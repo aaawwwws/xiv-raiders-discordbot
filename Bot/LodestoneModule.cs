@@ -435,6 +435,18 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
 
         try
         {
+            if (!TryValidateRoleOperation(Context.Guild, guildUser, provisionalRole, out var reason))
+            {
+                _logger.LogWarning(
+                    "Skipped provisional role grant due to permission/hierarchy. GuildId={GuildId}, UserId={UserId}, RoleId={RoleId}, Reason={Reason}",
+                    Context.Guild.Id,
+                    guildUser.Id,
+                    provisionalRole.Id,
+                    reason);
+                await FollowupAsync($"仮登録ロールを付与できません: {reason}", ephemeral: true);
+                return;
+            }
+
             await guildUser.AddRoleAsync(provisionalRole);
         }
         catch (Exception ex)
@@ -533,11 +545,35 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
         {
             if (provisionalRole is not null && targetUser.Roles.Any(role => role.Id == provisionalRole.Id))
             {
+                if (!TryValidateRoleOperation(Context.Guild, targetUser, provisionalRole, out var reason))
+                {
+                    _logger.LogWarning(
+                        "Skipped provisional role revoke due to permission/hierarchy. GuildId={GuildId}, UserId={UserId}, RoleId={RoleId}, Reason={Reason}",
+                        Context.Guild.Id,
+                        targetUser.Id,
+                        provisionalRole.Id,
+                        reason);
+                    await FollowupAsync($"仮登録ロールを解除できません: {reason}", ephemeral: true);
+                    return;
+                }
+
                 await targetUser.RemoveRoleAsync(provisionalRole);
             }
 
             if (approved && memberRole is not null && targetUser.Roles.All(role => role.Id != memberRole.Id))
             {
+                if (!TryValidateRoleOperation(Context.Guild, targetUser, memberRole, out var reason))
+                {
+                    _logger.LogWarning(
+                        "Skipped member role grant due to permission/hierarchy. GuildId={GuildId}, UserId={UserId}, RoleId={RoleId}, Reason={Reason}",
+                        Context.Guild.Id,
+                        targetUser.Id,
+                        memberRole.Id,
+                        reason);
+                    await FollowupAsync($"メンバーロールを付与できません: {reason}", ephemeral: true);
+                    return;
+                }
+
                 await targetUser.AddRoleAsync(memberRole);
             }
 
@@ -773,6 +809,8 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
         var bio = string.IsNullOrWhiteSpace(profile.Bio) ? "(なし)" : TruncateForLog(profile.Bio, 900);
         var displayName = string.IsNullOrWhiteSpace(profile.DisplayName) ? guildUser.DisplayName : profile.DisplayName;
         var discordName = string.IsNullOrWhiteSpace(profile.DiscordName) ? guildUser.Username : profile.DiscordName;
+        var discordCreatedAt = $"<t:{guildUser.CreatedAt.ToUnixTimeSeconds()}:F>";
+        var joinedAt = guildUser.JoinedAt.HasValue ? $"<t:{guildUser.JoinedAt.Value.ToUnixTimeSeconds()}:F>" : "(不明)";
 
         var avatar = guildUser.GetAvatarUrl() ?? guildUser.GetDisplayAvatarUrl();
         var embed = new EmbedBuilder()
@@ -780,7 +818,7 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
             .WithColor(Color.Orange)
             .WithCurrentTimestamp()
             .WithDescription($"申請者: {guildUser.Mention}\nUserId: `{guildUser.Id}`")
-            .AddField("Discord", $"表示名: {TruncateForLog(displayName, 120)}\nユーザー名: {TruncateForLog(discordName, 120)}", false)
+            .AddField("Discord", $"表示名: {TruncateForLog(displayName, 120)}\nユーザー名: {TruncateForLog(discordName, 120)}\nDiscord開始日: {discordCreatedAt}\nサーバー参加日: {joinedAt}", false)
             .AddField("FFXIV", $"{ffxivName}@{ffxivWorld} [{dataCenter}]", false)
             .AddField("SNS", $"𝕏: {TruncateForLog(xText, 120)}\nBluesky: {TruncateForLog(blueskyText, 120)}", false)
             .AddField("一言", bio, false)
@@ -1125,6 +1163,43 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
         }
 
         return messageChannel;
+    }
+
+    private static bool TryValidateRoleOperation(SocketGuild guild, SocketGuildUser targetUser, IRole role, out string reason)
+    {
+        var botUser = guild.CurrentUser;
+        if (botUser is null)
+        {
+            reason = "Botユーザーを取得できませんでした。";
+            return false;
+        }
+
+        if (!botUser.GuildPermissions.ManageRoles)
+        {
+            reason = "Botに「ロールの管理」権限がありません。";
+            return false;
+        }
+
+        if (role.Position >= botUser.Hierarchy)
+        {
+            reason = $"Botのロール位置が `{role.Name}` 以下です。";
+            return false;
+        }
+
+        if (targetUser.Id == guild.OwnerId)
+        {
+            reason = "サーバーオーナーのロールは変更できません。";
+            return false;
+        }
+
+        if (targetUser.Id != botUser.Id && targetUser.Hierarchy >= botUser.Hierarchy)
+        {
+            reason = "対象ユーザーのロール階層がBot以上です。";
+            return false;
+        }
+
+        reason = string.Empty;
+        return true;
     }
 
     private static string BuildCharacterLinkedSummary(IUser user, string characterName, string world, string dataCenter, string lodestoneUrl)

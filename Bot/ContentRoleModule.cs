@@ -202,6 +202,25 @@ public sealed class ContentRoleModule : InteractionModuleBase<SocketInteractionC
 
         try
         {
+            if (!TryValidateRoleOperation(Context.Guild, guildUser, role, out var reason))
+            {
+                _logger.LogWarning(
+                    "Skipped content role toggle due to permission/hierarchy. GuildId={GuildId}, UserId={UserId}, RoleId={RoleId}, Key={Key}, Reason={Reason}",
+                    Context.Guild.Id,
+                    guildUser.Id,
+                    role.Id,
+                    definition.Key,
+                    reason);
+                await _audit.SendAsync(
+                    Context.Guild,
+                    "コンテンツロール変更スキップ",
+                    $"👤 ユーザー: {guildUser.Mention} ({guildUser})\n🧩 ロール: {role.Name}\n🏷️ ラベル: {definition.Label}\n🔑 key: {definition.Key}\n⚠️ 理由: {reason}",
+                    Color.Orange,
+                    guildUser);
+                await ReplyEphemeralAsync($"ロール変更できません: {reason}");
+                return;
+            }
+
             var hasRole = guildUser.Roles.Any(r => r.Id == role.Id);
             if (hasRole)
             {
@@ -246,6 +265,43 @@ public sealed class ContentRoleModule : InteractionModuleBase<SocketInteractionC
         }
 
         return RespondAsync(text, ephemeral: true);
+    }
+
+    private static bool TryValidateRoleOperation(SocketGuild guild, SocketGuildUser targetUser, IRole role, out string reason)
+    {
+        var botUser = guild.CurrentUser;
+        if (botUser is null)
+        {
+            reason = "Botユーザーを取得できませんでした。";
+            return false;
+        }
+
+        if (!botUser.GuildPermissions.ManageRoles)
+        {
+            reason = "Botに「ロールの管理」権限がありません。";
+            return false;
+        }
+
+        if (role.Position >= botUser.Hierarchy)
+        {
+            reason = $"Botのロール位置が `{role.Name}` 以下です。";
+            return false;
+        }
+
+        if (targetUser.Id == guild.OwnerId)
+        {
+            reason = "サーバーオーナーのロールは変更できません。";
+            return false;
+        }
+
+        if (targetUser.Id != botUser.Id && targetUser.Hierarchy >= botUser.Hierarchy)
+        {
+            reason = "対象ユーザーのロール階層がBot以上です。";
+            return false;
+        }
+
+        reason = string.Empty;
+        return true;
     }
 
     private async Task<IMessageChannel?> ResolveSetupChannelAsync()

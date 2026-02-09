@@ -2593,7 +2593,6 @@ public sealed class DiscordBotService : IHostedService
 
     private static string BuildVoiceSummary(SocketGuild guild, SocketUser user, SocketVoiceChannel? beforeChannel, SocketVoiceChannel? afterChannel, TimeSpan? duration)
     {
-        var guildUser = guild.GetUser(user.Id);
         var lines = new List<string>
         {
             $"👤 ユーザー: {FormatVoiceUser(guild, user)}",
@@ -2604,8 +2603,6 @@ public sealed class DiscordBotService : IHostedService
         {
             lines.Add($"🎧 動作: 入室");
             lines.Add($"📢 チャンネル: {ChannelMention(afterChannel)}");
-            lines.Add($"🕒 Discord開始日: {FormatTimestamp(user.CreatedAt)}");
-            lines.Add($"🏠 サーバー参加日: {(guildUser?.JoinedAt.HasValue == true ? FormatTimestamp(guildUser.JoinedAt.Value) : "(不明)")}");
         }
         else if (beforeChannel is not null && afterChannel is null)
         {

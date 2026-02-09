@@ -90,7 +90,8 @@ public sealed class UserProfileEmbedService
         var profileLines = string.Join('\n', new[]
         {
             snapshot.BasicInfo,
-            $"キャラクター: {snapshot.CharacterInfo}"
+            "キャラクター",
+            snapshot.CharacterInfo
         });
         embed.AddField("プロフィール", profileLines, false);
         embed.AddField("SNS", snapshot.SnsInfo, false);
@@ -121,7 +122,7 @@ public sealed class UserProfileEmbedService
             authorName,
             avatar,
             thumbnail,
-            BuildVoiceBasicInfo(user, guildUser),
+            BuildVoiceBasicInfo(user),
             BuildVoiceRoleInfo(guildUser),
             BuildVoiceCharacterInfo(character, profile),
             BuildVoiceSnsInfo(profile),
@@ -170,19 +171,10 @@ public sealed class UserProfileEmbedService
         }
     }
 
-    private static string BuildVoiceBasicInfo(SocketUser user, SocketGuildUser? guildUser)
+    private static string BuildVoiceBasicInfo(SocketUser user)
     {
         var discordName = user.Username;
-        var joinedAtText = guildUser?.JoinedAt.HasValue == true
-            ? FormatTimestamp(guildUser.JoinedAt.Value)
-            : "不明";
-
-        return string.Join('\n', new[]
-        {
-            $"Discord: {MentionUser(user.Id)} (@{discordName})",
-            $"Discord開始日: {FormatTimestamp(user.CreatedAt)}",
-            $"サーバー参加日: {joinedAtText}"
-        });
+        return $"Discord: {MentionUser(user.Id)} (@{discordName})";
     }
 
     private static string BuildVoiceRoleInfo(SocketGuildUser? guildUser)
@@ -211,8 +203,10 @@ public sealed class UserProfileEmbedService
     {
         if (character is not null)
         {
+            var linkedName = string.IsNullOrWhiteSpace(character.Name) ? "unknown" : character.Name;
+            var linkedWorld = string.IsNullOrWhiteSpace(character.World) ? "unknown" : character.World;
             var linkedDc = string.IsNullOrWhiteSpace(character.DataCenter) ? "unknown" : character.DataCenter;
-            return $"{character.Name}@{character.World} [{linkedDc}]";
+            return $"名前: {linkedName}\nデータセンター: {linkedDc}\nサーバー: {linkedWorld}";
         }
 
         if (profile is not null &&
@@ -220,7 +214,7 @@ public sealed class UserProfileEmbedService
             !string.IsNullOrWhiteSpace(profile.FfxivWorld))
         {
             var profileDc = string.IsNullOrWhiteSpace(profile.FfxivDataCenter) ? "unknown" : profile.FfxivDataCenter;
-            return $"{profile.FfxivName}@{profile.FfxivWorld} [{profileDc}]";
+            return $"名前: {profile.FfxivName}\nデータセンター: {profileDc}\nサーバー: {profile.FfxivWorld}";
         }
 
         return "未連携";
