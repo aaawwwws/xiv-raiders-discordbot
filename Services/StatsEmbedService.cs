@@ -123,6 +123,15 @@ public sealed class StatsEmbedService
     {
         panel ??= await _db.GetGuildStatsPanelAsync(guild.Id);
 
+        try
+        {
+            await guild.DownloadUsersAsync();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to download guild users before stats refresh. GuildId={GuildId}", guild.Id);
+        }
+
         var allRegistered = await _db.ListRegisteredDiscordUserProfilesAsync();
         var normalizedAll = NormalizeRegisteredProfiles(allRegistered);
         var guildUserIds = guild.Users
@@ -132,15 +141,10 @@ public sealed class StatsEmbedService
         var registered = normalizedAll
             .Where(profile => guildUserIds.Contains(ToUlong(profile.DiscordUserId)))
             .ToList();
-        var usedFallback = registered.Count == 0 && normalizedAll.Count > 0;
-        if (usedFallback)
-        {
-            registered = normalizedAll;
-        }
 
-        var source = usedFallback ? "DB登録データ全体（フォールバック）" : "このサーバーの在籍メンバー";
+        var source = "このサーバーの在籍メンバー";
 
-        var specs = BuildChartSpecs(registered, usedFallback);
+        var specs = BuildChartSpecs(registered);
         var existingMessages = await ListManagedStatsMessagesAsync(channel);
         var existingByTitle = existingMessages
             .Where(message => message.Embeds.FirstOrDefault()?.Title is not null)
@@ -160,7 +164,6 @@ public sealed class StatsEmbedService
                 spec.DisplayRows,
                 spec.MaxRows,
                 spec.Color,
-                usedFallback,
                 spec.ChartFileName);
 
             var posted = await UpsertStatsMessageAsync(channel, existing, embed, chartPng, spec.ChartFileName);
@@ -196,10 +199,10 @@ public sealed class StatsEmbedService
             await _db.UpsertGuildStatsPanelAsync(guild.Id, channel.Id, dcMessage.Id, firstServerMessageId);
         }
 
-        return new StatsRefreshResult(true, usedFallback, registered.Count, source);
+        return new StatsRefreshResult(true, false, registered.Count, source);
     }
 
-    private static List<ChartSpec> BuildChartSpecs(IReadOnlyList<RegisteredProfile> registered, bool usedFallback)
+    private static List<ChartSpec> BuildChartSpecs(IReadOnlyList<RegisteredProfile> registered)
     {
         var specs = new List<ChartSpec>();
         var dcRows = registered
@@ -332,7 +335,6 @@ public sealed class StatsEmbedService
         IReadOnlyList<DistributionRow> rows,
         int maxRows,
         Discord.Color color,
-        bool usedFallback,
         string chartFileName)
     {
         var displayRows = rows.Take(Math.Max(1, maxRows)).ToList();
@@ -357,11 +359,6 @@ public sealed class StatsEmbedService
             .WithDescription(string.Join('\n', lines))
             .AddField("対象登録数", total, true)
             .WithCurrentTimestamp();
-
-        if (usedFallback)
-        {
-            embed.WithFooter("注記: サーバーメンバー取得が0件のため、DB全体登録データで集計");
-        }
 
         if (!string.IsNullOrWhiteSpace(chartFileName))
         {

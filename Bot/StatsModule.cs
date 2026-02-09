@@ -47,9 +47,8 @@ public sealed class StatsModule : InteractionModuleBase<SocketInteractionContext
         await DeferAsync(ephemeral: true);
 
         var result = await _stats.SetupAndRefreshAsync(Context.Guild, channel);
-        var fallbackText = result.UsedFallback ? "（フォールバックあり）" : string.Empty;
         await FollowupAsync(
-            $"統計EMBEDを更新しました。対象登録数: {result.RegisteredCount} / 集計元: {result.Source} {fallbackText}\n" +
+            $"統計EMBEDを更新しました。対象登録数: {result.RegisteredCount} / 集計元: {result.Source}\n" +
             "このサーバーのメンバー登録更新・参加/退出時に自動更新されます。",
             ephemeral: true);
     }
