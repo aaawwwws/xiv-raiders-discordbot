@@ -1,0 +1,91 @@
+using System.Net;
+using Discord;
+using Discord.Interactions;
+using Discord.WebSocket;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using RaidDcBot.Bot;
+using RaidDcBot.Data;
+using RaidDcBot.Models;
+using RaidDcBot.Services;
+
+EnvLoader.Load();
+
+var builder = Host.CreateApplicationBuilder(args);
+
+builder.Configuration
+    .AddJsonFile("appsettings.json", optional: true)
+    .AddEnvironmentVariables();
+
+builder.Services.Configure<DiscordOptions>(builder.Configuration.GetSection("Discord"));
+builder.Services.Configure<DatabaseOptions>(builder.Configuration.GetSection("Database"));
+builder.Services.Configure<LodestoneOptions>(builder.Configuration.GetSection("Lodestone"));
+
+builder.Services.AddSingleton(sp =>
+{
+    var lodestone = sp.GetRequiredService<IConfiguration>().GetSection("Lodestone").Get<LodestoneOptions>() ?? new LodestoneOptions();
+    var handler = new SocketsHttpHandler
+    {
+        AutomaticDecompression = DecompressionMethods.All
+    };
+
+    var client = new HttpClient(handler)
+    {
+        Timeout = TimeSpan.FromSeconds(lodestone.TimeoutSeconds > 0 ? lodestone.TimeoutSeconds : 15)
+    };
+
+    var userAgent = string.IsNullOrWhiteSpace(lodestone.UserAgent)
+        ? LodestoneOptions.DefaultUserAgent
+        : lodestone.UserAgent;
+
+    client.DefaultRequestHeaders.UserAgent.ParseAdd(userAgent);
+    client.DefaultRequestHeaders.AcceptLanguage.ParseAdd("en-US,en;q=0.9,ja;q=0.8");
+    client.DefaultRequestHeaders.Accept.ParseAdd("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+
+    return client;
+});
+
+builder.Services.AddSingleton<TokenService>();
+builder.Services.AddSingleton<LodestoneClient>();
+builder.Services.AddSingleton<LodestoneRateLimitService>();
+builder.Services.AddSingleton<Db>();
+builder.Services.AddSingleton<VoiceTransferTracker>();
+builder.Services.AddSingleton<VoiceChannelTextService>();
+builder.Services.AddSingleton<UserProfileEmbedService>();
+builder.Services.AddSingleton<GuildAuditLogService>();
+builder.Services.AddSingleton<StatsEmbedService>();
+builder.Services.AddSingleton<VoiceStatsService>();
+builder.Services.AddSingleton<RecruitmentListService>();
+builder.Services.AddSingleton<RecruitJoinContextTracker>();
+builder.Services.AddSingleton<RecruitCommentEditContextTracker>();
+builder.Services.AddSingleton<RecruitCreateDraftContextTracker>();
+builder.Services.AddSingleton<RecruitPostEditContextTracker>();
+builder.Services.AddSingleton<MemberRegistrationDraftContextTracker>();
+
+var discordOptions = builder.Configuration.GetSection("Discord").Get<DiscordOptions>() ?? new DiscordOptions();
+
+builder.Services.AddSingleton(new DiscordSocketClient(new DiscordSocketConfig
+{
+    GatewayIntents = GatewayIntents.Guilds
+        | GatewayIntents.GuildMembers
+        | GatewayIntents.GuildMessages
+        | GatewayIntents.GuildMessageReactions
+        | GatewayIntents.MessageContent
+        | GatewayIntents.GuildVoiceStates,
+    LogLevel = LogSeverity.Info,
+    MessageCacheSize = discordOptions.MessageCacheSize
+}));
+
+builder.Services.AddSingleton(sp => new InteractionService(
+    sp.GetRequiredService<DiscordSocketClient>(),
+    new InteractionServiceConfig
+    {
+        LogLevel = LogSeverity.Info,
+        UseCompiledLambda = true
+    }));
+
+builder.Services.AddHostedService<DiscordBotService>();
+
+var host = builder.Build();
+await host.RunAsync();

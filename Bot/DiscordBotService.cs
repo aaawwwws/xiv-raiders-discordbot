@@ -1,0 +1,3366 @@
+using System.Collections.Concurrent;
+using System.Globalization;
+using System.Linq;
+using System.Reflection;
+using System.Text.Json;
+using Discord;
+using Discord.Interactions;
+using Discord.Rest;
+using Discord.WebSocket;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+using RaidDcBot.Data;
+using RaidDcBot.Models;
+using RaidDcBot.Services;
+
+namespace RaidDcBot.Bot;
+
+public sealed class DiscordBotService : IHostedService
+{
+    private readonly DiscordSocketClient _client;
+    private readonly InteractionService _interactions;
+    private readonly IServiceProvider _services;
+    private readonly ILogger<DiscordBotService> _logger;
+    private readonly DiscordOptions _options;
+    private readonly Db _db;
+    private readonly VoiceChannelTextService _voiceTextService;
+    private readonly UserProfileEmbedService _profileEmbeds;
+    private readonly RecruitmentListService _recruitListService;
+    private readonly GuildAuditLogService _audit;
+    private readonly StatsEmbedService _stats;
+    private readonly VoiceStatsService _voiceStats;
+    private readonly string? _attachmentArchiveRootPath;
+    private readonly ConcurrentDictionary<ulong, byte> _tempVoiceChannelIds = new();
+    private readonly ConcurrentDictionary<ulong, CancellationTokenSource> _tempVoiceDeleteTokens = new();
+    private readonly ConcurrentDictionary<ulong, int> _dailyActivityRankingPosted = new();
+    private readonly ConcurrentDictionary<ulong, int> _weeklyVoiceRankingPosted = new();
+    private readonly SemaphoreSlim _tempVoiceLock = new(1, 1);
+    private static readonly HttpClient AttachmentArchiveHttpClient = CreateAttachmentArchiveHttpClient();
+    private static readonly TimeSpan JapanTimeOffset = TimeSpan.FromHours(9);
+    private const string RecruitScheduleFormat = "yyyy/MM/dd HH:mm";
+    private CancellationTokenSource? _cleanupCts;
+    private Task? _cleanupTask;
+    private CancellationTokenSource? _recruitScheduleCts;
+    private Task? _recruitScheduleTask;
+    private CancellationTokenSource? _activityRoleSyncCts;
+    private Task? _activityRoleSyncTask;
+
+    public DiscordBotService(
+        DiscordSocketClient client,
+        InteractionService interactions,
+        IServiceProvider services,
+        ILogger<DiscordBotService> logger,
+        IOptions<DiscordOptions> options,
+        Db db,
+        VoiceChannelTextService voiceTextService,
+        UserProfileEmbedService profileEmbeds,
+        RecruitmentListService recruitListService,
+        GuildAuditLogService audit,
+        StatsEmbedService stats,
+        VoiceStatsService voiceStats)
+    {
+        _client = client;
+        _interactions = interactions;
+        _services = services;
+        _logger = logger;
+        _options = options.Value;
+        _db = db;
+        _voiceTextService = voiceTextService;
+        _profileEmbeds = profileEmbeds;
+        _recruitListService = recruitListService;
+        _audit = audit;
+        _stats = stats;
+        _voiceStats = voiceStats;
+        _attachmentArchiveRootPath = ResolveAttachmentArchiveRootPath(_options);
+    }
+
+    public async Task StartAsync(CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(_options.Token))
+        {
+            throw new InvalidOperationException("Discord:Token is required.");
+        }
+
+        await _db.EnsureRecruitRequiredJobColumnAsync();
+        await _db.EnsureDiscordUserProfileCharacterColumnsAsync();
+        await _db.EnsureDiscordUserVoiceNotificationColumnAsync();
+        await _db.EnsureGuildLodestonePanelTableAsync();
+        await _db.EnsureGuildAdminControlPanelTableAsync();
+        await _db.EnsureGuildMemberContentRolesTableAsync();
+        await _db.EnsureGuildStatsPanelTableAsync();
+        await _db.EnsureGuildDailyActivityPanelTableAsync();
+        await _db.EnsureRecruitTemplatesTableAsync();
+        await _db.EnsureMessageLogPayloadColumnsAsync();
+        await _db.EnsureUserReactionLogsTableAsync();
+        EnsureAttachmentArchiveDirectory();
+
+        _client.Log += HandleLogAsync;
+        _interactions.Log += HandleLogAsync;
+        _client.Ready += OnReadyAsync;
+        _client.InteractionCreated += OnInteractionCreatedAsync;
+        _client.JoinedGuild += OnJoinedGuildAsync;
+        _client.UserJoined += OnUserJoinedAsync;
+        _client.UserLeft += OnUserLeftAsync;
+        _client.GuildMemberUpdated += OnGuildMemberUpdatedAsync;
+        _client.UserVoiceStateUpdated += OnUserVoiceStateUpdatedAsync;
+        _client.MessageDeleted += OnMessageDeletedAsync;
+        _client.MessageUpdated += OnMessageUpdatedAsync;
+        _client.MessageReceived += OnMessageReceivedAsync;
+        _client.ReactionAdded += OnReactionAddedAsync;
+
+        _cleanupCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        _cleanupTask = Task.Run(() => CleanupLoopAsync(_cleanupCts.Token), _cleanupCts.Token);
+        _recruitScheduleCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        _recruitScheduleTask = Task.Run(() => RecruitScheduleLoopAsync(_recruitScheduleCts.Token), _recruitScheduleCts.Token);
+        _activityRoleSyncCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        _activityRoleSyncTask = Task.Run(() => ActivityRoleSyncLoopAsync(_activityRoleSyncCts.Token), _activityRoleSyncCts.Token);
+
+        await _client.LoginAsync(TokenType.Bot, _options.Token);
+        await _client.StartAsync();
+    }
+
+    public async Task StopAsync(CancellationToken cancellationToken)
+    {
+        if (_cleanupCts is not null)
+        {
+            _cleanupCts.Cancel();
+        }
+
+        if (_cleanupTask is not null)
+        {
+            try
+            {
+                await _cleanupTask;
+            }
+            catch (OperationCanceledException)
+            {
+            }
+        }
+
+        if (_recruitScheduleCts is not null)
+        {
+            _recruitScheduleCts.Cancel();
+        }
+
+        if (_recruitScheduleTask is not null)
+        {
+            try
+            {
+                await _recruitScheduleTask;
+            }
+            catch (OperationCanceledException)
+            {
+            }
+        }
+
+        if (_activityRoleSyncCts is not null)
+        {
+            _activityRoleSyncCts.Cancel();
+        }
+
+        if (_activityRoleSyncTask is not null)
+        {
+            try
+            {
+                await _activityRoleSyncTask;
+            }
+            catch (OperationCanceledException)
+            {
+            }
+        }
+
+        await _client.StopAsync();
+    }
+
+    private async Task OnReadyAsync()
+    {
+        await RegisterInteractionModulesAsync();
+
+        if (_options.GuildId != 0)
+        {
+            await _interactions.RegisterCommandsToGuildAsync(_options.GuildId, true);
+        }
+        else
+        {
+            await _interactions.RegisterCommandsGloballyAsync(true);
+        }
+
+        _logger.LogInformation("Bot ready. Commands registered.");
+        await EnsureGuildResourcesAsync();
+        if ((_options.ActiveRoleEnabled || _options.InactiveRoleEnabled) && _options.InactiveRoleDays > 0)
+        {
+            await SyncActivityRolesAsync(DateTimeOffset.UtcNow);
+        }
+    }
+
+    private async Task OnInteractionCreatedAsync(SocketInteraction interaction)
+    {
+        var context = new SocketInteractionContext(_client, interaction);
+        var result = await _interactions.ExecuteCommandAsync(context, _services);
+        await LogCommandExecutionAsync(context, result);
+        if (!result.IsSuccess)
+        {
+            _logger.LogWarning("Interaction failed: {Error} - {Reason}", result.Error, result.ErrorReason);
+        }
+    }
+
+    private async Task RegisterInteractionModulesAsync()
+    {
+        var assembly = Assembly.GetExecutingAssembly();
+        if (_options.RecruitFeatureEnabled)
+        {
+            await _interactions.AddModulesAsync(assembly, _services);
+            return;
+        }
+
+        foreach (var type in assembly.GetTypes().Where(IsInteractionModuleType))
+        {
+            if (type == typeof(RecruitmentModule))
+            {
+                continue;
+            }
+
+            await _interactions.AddModuleAsync(type, _services);
+        }
+
+        _logger.LogInformation("Recruit feature is disabled. RecruitmentModule was not registered.");
+    }
+
+    private static bool IsInteractionModuleType(Type type)
+    {
+        if (!type.IsClass || type.IsAbstract)
+        {
+            return false;
+        }
+
+        var current = type;
+        while (current is not null)
+        {
+            var baseType = current.BaseType;
+            if (baseType is null)
+            {
+                return false;
+            }
+
+            if (baseType.IsGenericType && baseType.GetGenericTypeDefinition() == typeof(InteractionModuleBase<>))
+            {
+                return true;
+            }
+
+            current = baseType;
+        }
+
+        return false;
+    }
+
+    private Task HandleLogAsync(LogMessage message)
+    {
+        var level = message.Severity switch
+        {
+            LogSeverity.Critical => LogLevel.Critical,
+            LogSeverity.Error => LogLevel.Error,
+            LogSeverity.Warning => LogLevel.Warning,
+            LogSeverity.Info => LogLevel.Information,
+            LogSeverity.Verbose => LogLevel.Debug,
+            LogSeverity.Debug => LogLevel.Debug,
+            _ => LogLevel.Information
+        };
+
+        _logger.Log(level, message.Exception, "{Source}: {Message}", message.Source, message.Message);
+        return Task.CompletedTask;
+    }
+
+    private async Task LogCommandExecutionAsync(SocketInteractionContext context, IResult result)
+    {
+        if (context.Guild is null || context.Interaction is not SocketSlashCommand slash)
+        {
+            return;
+        }
+
+        var commandPath = BuildSlashCommandPath(slash);
+        var channel = context.Channel as SocketGuildChannel;
+        var channelText = channel is null ? "(不明)" : ChannelMention(channel);
+        var description = string.Join('\n', new[]
+        {
+            $"👤 実行者: {MentionUser(context.User.Id)} ({context.User})",
+            $"💬 チャンネル: {channelText}",
+            $"⌨️ コマンド: {commandPath}"
+        });
+
+        if (result.IsSuccess)
+        {
+            await _audit.SendAsync(context.Guild, "管理コマンド実行", description, Color.Teal, context.User);
+            return;
+        }
+
+        var reason = string.IsNullOrWhiteSpace(result.ErrorReason) ? "(不明)" : result.ErrorReason;
+        description = $"{description}\n❌ Error: {reason}";
+        await _audit.SendAsync(context.Guild, "管理コマンド失敗", description, Color.Red, context.User);
+    }
+
+    private async Task CleanupLoopAsync(CancellationToken token)
+    {
+        var interval = TimeSpan.FromHours(12);
+        while (!token.IsCancellationRequested)
+        {
+            await RunCleanupAsync();
+
+            try
+            {
+                await Task.Delay(interval, token);
+            }
+            catch (TaskCanceledException)
+            {
+            }
+        }
+    }
+
+    private async Task RecruitScheduleLoopAsync(CancellationToken token)
+    {
+        var intervalSeconds = _options.RecruitScheduleCheckIntervalSeconds <= 0
+            ? 60
+            : _options.RecruitScheduleCheckIntervalSeconds;
+        var interval = TimeSpan.FromSeconds(Math.Clamp(intervalSeconds, 10, 600));
+
+        while (!token.IsCancellationRequested)
+        {
+            await RunRecruitScheduleTickAsync();
+
+            try
+            {
+                await Task.Delay(interval, token);
+            }
+            catch (TaskCanceledException)
+            {
+            }
+        }
+    }
+
+    private async Task RunCleanupAsync()
+    {
+        try
+        {
+            if (_options.MessageLogRetentionDays > 0)
+            {
+                var deleted = await _db.CleanupMessageLogsAsync(_options.MessageLogRetentionDays);
+                if (deleted > 0)
+                {
+                    _logger.LogInformation("Cleaned up {Count} message logs.", deleted);
+                }
+
+                var removedFiles = CleanupArchivedAttachmentFiles(_options.MessageLogRetentionDays);
+                if (removedFiles > 0)
+                {
+                    _logger.LogInformation("Cleaned up {Count} archived attachment files.", removedFiles);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to cleanup message logs.");
+        }
+
+        try
+        {
+            if (_options.VoiceSessionRetentionDays > 0)
+            {
+                var deleted = await _db.CleanupVoiceSessionsAsync(_options.VoiceSessionRetentionDays);
+                if (deleted > 0)
+                {
+                    _logger.LogInformation("Cleaned up {Count} voice sessions.", deleted);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to cleanup voice sessions.");
+        }
+
+        try
+        {
+            if (_options.MessageLogRetentionDays > 0)
+            {
+                var deleted = await _db.CleanupReactionLogsAsync(_options.MessageLogRetentionDays);
+                if (deleted > 0)
+                {
+                    _logger.LogInformation("Cleaned up {Count} reaction logs.", deleted);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to cleanup reaction logs.");
+        }
+
+    }
+
+    private async Task ActivityRoleSyncLoopAsync(CancellationToken token)
+    {
+        var intervalMinutes = _options.ActivityRoleSyncIntervalMinutes <= 0
+            ? 30
+            : _options.ActivityRoleSyncIntervalMinutes;
+        var interval = TimeSpan.FromMinutes(Math.Clamp(intervalMinutes, 1, 720));
+
+        while (!token.IsCancellationRequested)
+        {
+            try
+            {
+                await Task.Delay(interval, token);
+            }
+            catch (TaskCanceledException)
+            {
+                return;
+            }
+
+            await RunActivityRoleSyncAsync();
+        }
+    }
+
+    private async Task RunActivityRoleSyncAsync()
+    {
+        try
+        {
+            if ((_options.ActiveRoleEnabled || _options.InactiveRoleEnabled) && _options.InactiveRoleDays > 0)
+            {
+                await SyncActivityRolesAsync(DateTimeOffset.UtcNow);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to sync activity roles in periodic loop.");
+        }
+    }
+
+    private async Task RunRecruitScheduleTickAsync()
+    {
+        try
+        {
+            var nowUtc = DateTimeOffset.UtcNow;
+
+            if (_options.RecruitFeatureEnabled && _options.RecruitReminderMinutesBefore > 0)
+            {
+                var reminderUntil = nowUtc.AddMinutes(_options.RecruitReminderMinutesBefore);
+                var remindTargets = await _db.ListDueRecruitPostsForReminderAsync(nowUtc, reminderUntil);
+                foreach (var post in remindTargets)
+                {
+                    await HandleRecruitReminderAsync(post);
+                }
+            }
+
+            if (_options.RecruitFeatureEnabled && _options.RecruitAutoCloseEnabled)
+            {
+                var autoCloseTargets = await _db.ListDueRecruitPostsForAutoCloseAsync(nowUtc);
+                foreach (var post in autoCloseTargets)
+                {
+                    await HandleRecruitAutoCloseAsync(post);
+                }
+            }
+
+            if (_options.DailyActivityRankingEnabled)
+            {
+                await TryPostDailyActivityRankingAsync(nowUtc);
+            }
+
+            if (_options.VoiceWeeklyRankingEnabled)
+            {
+                await TryPostWeeklyVoiceRankingAsync(nowUtc);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to process recruit schedule tick.");
+        }
+    }
+
+    private async Task EnsureGuildResourcesAsync()
+    {
+        foreach (var guild in _client.Guilds)
+        {
+            await EnsureGuildResourcesAsync(guild);
+        }
+    }
+
+    private async Task OnJoinedGuildAsync(SocketGuild guild)
+    {
+        await EnsureGuildResourcesAsync(guild);
+    }
+
+    private async Task EnsureGuildResourcesAsync(SocketGuild guild)
+    {
+        var roleName = string.IsNullOrWhiteSpace(_options.AdminRoleName) ? "RaidDC Admin" : _options.AdminRoleName;
+        var memberRoleName = string.IsNullOrWhiteSpace(_options.MemberRoleName) ? "メンバー" : _options.MemberRoleName;
+        var logChannelName = string.IsNullOrWhiteSpace(_options.LogChannelName) ? "log" : _options.LogChannelName;
+        var notificationChannelName = string.IsNullOrWhiteSpace(_options.NotificationChannelName) ? "notice" : _options.NotificationChannelName;
+        var activityRankingChannelName = string.IsNullOrWhiteSpace(_options.ActivityRankingChannelName) ? "ランキング" : _options.ActivityRankingChannelName;
+        var voiceNotificationRoleName = string.IsNullOrWhiteSpace(_options.VoiceNotificationRoleName) ? "通話通知" : _options.VoiceNotificationRoleName;
+        var controlChannelName = string.IsNullOrWhiteSpace(_options.ControlChannelName) ? "bot-control" : _options.ControlChannelName;
+        var autoOps = new List<string>();
+
+        var settings = await _db.GetGuildSettingsAsync(guild.Id);
+
+        IRole? adminRole = null;
+        if (settings is not null && settings.AdminRoleId != 0)
+        {
+            adminRole = guild.GetRole(ToUlong(settings.AdminRoleId));
+        }
+        adminRole ??= guild.Roles.FirstOrDefault(role => string.Equals(role.Name, roleName, StringComparison.OrdinalIgnoreCase));
+        if (adminRole is null)
+        {
+            adminRole = await guild.CreateRoleAsync(roleName, GuildPermissions.None, color: new Color(226, 185, 73), isHoisted: false, isMentionable: false);
+            _logger.LogInformation("Admin role created in guild {GuildId}.", guild.Id);
+            autoOps.Add($"🛠️ 管理者ロール作成: {adminRole.Name} ({MentionRole(adminRole.Id)})");
+        }
+
+        IRole? memberRole = null;
+        if (settings is not null && settings.MemberRoleId != 0)
+        {
+            memberRole = guild.GetRole(ToUlong(settings.MemberRoleId));
+        }
+        memberRole ??= guild.Roles.FirstOrDefault(role => string.Equals(role.Name, memberRoleName, StringComparison.OrdinalIgnoreCase));
+        if (memberRole is null)
+        {
+            memberRole = await guild.CreateRoleAsync(memberRoleName, GuildPermissions.None, color: new Color(72, 201, 176), isHoisted: false, isMentionable: false);
+            _logger.LogInformation("Member role created in guild {GuildId}.", guild.Id);
+            autoOps.Add($"🛠️ メンバーロール作成: {memberRole.Name} ({MentionRole(memberRole.Id)})");
+        }
+
+        IRole? voiceNotificationRole = guild.Roles.FirstOrDefault(role =>
+            string.Equals(role.Name, voiceNotificationRoleName, StringComparison.OrdinalIgnoreCase));
+        if (voiceNotificationRole is null && _options.AutoCreateVoiceNotificationRole)
+        {
+            voiceNotificationRole = await guild.CreateRoleAsync(
+                voiceNotificationRoleName,
+                GuildPermissions.None,
+                color: new Color(52, 152, 219),
+                isHoisted: false,
+                isMentionable: true);
+            autoOps.Add($"🛠️ 通話通知ロール作成: {voiceNotificationRole.Name} ({MentionRole(voiceNotificationRole.Id)})");
+        }
+
+        IMessageChannel? registrationChannel = null;
+        if (settings is not null && settings.RegistrationChannelId != 0)
+        {
+            registrationChannel = guild.GetTextChannel(ToUlong(settings.RegistrationChannelId));
+        }
+
+        IMessageChannel? logChannel = null;
+        if (settings is not null && settings.LogChannelId != 0)
+        {
+            logChannel = guild.GetTextChannel(ToUlong(settings.LogChannelId));
+        }
+        logChannel ??= guild.TextChannels.FirstOrDefault(channel =>
+            string.Equals(channel.Name, logChannelName, StringComparison.OrdinalIgnoreCase));
+        if (logChannel is null)
+        {
+            logChannel = await guild.CreateTextChannelAsync(logChannelName, props =>
+            {
+                props.Topic = "監視ログが投稿されます。";
+            });
+            _logger.LogInformation("Log channel created in guild {GuildId}.", guild.Id);
+            autoOps.Add($"🛠️ ログチャンネル作成: <#{logChannel.Id}>");
+        }
+
+        IMessageChannel? notificationChannel = guild.TextChannels.FirstOrDefault(channel =>
+            string.Equals(channel.Name, notificationChannelName, StringComparison.OrdinalIgnoreCase));
+        if (notificationChannel is null)
+        {
+            notificationChannel = await guild.CreateTextChannelAsync(notificationChannelName, props =>
+            {
+                props.Topic = "通知が投稿されます。";
+            });
+            _logger.LogInformation("Notification channel created in guild {GuildId}.", guild.Id);
+            autoOps.Add($"🛠️ 通知チャンネル作成: <#{notificationChannel.Id}>");
+        }
+
+        IMessageChannel? activityRankingChannel = guild.TextChannels.FirstOrDefault(channel =>
+            string.Equals(channel.Name, activityRankingChannelName, StringComparison.OrdinalIgnoreCase));
+        if (activityRankingChannel is null && _options.AutoCreateActivityRankingChannel)
+        {
+            activityRankingChannel = await guild.CreateTextChannelAsync(activityRankingChannelName, props =>
+            {
+                props.Topic = "日次/週次アクティビティランキングが投稿されます。";
+            });
+            _logger.LogInformation("Activity ranking channel created in guild {GuildId}.", guild.Id);
+            autoOps.Add($"🛠️ ランキングチャンネル作成: <#{activityRankingChannel.Id}>");
+        }
+
+        IMessageChannel? controlChannel = null;
+        if (settings is not null && settings.ControlChannelId != 0)
+        {
+            controlChannel = guild.GetTextChannel(ToUlong(settings.ControlChannelId));
+        }
+        controlChannel ??= guild.TextChannels.FirstOrDefault(channel =>
+            string.Equals(channel.Name, controlChannelName, StringComparison.OrdinalIgnoreCase));
+        if (controlChannel is null)
+        {
+            controlChannel = await guild.CreateTextChannelAsync(controlChannelName, props =>
+            {
+                props.Topic = "Botの管理パネルです。";
+            });
+            _logger.LogInformation("Control channel created in guild {GuildId}.", guild.Id);
+            autoOps.Add($"🛠️ コントロールチャンネル作成: <#{controlChannel.Id}>");
+        }
+
+        await _db.UpsertGuildSettingsAsync(
+            guild.Id,
+            adminRole.Id,
+            memberRole.Id,
+            0,
+            registrationChannel?.Id ?? 0,
+            logChannel.Id,
+            controlChannel.Id);
+
+        if (_options.ApplyChannelPermissionOverwritesOnStartup)
+        {
+            await EnsureVisibilityAsync(guild, adminRole, memberRole, registrationChannel, logChannel, notificationChannel, controlChannel, activityRankingChannel);
+            autoOps.Add("🔧 チャンネル権限オーバーライト同期を実施");
+        }
+        else
+        {
+            _logger.LogInformation("Skipping channel permission overwrite sync for guild {GuildId}.", guild.Id);
+        }
+        await EnsureTempVoiceLobbyAsync(guild, adminRole, memberRole);
+
+        if (autoOps.Count > 0)
+        {
+            await _audit.SendSystemAsync(guild, "自動セットアップ", string.Join('\n', autoOps), Color.LightGrey);
+        }
+
+        await RefreshExistingPanelsAsync(guild, registrationChannel, controlChannel);
+        _ = _stats.RefreshIfConfiguredAsync(guild);
+    }
+
+    private async Task RefreshExistingPanelsAsync(SocketGuild guild, IMessageChannel? registrationChannel, IMessageChannel controlChannel)
+    {
+        var panelFallbackChannel = registrationChannel ?? controlChannel;
+        await RefreshMemberRegistrationPanelMessageAsync(guild, panelFallbackChannel);
+        await RefreshLodestonePanelMessageAsync(guild, panelFallbackChannel);
+        await RefreshControlPanelMessageAsync(guild, controlChannel);
+        if (_options.RecruitFeatureEnabled)
+        {
+            await RefreshRecruitPanelMessageAsync(guild, controlChannel);
+            await RefreshRecruitListMessageAsync(guild, controlChannel);
+        }
+        else
+        {
+            await RefreshRecruitPanelMessageAsync(guild, controlChannel);
+        }
+    }
+
+    private async Task RefreshMemberRegistrationPanelMessageAsync(SocketGuild guild, IMessageChannel fallbackChannel)
+    {
+        var panel = await _db.GetGuildPanelAsync(guild.Id);
+        if (panel is null || panel.MessageId == 0)
+        {
+            return;
+        }
+
+        var channel = panel.ChannelId != 0
+            ? guild.GetTextChannel(ToUlong(panel.ChannelId))
+            : null;
+
+        channel ??= fallbackChannel as SocketTextChannel;
+        if (channel is null)
+        {
+            return;
+        }
+
+        try
+        {
+            var message = await channel.GetMessageAsync(ToUlong(panel.MessageId)) as IUserMessage;
+            if (message is null)
+            {
+                return;
+            }
+
+            var components = MemberRegistrationPanel.BuildComponents();
+            await message.ModifyAsync(props =>
+            {
+                props.Content = MemberRegistrationPanel.PanelMessage;
+                props.Components = components;
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to refresh member registration panel message.");
+        }
+    }
+
+    private async Task RefreshLodestonePanelMessageAsync(SocketGuild guild, IMessageChannel fallbackChannel)
+    {
+        var panel = await _db.GetGuildLodestonePanelAsync(guild.Id);
+        if (panel is null || panel.MessageId == 0)
+        {
+            return;
+        }
+
+        var channel = panel.ChannelId != 0
+            ? guild.GetTextChannel(ToUlong(panel.ChannelId))
+            : null;
+
+        channel ??= fallbackChannel as SocketTextChannel;
+        if (channel is null)
+        {
+            return;
+        }
+
+        try
+        {
+            var message = await channel.GetMessageAsync(ToUlong(panel.MessageId)) as IUserMessage;
+            if (message is null)
+            {
+                return;
+            }
+
+            var components = LodestonePanel.BuildComponents();
+            await message.ModifyAsync(props =>
+            {
+                props.Content = LodestonePanel.PanelMessage;
+                props.Components = components;
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to refresh lodestone panel message.");
+        }
+    }
+
+    private async Task RefreshControlPanelMessageAsync(SocketGuild guild, IMessageChannel fallbackChannel)
+    {
+        var panel = await _db.GetGuildControlPanelAsync(guild.Id);
+        if (panel is null || panel.MessageId == 0)
+        {
+            return;
+        }
+
+        var channel = panel.ChannelId != 0
+            ? guild.GetTextChannel(ToUlong(panel.ChannelId))
+            : null;
+
+        channel ??= fallbackChannel as SocketTextChannel;
+        if (channel is null)
+        {
+            return;
+        }
+
+        try
+        {
+            var message = await channel.GetMessageAsync(ToUlong(panel.MessageId)) as IUserMessage;
+            if (message is null)
+            {
+                return;
+            }
+
+            var components = ControlPanel.BuildComponents();
+            await message.ModifyAsync(props => props.Components = components);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to refresh control panel message.");
+        }
+    }
+
+    private async Task RefreshRecruitPanelMessageAsync(SocketGuild guild, IMessageChannel fallbackChannel)
+    {
+        var panel = await _db.GetGuildRecruitPanelAsync(guild.Id);
+        if (panel is null || panel.MessageId == 0)
+        {
+            return;
+        }
+
+        var channel = panel.ChannelId != 0
+            ? guild.GetTextChannel(ToUlong(panel.ChannelId))
+            : null;
+
+        channel ??= fallbackChannel as SocketTextChannel;
+        if (channel is null)
+        {
+            return;
+        }
+
+        try
+        {
+            var message = await channel.GetMessageAsync(ToUlong(panel.MessageId)) as IUserMessage;
+            if (message is null)
+            {
+                return;
+            }
+
+            var components = RecruitmentPanel.BuildPanelComponents(_options.RecruitFeatureEnabled);
+            await message.ModifyAsync(props =>
+            {
+                props.Content = _options.RecruitFeatureEnabled
+                    ? RecruitmentPanel.PanelMessage
+                    : RecruitmentPanel.DisabledPanelMessage;
+                props.Components = components;
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to refresh recruit panel message.");
+        }
+    }
+
+    private async Task RefreshRecruitListMessageAsync(SocketGuild guild, IMessageChannel fallbackChannel)
+    {
+        await _recruitListService.RefreshAsync(guild, fallbackChannel);
+    }
+
+    private async Task HandleRecruitReminderAsync(RecruitPost post)
+    {
+        var guild = _client.GetGuild(ToUlong(post.GuildId));
+        if (guild is null)
+        {
+            return;
+        }
+
+        if (post.ReminderSentAt.HasValue)
+        {
+            return;
+        }
+
+        var schedule = FormatRecruitSchedule(post.ScheduleText, post.ScheduleAt);
+        var sent = await TryPostRecruitNoticeAsync(guild, post, $"開始時刻が近づいています（{schedule}）。");
+        if (sent)
+        {
+            await _db.MarkRecruitReminderSentAsync(post.Id);
+        }
+    }
+
+    private async Task HandleRecruitAutoCloseAsync(RecruitPost post)
+    {
+        var guild = _client.GetGuild(ToUlong(post.GuildId));
+        if (guild is null)
+        {
+            return;
+        }
+
+        await _db.UpdateRecruitPostStatusAsync(post.Id, RecruitPostStatus.Closed);
+        post.Status = RecruitPostStatus.Closed;
+        await UpdateRecruitPostMessageAsync(guild, post);
+        await TryPostRecruitNoticeAsync(guild, post, "開始時刻になったため募集を自動で終了しました。");
+        await TryArchiveRecruitThreadAsync(post, lockThread: true);
+
+        var fallback = guild.GetTextChannel(ToUlong(post.ChannelId));
+        if (fallback is not null)
+        {
+            await _recruitListService.RefreshAsync(guild, fallback);
+        }
+    }
+
+    private async Task TryPostDailyActivityRankingAsync(DateTimeOffset nowUtc)
+    {
+        var topCount = Math.Clamp(_options.DailyActivityRankingTopCount, 1, 20);
+        var targetHour = Math.Clamp(_options.DailyActivityRankingPostHourJst, 0, 23);
+        var intervalMinutes = Math.Clamp(_options.DailyActivityRankingUpdateIntervalMinutes, 5, 180);
+        var nowJst = nowUtc.ToOffset(JapanTimeOffset);
+        if (nowJst.Hour < targetHour)
+        {
+            return;
+        }
+
+        var slotKey = (int)(nowJst.ToUnixTimeSeconds() / (intervalMinutes * 60L));
+        var dayStartJst = new DateTimeOffset(nowJst.Year, nowJst.Month, nowJst.Day, 0, 0, 0, JapanTimeOffset);
+        var fromUtc = dayStartJst.ToUniversalTime();
+
+        foreach (var guild in _client.Guilds)
+        {
+            if (_dailyActivityRankingPosted.TryGetValue(guild.Id, out var postedSlot) && postedSlot == slotKey)
+            {
+                continue;
+            }
+
+            var panel = await _db.GetGuildDailyActivityPanelAsync(guild.Id);
+            if (panel is null || panel.ChannelId == 0 || panel.MessageId == 0)
+            {
+                continue;
+            }
+
+            var channel = guild.GetTextChannel(ToUlong(panel.ChannelId));
+            if (channel is null)
+            {
+                continue;
+            }
+
+            try
+            {
+                var embed = await _voiceStats.BuildActivityRankingEmbedAsync(guild, fromUtc, nowUtc, topCount, "今日のアクティビティランキング");
+                var message = await UpsertDailyActivityRankingMessageAsync(guild, channel, ToUlong(panel.MessageId), embed);
+                await _db.UpsertGuildDailyActivityPanelAsync(guild.Id, channel.Id, message.Id);
+                _dailyActivityRankingPosted[guild.Id] = slotKey;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to post daily activity ranking. GuildId={GuildId}", guild.Id);
+            }
+        }
+    }
+
+    private async Task TryPostWeeklyVoiceRankingAsync(DateTimeOffset nowUtc)
+    {
+        var rangeDays = Math.Clamp(_options.VoiceWeeklyRankingRangeDays, 1, 30);
+        var topCount = Math.Clamp(_options.VoiceWeeklyRankingTopCount, 1, 20);
+        var targetHour = Math.Clamp(_options.VoiceWeeklyRankingPostHourJst, 0, 23);
+        var targetDay = Math.Clamp(_options.VoiceWeeklyRankingPostDayOfWeekJst, 0, 6);
+
+        var nowJst = nowUtc.ToOffset(JapanTimeOffset);
+        if ((int)nowJst.DayOfWeek != targetDay || nowJst.Hour != targetHour)
+        {
+            return;
+        }
+
+        var week = ISOWeek.GetWeekOfYear(nowJst.DateTime);
+        var year = ISOWeek.GetYear(nowJst.DateTime);
+        var weekKey = (year * 100) + week;
+
+        foreach (var guild in _client.Guilds)
+        {
+            if (_weeklyVoiceRankingPosted.TryGetValue(guild.Id, out var postedWeek) && postedWeek == weekKey)
+            {
+                continue;
+            }
+
+            var channel = await ResolveActivityRankingChannelAsync(guild);
+            if (channel is null)
+            {
+                continue;
+            }
+
+            try
+            {
+                var embed = await _voiceStats.BuildWeeklyRankingEmbedAsync(guild, nowUtc, rangeDays, topCount);
+                await channel.SendMessageAsync(embed: embed, flags: MessageFlags.SuppressNotification);
+                _weeklyVoiceRankingPosted[guild.Id] = weekKey;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to post weekly voice ranking. GuildId={GuildId}", guild.Id);
+            }
+        }
+    }
+
+    private async Task SyncActivityRolesAsync(DateTimeOffset nowUtc)
+    {
+        foreach (var guild in _client.Guilds)
+        {
+            try
+            {
+                await SyncActivityRolesInGuildAsync(guild, nowUtc);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to sync activity roles in guild {GuildId}.", guild.Id);
+            }
+        }
+    }
+
+    private async Task SyncActivityRolesInGuildAsync(SocketGuild guild, DateTimeOffset nowUtc)
+    {
+        // Guild member cache can be incomplete right after startup unless downloaded explicitly.
+        try
+        {
+            await guild.DownloadUsersAsync();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to download guild users before activity role sync. GuildId={GuildId}", guild.Id);
+        }
+
+        var (activeRole, inactiveRole) = await ResolveActivityRolesAsync(guild);
+
+        if (inactiveRole is null && activeRole is null)
+        {
+            return;
+        }
+
+        if (inactiveRole is not null && activeRole is not null && inactiveRole.Id == activeRole.Id)
+        {
+            _logger.LogWarning("Active role and inactive role are identical in guild {GuildId}. Active role sync is skipped.", guild.Id);
+            activeRole = null;
+        }
+
+        var cutoff = nowUtc.AddDays(-Math.Max(1, _options.InactiveRoleDays));
+        var activeUserIds = await _db.ListActiveUserIdsSinceAsync(guild.Id, cutoff);
+        var addedActive = 0;
+        var removedActive = 0;
+        var addedInactive = 0;
+        var removedInactive = 0;
+        var eligibleUsers = 0;
+
+        foreach (var user in guild.Users)
+        {
+            if (user.IsBot || user.Id == guild.OwnerId)
+            {
+                continue;
+            }
+
+            eligibleUsers++;
+            var hasInactiveRole = inactiveRole is not null && user.Roles.Any(role => role.Id == inactiveRole.Id);
+            var hasActiveRole = activeRole is not null && user.Roles.Any(role => role.Id == activeRole.Id);
+            var isActive = activeUserIds.Contains(user.Id);
+            var joinedAt = user.JoinedAt ?? user.CreatedAt;
+            var joinedRecently = joinedAt > cutoff;
+
+            if (isActive)
+            {
+                if (hasInactiveRole && inactiveRole is not null)
+                {
+                    try
+                    {
+                        await user.RemoveRoleAsync(inactiveRole);
+                        removedInactive++;
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Failed to remove inactive role. GuildId={GuildId}, UserId={UserId}", guild.Id, user.Id);
+                    }
+                }
+
+                if (!hasActiveRole && activeRole is not null)
+                {
+                    try
+                    {
+                        await user.AddRoleAsync(activeRole);
+                        addedActive++;
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Failed to add active role. GuildId={GuildId}, UserId={UserId}", guild.Id, user.Id);
+                    }
+                }
+
+                continue;
+            }
+
+            if (joinedRecently)
+            {
+                if (hasInactiveRole && inactiveRole is not null)
+                {
+                    try
+                    {
+                        await user.RemoveRoleAsync(inactiveRole);
+                        removedInactive++;
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Failed to remove inactive role from recently joined member. GuildId={GuildId}, UserId={UserId}", guild.Id, user.Id);
+                    }
+                }
+
+                continue;
+            }
+
+            if (hasActiveRole && activeRole is not null)
+            {
+                try
+                {
+                    await user.RemoveRoleAsync(activeRole);
+                    removedActive++;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to remove active role. GuildId={GuildId}, UserId={UserId}", guild.Id, user.Id);
+                }
+            }
+
+            if (!hasInactiveRole && inactiveRole is not null)
+            {
+                try
+                {
+                    await user.AddRoleAsync(inactiveRole);
+                    addedInactive++;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to add inactive role. GuildId={GuildId}, UserId={UserId}", guild.Id, user.Id);
+                }
+            }
+        }
+
+        _logger.LogInformation(
+            "Activity role sync completed. GuildId={GuildId}, EligibleUsers={EligibleUsers}, ActiveUsers={ActiveUsers}, +Active={AddedActive}, -Active={RemovedActive}, +Inactive={AddedInactive}, -Inactive={RemovedInactive}",
+            guild.Id,
+            eligibleUsers,
+            activeUserIds.Count,
+            addedActive,
+            removedActive,
+            addedInactive,
+            removedInactive);
+    }
+
+    private async Task<(IRole? ActiveRole, IRole? InactiveRole)> ResolveActivityRolesAsync(SocketGuild guild)
+    {
+        var inactiveRoleName = string.IsNullOrWhiteSpace(_options.InactiveRoleName) ? "非アクティブ" : _options.InactiveRoleName;
+        IRole? inactiveRole = null;
+        if (_options.InactiveRoleEnabled)
+        {
+            inactiveRole = guild.Roles.FirstOrDefault(role =>
+                string.Equals(role.Name, inactiveRoleName, StringComparison.OrdinalIgnoreCase));
+
+            if (inactiveRole is null && _options.AutoCreateInactiveRole)
+            {
+                inactiveRole = await guild.CreateRoleAsync(
+                    inactiveRoleName,
+                    GuildPermissions.None,
+                    color: new Color(127, 140, 141),
+                    isHoisted: false,
+                    isMentionable: false);
+            }
+        }
+
+        var activeRoleName = string.IsNullOrWhiteSpace(_options.ActiveRoleName) ? "アクティブ" : _options.ActiveRoleName;
+        IRole? activeRole = null;
+        if (_options.ActiveRoleEnabled)
+        {
+            activeRole = guild.Roles.FirstOrDefault(role =>
+                string.Equals(role.Name, activeRoleName, StringComparison.OrdinalIgnoreCase));
+
+            if (activeRole is null && _options.AutoCreateActiveRole)
+            {
+                activeRole = await guild.CreateRoleAsync(
+                    activeRoleName,
+                    GuildPermissions.None,
+                    color: new Color(46, 204, 113),
+                    isHoisted: false,
+                    isMentionable: false);
+            }
+        }
+
+        if (activeRole is not null && inactiveRole is not null && activeRole.Id == inactiveRole.Id)
+        {
+            _logger.LogWarning("Active role and inactive role are identical in guild {GuildId}. Active role sync is skipped.", guild.Id);
+            activeRole = null;
+        }
+
+        return (activeRole, inactiveRole);
+    }
+
+    private async Task MarkUserActiveNowAsync(SocketGuild guild, ulong userId)
+    {
+        if (!(_options.ActiveRoleEnabled || _options.InactiveRoleEnabled))
+        {
+            return;
+        }
+
+        var user = guild.GetUser(userId);
+        if (user is null || user.IsBot || user.Id == guild.OwnerId)
+        {
+            return;
+        }
+
+        IRole? activeRole;
+        IRole? inactiveRole;
+        try
+        {
+            (activeRole, inactiveRole) = await ResolveActivityRolesAsync(guild);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to resolve activity roles for immediate apply. GuildId={GuildId}, UserId={UserId}", guild.Id, userId);
+            return;
+        }
+
+        if (activeRole is null && inactiveRole is null)
+        {
+            return;
+        }
+
+        try
+        {
+            var removedInactive = false;
+            var addedActive = false;
+            if (inactiveRole is not null && user.Roles.Any(role => role.Id == inactiveRole.Id))
+            {
+                await user.RemoveRoleAsync(inactiveRole);
+                removedInactive = true;
+            }
+
+            if (activeRole is not null && !user.Roles.Any(role => role.Id == activeRole.Id))
+            {
+                await user.AddRoleAsync(activeRole);
+                addedActive = true;
+            }
+
+            if (removedInactive || addedActive)
+            {
+                _logger.LogInformation(
+                    "Applied immediate activity role update. GuildId={GuildId}, UserId={UserId}, AddedActive={AddedActive}, RemovedInactive={RemovedInactive}",
+                    guild.Id,
+                    userId,
+                    addedActive,
+                    removedInactive);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to immediately apply active role. GuildId={GuildId}, UserId={UserId}", guild.Id, userId);
+        }
+    }
+
+    private async Task HandleRecruitPostDeletedAsync(SocketGuild guild, SocketGuildChannel deletedChannel, RecruitPost post)
+    {
+        if (post.Status is RecruitPostStatus.Closed or RecruitPostStatus.Canceled)
+        {
+            return;
+        }
+
+        await _db.UpdateRecruitPostStatusAsync(post.Id, RecruitPostStatus.Canceled);
+        post.Status = RecruitPostStatus.Canceled;
+        await TryPostRecruitNoticeAsync(guild, post, "募集メッセージが削除されたため募集を自動キャンセルしました。");
+        await TryArchiveRecruitThreadAsync(post, lockThread: true);
+
+        if (guild.GetTextChannel(ToUlong(post.ChannelId)) is IMessageChannel fallback)
+        {
+            await _recruitListService.RefreshAsync(guild, fallback);
+        }
+        else if (deletedChannel is IMessageChannel deletedMessageChannel)
+        {
+            await _recruitListService.RefreshAsync(guild, deletedMessageChannel);
+        }
+    }
+
+    private async Task UpdateRecruitPostMessageAsync(SocketGuild guild, RecruitPost post)
+    {
+        var channel = guild.GetTextChannel(ToUlong(post.ChannelId));
+        if (channel is null)
+        {
+            return;
+        }
+
+        IUserMessage? message = null;
+        try
+        {
+            message = await channel.GetMessageAsync(ToUlong(post.MessageId)) as IUserMessage;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to fetch recruit message {MessageId} in channel {ChannelId}.", ToUlong(post.MessageId), channel.Id);
+        }
+
+        if (message is null)
+        {
+            return;
+        }
+
+        var slots = await _db.ListRecruitSlotsAsync(post.Id);
+        var embed = BuildRecruitEmbed(post, slots);
+        var positions = GetOrderedPositions(slots.Where(slot => !slot.IsClosed).ToList());
+        await message.ModifyAsync(props =>
+        {
+            props.Embed = embed;
+            props.Components = RecruitmentPanel.BuildRecruitComponents(post.Status, positions);
+        });
+    }
+
+    private async Task<bool> TryPostRecruitNoticeAsync(SocketGuild guild, RecruitPost post, string text)
+    {
+        var thread = post.ThreadChannelId.HasValue
+            ? await ResolveRecruitThreadChannelAsync(ToUlong(post.ThreadChannelId.Value))
+            : null;
+
+        if (thread is not null)
+        {
+            try
+            {
+                await thread.SendMessageAsync(text);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to post recruit notice in thread for post {PostId}.", post.Id);
+            }
+        }
+
+        var channel = guild.GetTextChannel(ToUlong(post.ChannelId));
+        if (channel is null)
+        {
+            return false;
+        }
+
+        var link = BuildMessageLink(guild.Id, channel.Id, ToUlong(post.MessageId));
+        try
+        {
+            await channel.SendMessageAsync($"{text}\n<{link}>");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to post recruit notice in channel for post {PostId}.", post.Id);
+            return false;
+        }
+    }
+
+    private async Task TryArchiveRecruitThreadAsync(RecruitPost post, bool lockThread)
+    {
+        if (!post.ThreadChannelId.HasValue)
+        {
+            return;
+        }
+
+        var thread = await ResolveRecruitThreadChannelAsync(ToUlong(post.ThreadChannelId.Value));
+        if (thread is null)
+        {
+            return;
+        }
+
+        try
+        {
+            await thread.ModifyAsync(props =>
+            {
+                props.Archived = true;
+                props.Locked = lockThread;
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to archive recruit thread {ChannelId}.", thread.Id);
+        }
+    }
+
+    private async Task<IThreadChannel?> ResolveRecruitThreadChannelAsync(ulong channelId)
+    {
+        if (_client.GetChannel(channelId) is IThreadChannel cached)
+        {
+            return cached;
+        }
+
+        try
+        {
+            var channel = await _client.Rest.GetChannelAsync(channelId);
+            return channel as IThreadChannel;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to resolve recruit thread channel {ChannelId}.", channelId);
+            return null;
+        }
+    }
+
+    private static Embed BuildRecruitEmbed(RecruitPost post, IReadOnlyList<RecruitSlot> slots)
+    {
+        var filled = slots.Count(slot => slot.UserId.HasValue || slot.IsClosed);
+        var max = slots.Count > 0 ? slots.Count : RecruitmentRules.Positions.Count;
+        var status = post.Status switch
+        {
+            RecruitPostStatus.Full => "満員",
+            RecruitPostStatus.Closed => "終了",
+            RecruitPostStatus.Canceled => "キャンセル",
+            _ => "募集中"
+        };
+
+        var embed = new EmbedBuilder()
+            .WithTitle($"募集: {post.Title}")
+            .WithColor(new Color(250, 177, 160))
+            .WithCurrentTimestamp()
+            .AddField("主催", MentionUser(ToUlong(post.CreatorUserId)), true)
+            .AddField("DC", string.IsNullOrWhiteSpace(post.DataCenter) ? "未指定" : post.DataCenter, true)
+            .AddField("開始", FormatRecruitSchedule(post.ScheduleText, post.ScheduleAt), true)
+            .AddField("人数", $"{filled}/{max}", true)
+            .AddField("状態", status, true)
+            .AddField("コメント", string.IsNullOrWhiteSpace(post.Note) ? "なし" : post.Note, false)
+            .AddField("ポジション", BuildRecruitSlotLines(slots), false)
+            .WithFooter("メニューで参加できます（ジョブ重複不可）");
+
+        return embed.Build();
+    }
+
+    private static string BuildRecruitSlotLines(IReadOnlyList<RecruitSlot> slots)
+    {
+        if (slots.Count == 0)
+        {
+            return "なし";
+        }
+
+        var map = slots
+            .GroupBy(slot => slot.Position, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(group => group.Key, group => group.First(), StringComparer.OrdinalIgnoreCase);
+
+        var ordered = GetOrderedPositions(slots);
+        var lines = new List<string>();
+        foreach (var position in ordered)
+        {
+            if (!map.TryGetValue(position, out var slot))
+            {
+                lines.Add($"{position}: 空き");
+                continue;
+            }
+
+            if (slot.IsClosed && !slot.UserId.HasValue)
+            {
+                var closedJob = string.IsNullOrWhiteSpace(slot.Job) ? "?" : slot.Job;
+                lines.Add($"{position}: 〆（{closedJob}）");
+                continue;
+            }
+
+            if (!slot.UserId.HasValue)
+            {
+                lines.Add($"{position}: 空き");
+                continue;
+            }
+
+            var job = string.IsNullOrWhiteSpace(slot.Job) ? "?" : slot.Job;
+            lines.Add($"{position}: {MentionUser(ToUlong(slot.UserId.Value))} ({job})");
+        }
+
+        return string.Join('\n', lines);
+    }
+
+    private static IReadOnlyList<string> GetOrderedPositions(IReadOnlyList<RecruitSlot> slots)
+    {
+        if (slots.Count == 0)
+        {
+            return RecruitmentRules.Positions;
+        }
+
+        var set = new HashSet<string>(slots.Select(slot => slot.Position), StringComparer.OrdinalIgnoreCase);
+        var ordered = RecruitmentRules.Positions.Where(set.Contains).ToList();
+        if (ordered.Count > 0)
+        {
+            return ordered;
+        }
+
+        return slots
+            .Select(slot => slot.Position)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private static string FormatRecruitSchedule(string? scheduleText, DateTimeOffset? scheduleAt)
+    {
+        if (!string.IsNullOrWhiteSpace(scheduleText))
+        {
+            return scheduleText;
+        }
+
+        if (!scheduleAt.HasValue)
+        {
+            return "未定";
+        }
+
+        return scheduleAt.Value
+            .ToOffset(JapanTimeOffset)
+            .ToString(RecruitScheduleFormat, System.Globalization.CultureInfo.InvariantCulture);
+    }
+
+    private async Task EnsurePanelMessageAsync(ulong guildId, IMessageChannel channel, ulong? existingMessageId)
+    {
+        IUserMessage? existing = null;
+        if (existingMessageId.HasValue)
+        {
+            try
+            {
+                existing = await channel.GetMessageAsync(existingMessageId.Value) as IUserMessage;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to fetch existing panel message.");
+            }
+        }
+
+        var components = MemberRegistrationPanel.BuildComponents();
+        if (existing is not null)
+        {
+            await existing.ModifyAsync(props =>
+            {
+                props.Content = MemberRegistrationPanel.PanelMessage;
+                props.Components = components;
+            });
+            _logger.LogInformation("Panel message updated in channel {ChannelId}.", channel.Id);
+            return;
+        }
+
+        var posted = await channel.SendMessageAsync(MemberRegistrationPanel.PanelMessage, components: components, flags: MessageFlags.SuppressNotification);
+        await _db.UpsertGuildPanelAsync(guildId, channel.Id, posted.Id);
+        _logger.LogInformation("Panel message posted in channel {ChannelId}.", channel.Id);
+    }
+
+    private async Task EnsureControlPanelMessageAsync(ulong guildId, IMessageChannel channel)
+    {
+        var panel = await _db.GetGuildControlPanelAsync(guildId);
+        ulong? existingMessageId = panel is null || panel.MessageId == 0 ? null : ToUlong(panel.MessageId);
+        IUserMessage? existing = null;
+        if (existingMessageId.HasValue)
+        {
+            try
+            {
+                existing = await channel.GetMessageAsync(existingMessageId.Value) as IUserMessage;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to fetch existing control panel message.");
+            }
+        }
+
+        var components = ControlPanel.BuildComponents();
+        if (existing is not null)
+        {
+            await existing.ModifyAsync(props => props.Components = components);
+            return;
+        }
+
+        var posted = await channel.SendMessageAsync(ControlPanel.PanelMessage, components: components, flags: MessageFlags.SuppressNotification);
+        await _db.UpsertGuildControlPanelAsync(guildId, channel.Id, posted.Id);
+    }
+
+    private async Task EnsureVisibilityAsync(
+        SocketGuild guild,
+        IRole adminRole,
+        IRole memberRole,
+        IMessageChannel? registrationChannel,
+        IMessageChannel logChannel,
+        IMessageChannel notificationChannel,
+        IMessageChannel controlChannel,
+        IMessageChannel? activityRankingChannel)
+    {
+        var everyoneRole = guild.EveryoneRole;
+        var registrationAllow = new OverwritePermissions(
+            viewChannel: PermValue.Allow,
+            readMessageHistory: PermValue.Allow,
+            sendMessages: PermValue.Allow);
+
+        if (registrationChannel is IGuildChannel regGuildChannel && regGuildChannel is not IThreadChannel)
+        {
+            await regGuildChannel.AddPermissionOverwriteAsync(everyoneRole, registrationAllow);
+            await regGuildChannel.AddPermissionOverwriteAsync(memberRole, registrationAllow);
+            await regGuildChannel.AddPermissionOverwriteAsync(adminRole, registrationAllow);
+        }
+
+        var denyView = new OverwritePermissions(viewChannel: PermValue.Deny);
+        var allowView = new OverwritePermissions(viewChannel: PermValue.Allow, readMessageHistory: PermValue.Allow);
+
+        if (logChannel is IGuildChannel logGuildChannel && logGuildChannel is not IThreadChannel)
+        {
+            await logGuildChannel.AddPermissionOverwriteAsync(everyoneRole, denyView);
+            await logGuildChannel.AddPermissionOverwriteAsync(memberRole, denyView);
+            await logGuildChannel.AddPermissionOverwriteAsync(adminRole, allowView);
+        }
+
+        if (notificationChannel is IGuildChannel notificationGuildChannel && notificationGuildChannel is not IThreadChannel)
+        {
+            var notificationMember = new OverwritePermissions(viewChannel: PermValue.Allow, readMessageHistory: PermValue.Allow, sendMessages: PermValue.Deny);
+            var notificationAdmin = new OverwritePermissions(viewChannel: PermValue.Allow, readMessageHistory: PermValue.Allow, sendMessages: PermValue.Allow);
+            await notificationGuildChannel.AddPermissionOverwriteAsync(everyoneRole, denyView);
+            await notificationGuildChannel.AddPermissionOverwriteAsync(memberRole, notificationMember);
+            await notificationGuildChannel.AddPermissionOverwriteAsync(adminRole, notificationAdmin);
+        }
+
+        if (controlChannel is IGuildChannel controlGuildChannel && controlGuildChannel is not IThreadChannel)
+        {
+            var memberSend = _options.ControlChannelMemberCanSend ? PermValue.Allow : PermValue.Deny;
+            var controlMember = new OverwritePermissions(viewChannel: PermValue.Allow, readMessageHistory: PermValue.Allow, sendMessages: memberSend);
+            var controlAdmin = new OverwritePermissions(viewChannel: PermValue.Allow, readMessageHistory: PermValue.Allow, sendMessages: PermValue.Allow);
+            await controlGuildChannel.AddPermissionOverwriteAsync(everyoneRole, denyView);
+            await controlGuildChannel.AddPermissionOverwriteAsync(memberRole, controlMember);
+            await controlGuildChannel.AddPermissionOverwriteAsync(adminRole, controlAdmin);
+        }
+
+        if (activityRankingChannel is IGuildChannel rankingGuildChannel && rankingGuildChannel is not IThreadChannel)
+        {
+            var rankingMember = new OverwritePermissions(viewChannel: PermValue.Allow, readMessageHistory: PermValue.Allow, sendMessages: PermValue.Deny);
+            var rankingAdmin = new OverwritePermissions(viewChannel: PermValue.Allow, readMessageHistory: PermValue.Allow, sendMessages: PermValue.Allow);
+            await rankingGuildChannel.AddPermissionOverwriteAsync(everyoneRole, denyView);
+            await rankingGuildChannel.AddPermissionOverwriteAsync(memberRole, rankingMember);
+            await rankingGuildChannel.AddPermissionOverwriteAsync(adminRole, rankingAdmin);
+        }
+
+        foreach (var channel in guild.Channels)
+        {
+            if (channel is IThreadChannel)
+            {
+                continue;
+            }
+
+            if ((registrationChannel is not null && channel.Id == registrationChannel.Id)
+                || channel.Id == logChannel.Id
+                || channel.Id == notificationChannel.Id
+                || channel.Id == controlChannel.Id
+                || (activityRankingChannel is not null && channel.Id == activityRankingChannel.Id))
+            {
+                continue;
+            }
+
+            await channel.AddPermissionOverwriteAsync(everyoneRole, denyView);
+            await channel.AddPermissionOverwriteAsync(memberRole, allowView);
+            await channel.AddPermissionOverwriteAsync(adminRole, allowView);
+        }
+    }
+
+    private async Task OnUserJoinedAsync(SocketGuildUser user)
+    {
+        var summary = BuildMemberSummary(user, user.Guild.MemberCount);
+        var embed = CreateLogEmbedBase(user.Guild, "メンバー参加", Color.Green, user)
+            .WithDescription(summary)
+            .Build();
+
+        await SendLogEmbedAsync(user.Guild, embed);
+        _ = _stats.RefreshIfConfiguredAsync(user.Guild);
+    }
+
+    private async Task OnUserLeftAsync(SocketGuild guild, SocketUser user)
+    {
+        var summary = BuildMemberSummary(user, guild.MemberCount);
+        var embed = CreateLogEmbedBase(guild, "メンバー退出", Color.DarkGrey, user)
+            .WithDescription(summary)
+            .Build();
+
+        await SendLogEmbedAsync(guild, embed);
+        _ = _stats.RefreshIfConfiguredAsync(guild);
+    }
+
+    private async Task OnGuildMemberUpdatedAsync(Cacheable<SocketGuildUser, ulong> beforeCache, SocketGuildUser after)
+    {
+        await Task.CompletedTask;
+    }
+
+    private async Task OnUserVoiceStateUpdatedAsync(SocketUser user, SocketVoiceState before, SocketVoiceState after)
+    {
+        if (user.IsBot)
+        {
+            return;
+        }
+
+        var beforeChannel = before.VoiceChannel;
+        var afterChannel = after.VoiceChannel;
+
+        if (beforeChannel?.Id == afterChannel?.Id)
+        {
+            return;
+        }
+
+        var guild = (user as SocketGuildUser)?.Guild ?? beforeChannel?.Guild ?? afterChannel?.Guild;
+        if (guild is null)
+        {
+            return;
+        }
+
+        await MarkUserActiveNowAsync(guild, user.Id);
+
+        var now = DateTimeOffset.UtcNow;
+        var lobby = FindTempVoiceLobby(guild);
+        if (afterChannel is not null && lobby is not null && afterChannel.Id == lobby.Id)
+        {
+            var handled = await HandleTempVoiceLobbyJoinAsync(guild, lobby, user);
+            if (handled)
+            {
+                return;
+            }
+        }
+
+        if (afterChannel is not null && IsTempVoiceChannel(afterChannel, lobby))
+        {
+            CancelTempVoiceDeletion(afterChannel.Id);
+        }
+
+        if (beforeChannel is not null && IsTempVoiceChannel(beforeChannel, lobby) && beforeChannel.Id != afterChannel?.Id)
+        {
+            await HandleTempVoiceOwnerLeftAsync(beforeChannel, user);
+        }
+        var duration = await ResolveVoiceDurationAsync(guild, user, beforeChannel, now);
+        var summary = BuildVoiceSummary(guild, user, beforeChannel, afterChannel, duration);
+        var isFirstJoinInChannel = IsFirstHumanJoinInChannel(beforeChannel, afterChannel);
+        var endedChannel = ResolveEndedVoiceChannel(beforeChannel, afterChannel);
+        var shouldNotifyUserVoiceActivity = true;
+        if (isFirstJoinInChannel || endedChannel is not null)
+        {
+            shouldNotifyUserVoiceActivity = await ShouldNotifyUserVoiceActivityAsync(user.Id);
+        }
+
+        string title;
+        Color color;
+        if (beforeChannel is null && afterChannel is not null)
+        {
+            title = "VC参加";
+            color = Color.Green;
+        }
+        else if (beforeChannel is not null && afterChannel is null)
+        {
+            title = "VC退出";
+            color = Color.DarkGrey;
+        }
+        else
+        {
+            title = "VC移動";
+            color = Color.Orange;
+        }
+
+        var embed = CreateLogEmbedBase(guild, title, color, user, preferGuildDisplayName: true)
+            .WithDescription(summary)
+            .Build();
+
+        await SendLogEmbedAsync(guild, embed);
+
+        if (shouldNotifyUserVoiceActivity && isFirstJoinInChannel && afterChannel is not null)
+        {
+            var firstJoinEmbed = CreateLogEmbedBase(guild, "通話開始", Color.Green, user, preferGuildDisplayName: true)
+                .WithDescription(BuildVoiceFirstJoinSummary(guild, user, afterChannel, now))
+                .Build();
+            await SendNotificationEmbedAsync(guild, firstJoinEmbed, mentionVoiceRole: true);
+        }
+
+        if (shouldNotifyUserVoiceActivity && endedChannel is not null)
+        {
+            var endedEmbed = CreateLogEmbedBase(guild, "通話終了", Color.DarkGrey, user, preferGuildDisplayName: true)
+                .WithDescription(BuildVoiceCallEndedSummary(guild, user, endedChannel, now, duration))
+                .Build();
+            await SendNotificationEmbedAsync(guild, endedEmbed, mentionVoiceRole: true);
+        }
+
+        if (afterChannel is not null && _options.VoiceProfileEmbedEnabled)
+        {
+            await SendVoiceJoinEmbedAsync(afterChannel, user, now);
+        }
+
+        if (beforeChannel is null && afterChannel is not null)
+        {
+            await CloseOpenVoiceSessionAsync(guild, user, now);
+            await _db.StartVoiceSessionAsync(guild.Id, afterChannel.Id, user.Id, user.ToString() ?? string.Empty, now);
+        }
+        else if (beforeChannel is not null && afterChannel is null)
+        {
+            await CloseVoiceSessionAsync(guild, user, beforeChannel, now);
+        }
+        else if (beforeChannel is not null && afterChannel is not null)
+        {
+            await CloseVoiceSessionAsync(guild, user, beforeChannel, now);
+            await _db.StartVoiceSessionAsync(guild.Id, afterChannel.Id, user.Id, user.ToString() ?? string.Empty, now);
+        }
+
+        if (beforeChannel is not null && IsTempVoiceChannel(beforeChannel, lobby) && beforeChannel.ConnectedUsers.Count == 0)
+        {
+            await _voiceTextService.ClearOwnerTransferAsync(beforeChannel);
+            await ScheduleTempVoiceDeletionAsync(beforeChannel);
+        }
+    }
+
+    private async Task OnMessageDeletedAsync(Cacheable<IMessage, ulong> cache, Cacheable<IMessageChannel, ulong> channelCache)
+    {
+        if (channelCache.HasValue && channelCache.Value is SocketGuildChannel guildChannel)
+        {
+            var recruitPost = await _db.GetRecruitPostByMessageIdAsync(cache.Id);
+            if (recruitPost is not null)
+            {
+                try
+                {
+                    await HandleRecruitPostDeletedAsync(guildChannel.Guild, guildChannel, recruitPost);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to cleanup recruit post after message deletion. MessageId={MessageId}", cache.Id);
+                }
+            }
+
+            var message = cache.HasValue ? cache.Value : null;
+            var fromDb = await _db.GetMessageAsync(cache.Id);
+
+            if (fromDb is null && message?.Author?.IsBot == true)
+            {
+                return;
+            }
+
+            var authorId = fromDb is null ? message?.Author.Id : ToUlong(fromDb.AuthorId);
+            var authorName = fromDb is null ? message?.Author.ToString() : fromDb.AuthorName;
+            var authorUser = authorId.HasValue ? guildChannel.Guild.GetUser(authorId.Value) : null;
+
+            var author = authorId.HasValue
+                ? $"{MentionUser(authorId.Value)} ({authorName ?? "不明"})"
+                : "不明";
+
+            var content = fromDb is null
+                ? (string.IsNullOrWhiteSpace(message?.Content) ? "(内容取得不可)" : message.Content)
+                : (string.IsNullOrWhiteSpace(fromDb.Content) ? "(内容なし)" : fromDb.Content);
+
+            var attachments = fromDb?.AttachmentCount ?? message?.Attachments.Count ?? 0;
+            var embeds = fromDb?.EmbedCount ?? message?.Embeds.Count ?? 0;
+            var category = ResolveCategoryName(guildChannel);
+            var messageLink = BuildMessageLink(guildChannel.Guild.Id, guildChannel.Id, cache.Id);
+            var deletedBy = await TryResolveDeleterAsync(guildChannel.Guild, authorId, guildChannel.Id);
+            var createdAt = fromDb?.CreatedAt ?? message?.Timestamp;
+            var editedAt = fromDb?.EditedAt;
+            var summary = BuildMessageSummary(
+                guildChannel,
+                author,
+                category,
+                createdAt,
+                editedAt,
+                attachments,
+                embeds,
+                messageLink,
+                deletedBy);
+
+            if (!IsLogIgnoredChannel(guildChannel))
+            {
+                var attachmentUrls = ListAttachmentUrls(message, fromDb);
+                var previewImageUrl = ResolvePreviewImageUrl(message, fromDb);
+                var embedBuilder = CreateLogEmbedBase(guildChannel.Guild, "メッセージ削除", Color.Orange, authorUser)
+                    .WithDescription(summary)
+                    .AddField("メッセージID", cache.Id, true);
+
+                if (_options.LogIncludeMessageContent)
+                {
+                    embedBuilder.AddField("内容", Truncate(content, 900));
+                }
+
+                if (attachmentUrls.Count > 0)
+                {
+                    var links = string.Join('\n', attachmentUrls.Select(url => $"・{url}"));
+                    embedBuilder.AddField("添付ファイル", Truncate(links, 1000), false);
+                }
+                else if (attachments > 0)
+                {
+                    embedBuilder.AddField("添付ファイル", "(キャッシュ未取得のためURL不明)", false);
+                }
+
+                if (!string.IsNullOrWhiteSpace(previewImageUrl))
+                {
+                    embedBuilder.WithImageUrl(previewImageUrl);
+                }
+
+                var embed = embedBuilder.Build();
+                await SendLogEmbedAsync(guildChannel.Guild, embed);
+            }
+
+            await _db.MarkMessageDeletedAsync(cache.Id);
+        }
+    }
+
+    private async Task OnMessageUpdatedAsync(Cacheable<IMessage, ulong> beforeCache, SocketMessage after, ISocketMessageChannel channel)
+    {
+        if (channel is not SocketGuildChannel guildChannel)
+        {
+            return;
+        }
+
+        if (after.Author.IsBot)
+        {
+            return;
+        }
+
+        var stored = await _db.GetMessageAsync(after.Id);
+        var before = beforeCache.HasValue ? beforeCache.Value.Content : stored?.Content ?? "(内容取得不可)";
+        var afterContent = string.IsNullOrWhiteSpace(after.Content) ? "(内容取得不可)" : after.Content;
+        var contentChanged = !string.Equals(before, afterContent, StringComparison.Ordinal);
+        var attachments = after.Attachments.Count;
+        var embeds = after.Embeds.Count;
+        var attachmentOrEmbedChanged = stored is null
+            || stored.AttachmentCount != attachments
+            || stored.EmbedCount != embeds;
+
+        if (!contentChanged && !attachmentOrEmbedChanged)
+        {
+            return;
+        }
+
+        var author = $"{after.Author} ({after.Author.Id})";
+        var category = ResolveCategoryName(guildChannel);
+        var messageLink = BuildMessageLink(guildChannel.Guild.Id, guildChannel.Id, after.Id);
+        var createdAt = after.Timestamp;
+        var editedAt = after.EditedTimestamp;
+        var summary = BuildMessageSummary(
+            guildChannel,
+            author,
+            category,
+            createdAt,
+            editedAt,
+            attachments,
+            embeds,
+            messageLink);
+
+        if (!IsLogIgnoredChannel(guildChannel))
+        {
+            var embedBuilder = CreateLogEmbedBase(guildChannel.Guild, "メッセージ編集", Color.Gold, after.Author)
+                .WithDescription(summary)
+                .AddField("メッセージID", after.Id, true);
+
+            if (_options.LogIncludeMessageContent && contentChanged)
+            {
+                embedBuilder.AddField("編集前", Truncate(before, 900))
+                            .AddField("編集後", Truncate(afterContent, 900));
+            }
+
+            var embed = embedBuilder.Build();
+            await SendLogEmbedAsync(guildChannel.Guild, embed);
+        }
+
+        var archivedAttachmentPaths = await ArchiveMessageAttachmentsAsync(guildChannel.Guild.Id, guildChannel.Id, after.Id, after.Attachments);
+        var attachmentsJson = BuildAttachmentsJson(after.Attachments, archivedAttachmentPaths);
+        var embedsJson = BuildEmbedsJson(after.Embeds);
+        await _db.UpdateMessageAsync(after.Id, afterContent, attachments, embeds, attachmentsJson, embedsJson);
+    }
+
+    private async Task OnMessageReceivedAsync(SocketMessage message)
+    {
+        if (message.Author.IsBot)
+        {
+            return;
+        }
+
+        if (message is not SocketUserMessage userMessage)
+        {
+            return;
+        }
+
+        if (message.Channel is not SocketGuildChannel guildChannel)
+        {
+            return;
+        }
+
+        var guildUser = message.Author as SocketGuildUser ?? guildChannel.Guild.GetUser(message.Author.Id);
+        var authorDisplayName = guildUser?.DisplayName ?? guildUser?.GlobalName;
+        var content = userMessage.Content ?? string.Empty;
+        var archivedAttachmentPaths = await ArchiveMessageAttachmentsAsync(guildChannel.Guild.Id, guildChannel.Id, userMessage.Id, userMessage.Attachments);
+        var attachmentsJson = BuildAttachmentsJson(userMessage.Attachments, archivedAttachmentPaths);
+        var embedsJson = BuildEmbedsJson(userMessage.Embeds);
+        await _db.UpsertMessageAsync(
+            guildChannel.Guild.Id,
+            guildChannel.Id,
+            userMessage.Id,
+            userMessage.Author.Id,
+            userMessage.Author.ToString(),
+            authorDisplayName,
+            content,
+            userMessage.Attachments.Count,
+            userMessage.Embeds.Count,
+            attachmentsJson,
+            embedsJson,
+            userMessage.Timestamp);
+        await MarkUserActiveNowAsync(guildChannel.Guild, userMessage.Author.Id);
+    }
+
+    private async Task OnReactionAddedAsync(Cacheable<IUserMessage, ulong> _, Cacheable<IMessageChannel, ulong> channelCache, SocketReaction reaction)
+    {
+        if (reaction.UserId == _client.CurrentUser.Id)
+        {
+            return;
+        }
+
+        if (reaction.User.IsSpecified && reaction.User.Value.IsBot)
+        {
+            return;
+        }
+
+        IMessageChannel? channel = null;
+        if (channelCache.HasValue)
+        {
+            channel = channelCache.Value;
+        }
+        else
+        {
+            try
+            {
+                channel = await channelCache.GetOrDownloadAsync();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to resolve reaction channel. ChannelId={ChannelId}", channelCache.Id);
+                return;
+            }
+        }
+
+        if (channel is not SocketGuildChannel guildChannel)
+        {
+            return;
+        }
+
+        try
+        {
+            var emojiKey = BuildEmojiKey(reaction.Emote);
+            await _db.UpsertReactionAsync(
+                guildChannel.Guild.Id,
+                guildChannel.Id,
+                reaction.MessageId,
+                reaction.UserId,
+                emojiKey,
+                DateTimeOffset.UtcNow);
+            await MarkUserActiveNowAsync(guildChannel.Guild, reaction.UserId);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to upsert reaction activity. GuildId={GuildId}, UserId={UserId}", guildChannel.Guild.Id, reaction.UserId);
+        }
+    }
+
+    private EmbedBuilder CreateLogEmbedBase(SocketGuild guild, string title, Color color, SocketUser? user = null, bool preferGuildDisplayName = false)
+    {
+        var builder = new EmbedBuilder()
+            .WithTitle(title)
+            .WithColor(color)
+            .WithCurrentTimestamp();
+
+        if (user is not null)
+        {
+            var avatar = user.GetAvatarUrl() ?? user.GetDefaultAvatarUrl();
+            string authorName;
+            if (preferGuildDisplayName)
+            {
+                var guildUser = guild.GetUser(user.Id);
+                authorName = guildUser?.DisplayName ?? guildUser?.GlobalName ?? user.GlobalName ?? user.Username;
+            }
+            else
+            {
+                authorName = user.GlobalName ?? user.Username;
+            }
+
+            builder.WithAuthor(authorName, avatar)
+                   .WithThumbnailUrl(avatar);
+        }
+
+        return builder;
+    }
+
+    private async Task SendLogEmbedAsync(SocketGuild guild, Embed embed)
+    {
+        var channel = await ResolveLogChannelAsync(guild);
+        if (channel is null)
+        {
+            return;
+        }
+
+        await channel.SendMessageAsync(embed: embed, flags: MessageFlags.SuppressNotification);
+    }
+
+    private async Task SendNotificationEmbedAsync(SocketGuild guild, Embed embed, bool mentionVoiceRole = false)
+    {
+        var channel = await ResolveNotificationChannelAsync(guild);
+        if (channel is null)
+        {
+            return;
+        }
+
+        if (!mentionVoiceRole || !_options.MentionVoiceNotificationRole)
+        {
+            await channel.SendMessageAsync(embed: embed);
+            return;
+        }
+
+        var role = ResolveVoiceNotificationRole(guild);
+        if (role is null)
+        {
+            await channel.SendMessageAsync(embed: embed);
+            return;
+        }
+
+        await channel.SendMessageAsync(text: MentionRole(role.Id), embed: embed);
+    }
+
+    private async Task<bool> ShouldNotifyUserVoiceActivityAsync(ulong userId)
+    {
+        try
+        {
+            return await _db.GetVoiceNotificationEnabledAsync(userId);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to resolve user voice notification setting. UserId={UserId}", userId);
+            return true;
+        }
+    }
+
+    private async Task<IMessageChannel?> ResolveLogChannelAsync(SocketGuild guild)
+    {
+        var settings = await _db.GetGuildSettingsAsync(guild.Id);
+        if (settings is not null && settings.LogChannelId != 0)
+        {
+            var channel = guild.GetTextChannel(ToUlong(settings.LogChannelId));
+            if (channel is not null)
+            {
+                return channel;
+            }
+        }
+
+        var logChannelName = string.IsNullOrWhiteSpace(_options.LogChannelName) ? "log" : _options.LogChannelName;
+        return guild.TextChannels.FirstOrDefault(c => string.Equals(c.Name, logChannelName, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private Task<IMessageChannel?> ResolveNotificationChannelAsync(SocketGuild guild)
+    {
+        var notificationChannelName = string.IsNullOrWhiteSpace(_options.NotificationChannelName) ? "notice" : _options.NotificationChannelName;
+        IMessageChannel? channel = guild.TextChannels.FirstOrDefault(c => string.Equals(c.Name, notificationChannelName, StringComparison.OrdinalIgnoreCase));
+        return Task.FromResult(channel);
+    }
+
+    private Task<IMessageChannel?> ResolveActivityRankingChannelAsync(SocketGuild guild)
+    {
+        var rankingChannelName = string.IsNullOrWhiteSpace(_options.ActivityRankingChannelName) ? "ランキング" : _options.ActivityRankingChannelName;
+        IMessageChannel? channel = guild.TextChannels.FirstOrDefault(c => string.Equals(c.Name, rankingChannelName, StringComparison.OrdinalIgnoreCase));
+        return Task.FromResult(channel);
+    }
+
+    private async Task<IUserMessage> UpsertDailyActivityRankingMessageAsync(
+        SocketGuild guild,
+        IMessageChannel channel,
+        ulong existingMessageId,
+        Embed embed)
+    {
+        IUserMessage? existing = null;
+        if (existingMessageId != 0)
+        {
+            try
+            {
+                existing = await channel.GetMessageAsync(existingMessageId) as IUserMessage;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to fetch daily activity ranking message by id. GuildId={GuildId}, MessageId={MessageId}", guild.Id, existingMessageId);
+            }
+        }
+
+        try
+        {
+            if (existing is null)
+            {
+                var recent = await channel.GetMessagesAsync(50).FlattenAsync();
+                existing = recent
+                    .OfType<IUserMessage>()
+                    .FirstOrDefault(message =>
+                        message.Author.Id == _client.CurrentUser.Id &&
+                        string.Equals(message.Content, ActivityRankingPanel.DailyMessageHeader, StringComparison.Ordinal));
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to find daily activity ranking message. GuildId={GuildId}", guild.Id);
+        }
+
+        if (existing is not null)
+        {
+            await existing.ModifyAsync(props =>
+            {
+                props.Content = ActivityRankingPanel.DailyMessageHeader;
+                props.Embed = embed;
+            });
+            return existing;
+        }
+
+        return await channel.SendMessageAsync(
+            text: ActivityRankingPanel.DailyMessageHeader,
+            embed: embed,
+            flags: MessageFlags.SuppressNotification);
+    }
+
+    private IRole? ResolveVoiceNotificationRole(SocketGuild guild)
+    {
+        var roleName = string.IsNullOrWhiteSpace(_options.VoiceNotificationRoleName) ? "通話通知" : _options.VoiceNotificationRoleName;
+        return guild.Roles.FirstOrDefault(role =>
+            string.Equals(role.Name, roleName, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static string Truncate(string value, int maxLength)
+    {
+        if (string.IsNullOrEmpty(value) || value.Length <= maxLength)
+        {
+            return value;
+        }
+
+        return value[..maxLength] + "…";
+    }
+
+    private static string ChannelMention(IGuildChannel channel) => $"<#{channel.Id}>";
+    private static string MentionUser(ulong userId) => $"<@{userId}>";
+    private static string MentionRole(ulong roleId) => $"<@&{roleId}>";
+    private static string BuildEmojiKey(IEmote emote)
+    {
+        return emote switch
+        {
+            Emote custom => $"custom:{custom.Id}",
+            Emoji unicode => $"unicode:{(string.IsNullOrWhiteSpace(unicode.Name) ? "unknown" : unicode.Name)}",
+            _ => emote.ToString() ?? "unknown"
+        };
+    }
+
+    private static string FormatTimestamp(DateTimeOffset time) => $"<t:{time.ToUnixTimeSeconds()}:F>";
+    private static string BuildMessageLink(ulong guildId, ulong channelId, ulong messageId)
+        => $"https://discord.com/channels/{guildId}/{channelId}/{messageId}";
+
+    private static string BuildSlashCommandPath(SocketSlashCommand slash)
+    {
+        var parts = new List<string> { slash.CommandName };
+        AppendSlashCommandPathParts(slash.Data.Options, parts);
+        return "/" + string.Join(' ', parts);
+    }
+
+    private static void AppendSlashCommandPathParts(IReadOnlyCollection<SocketSlashCommandDataOption> options, List<string> parts)
+    {
+        if (options.Count == 0)
+        {
+            return;
+        }
+
+        var next = options.FirstOrDefault(option =>
+            option.Type is ApplicationCommandOptionType.SubCommand or ApplicationCommandOptionType.SubCommandGroup);
+
+        if (next is null)
+        {
+            return;
+        }
+
+        parts.Add(next.Name);
+        AppendSlashCommandPathParts(next.Options, parts);
+    }
+
+    private static bool IsLikelyRecent(DateTimeOffset timestamp)
+        => DateTimeOffset.UtcNow - timestamp < TimeSpan.FromSeconds(20);
+
+    private bool IsLogIgnoredChannel(SocketGuildChannel channel)
+    {
+        var names = _options.LogIgnoreChannelNames;
+        if (names is null || names.Length == 0)
+        {
+            return false;
+        }
+
+        return names.Any(name => string.Equals(name, channel.Name, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private async Task<string?> TryResolveDeleterAsync(SocketGuild guild, ulong? authorId, ulong channelId)
+    {
+        try
+        {
+            var logs = await guild.GetAuditLogsAsync(10, actionType: ActionType.MessageDeleted).FlattenAsync();
+            foreach (var entry in logs)
+            {
+                if (entry is Discord.Rest.RestAuditLogEntry restEntry)
+                {
+                    if (!IsLikelyRecent(restEntry.CreatedAt))
+                    {
+                        continue;
+                    }
+                }
+
+                if (entry.Data is SocketMessageDeleteAuditLogData socketData)
+                {
+                    if (socketData.ChannelId != channelId)
+                    {
+                        continue;
+                    }
+
+                    if (authorId.HasValue && socketData.Target.Id != authorId.Value)
+                    {
+                        continue;
+                    }
+
+                    return FormatAuditUser(entry);
+                }
+
+                if (entry.Data is Discord.Rest.MessageDeleteAuditLogData restData)
+                {
+                    if (restData.ChannelId != channelId)
+                    {
+                        continue;
+                    }
+
+                    if (authorId.HasValue && restData.Target?.Id != authorId.Value)
+                    {
+                        continue;
+                    }
+
+                    return FormatAuditUser(entry);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to resolve deleter from audit logs.");
+        }
+
+        return null;
+    }
+
+    private static ulong ToUlong(long value) => unchecked((ulong)value);
+    private static long ToDbId(ulong value) => unchecked((long)value);
+    private static IRole? ResolveRole(SocketGuild guild, long roleId, string? roleName)
+    {
+        if (roleId != 0)
+        {
+            var byId = guild.GetRole(ToUlong(roleId));
+            if (byId is not null)
+            {
+                return byId;
+            }
+        }
+
+        if (string.IsNullOrWhiteSpace(roleName))
+        {
+            return null;
+        }
+
+        return guild.Roles.FirstOrDefault(role =>
+            string.Equals(role.Name, roleName, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static string ResolveCategoryName(SocketGuildChannel channel)
+    {
+        if (channel is INestedChannel nested && nested.CategoryId.HasValue)
+        {
+            var category = channel.Guild.GetCategoryChannel(nested.CategoryId.Value);
+            if (category is not null)
+            {
+                return category.Name;
+            }
+        }
+
+        return "(カテゴリなし)";
+    }
+
+    private static string FormatAuditUser(IAuditLogEntry entry)
+    {
+        if (entry.User is null)
+        {
+            return "(不明)";
+        }
+
+        var baseText = $"{MentionUser(entry.User.Id)} ({entry.User})";
+        if (!string.IsNullOrWhiteSpace(entry.Reason))
+        {
+            return $"{baseText} - {entry.Reason}";
+        }
+
+        return baseText;
+    }
+
+    private static string FormatUser(SocketGuildUser? user)
+    {
+        if (user is null)
+        {
+            return "未設定";
+        }
+
+        var display = user.DisplayName ?? user.GlobalName ?? user.Username;
+        return $"{MentionUser(user.Id)} ({display})";
+    }
+
+    private static string BuildMessageSummary(
+        SocketGuildChannel channel,
+        string author,
+        string category,
+        DateTimeOffset? createdAt,
+        DateTimeOffset? editedAt,
+        int attachments,
+        int embeds,
+        string messageLink,
+        string? deletedBy = null)
+    {
+        var lines = new List<string>
+        {
+            $"🧭 チャンネル: {ChannelMention(channel)}",
+            $"👤 投稿者: {author}",
+            $"🗂️ カテゴリ: {category}",
+            $"🕒 作成: {(createdAt.HasValue ? FormatTimestamp(createdAt.Value) : "(不明)")}",
+            $"✏️ 編集: {(editedAt.HasValue ? FormatTimestamp(editedAt.Value) : "(なし)")}",
+            $"📎 添付/埋め込み: {attachments} / {embeds}",
+            $"🔗 リンク: {messageLink}"
+        };
+
+        if (!string.IsNullOrWhiteSpace(deletedBy))
+        {
+            lines.Add($"🧹 削除実行者: {deletedBy}");
+        }
+
+        return string.Join('\n', lines);
+    }
+
+    private static string BuildMemberSummary(SocketUser user, int memberCount)
+    {
+        var lines = new List<string>
+        {
+            $"👤 ユーザー: {MentionUser(user.Id)} ({user})",
+            $"🆔 ユーザーID: {user.Id}",
+            $"🕒 アカウント作成: {FormatTimestamp(user.CreatedAt)}",
+            $"👥 メンバー数: {memberCount}"
+        };
+
+        return string.Join('\n', lines);
+    }
+
+    private static string BuildVoiceSummary(SocketGuild guild, SocketUser user, SocketVoiceChannel? beforeChannel, SocketVoiceChannel? afterChannel, TimeSpan? duration)
+    {
+        var lines = new List<string>
+        {
+            $"👤 ユーザー: {FormatVoiceUser(guild, user)}",
+            $"🆔 ユーザーID: {user.Id}"
+        };
+
+        if (beforeChannel is null && afterChannel is not null)
+        {
+            lines.Add($"🎧 動作: 入室");
+            lines.Add($"📢 チャンネル: {ChannelMention(afterChannel)}");
+        }
+        else if (beforeChannel is not null && afterChannel is null)
+        {
+            lines.Add($"🎧 動作: 退出");
+            lines.Add($"📢 チャンネル: {ChannelMention(beforeChannel)}");
+        }
+        else
+        {
+            lines.Add($"🎧 動作: 移動");
+            if (beforeChannel is not null)
+            {
+                lines.Add($"⬅️ 移動元: {ChannelMention(beforeChannel)}");
+            }
+
+            if (afterChannel is not null)
+            {
+                lines.Add($"➡️ 移動先: {ChannelMention(afterChannel)}");
+            }
+        }
+
+        if (duration.HasValue)
+        {
+            lines.Add($"⏱️ 滞在時間: {FormatDuration(duration.Value)}");
+        }
+
+        return string.Join('\n', lines);
+    }
+
+    private static string BuildVoiceFirstJoinSummary(SocketGuild guild, SocketUser user, SocketVoiceChannel channel, DateTimeOffset joinedAt)
+    {
+        var lines = new List<string>
+        {
+            $"👤 入室者: {FormatVoiceUser(guild, user)}",
+            $"🎙️ チャンネル: {ChannelMention(channel)}",
+            $"🕒 開始: {FormatTimestamp(joinedAt)}"
+        };
+
+        return string.Join('\n', lines);
+    }
+
+    private static string BuildVoiceCallEndedSummary(SocketGuild guild, SocketUser user, SocketVoiceChannel channel, DateTimeOffset endedAt, TimeSpan? duration)
+    {
+        var lines = new List<string>
+        {
+            $"👤 最終退出: {FormatVoiceUser(guild, user)}",
+            $"🎙️ チャンネル: {ChannelMention(channel)}",
+            $"🕒 終了: {FormatTimestamp(endedAt)}"
+        };
+
+        if (duration.HasValue)
+        {
+            lines.Add($"⏱️ 通話時間: {FormatDuration(duration.Value)}");
+        }
+
+        return string.Join('\n', lines);
+    }
+
+    private static HttpClient CreateAttachmentArchiveHttpClient()
+    {
+        var client = new HttpClient
+        {
+            Timeout = TimeSpan.FromSeconds(30)
+        };
+        client.DefaultRequestHeaders.UserAgent.ParseAdd("RaidDcBot/1.0");
+        return client;
+    }
+
+    private static string? ResolveAttachmentArchiveRootPath(DiscordOptions options)
+    {
+        if (!options.AttachmentArchiveEnabled || string.IsNullOrWhiteSpace(options.AttachmentArchiveRootPath))
+        {
+            return null;
+        }
+
+        return Path.GetFullPath(options.AttachmentArchiveRootPath, Environment.CurrentDirectory);
+    }
+
+    private void EnsureAttachmentArchiveDirectory()
+    {
+        if (string.IsNullOrWhiteSpace(_attachmentArchiveRootPath))
+        {
+            return;
+        }
+
+        Directory.CreateDirectory(_attachmentArchiveRootPath);
+        _logger.LogInformation("Attachment archive enabled. RootPath={RootPath}", _attachmentArchiveRootPath);
+    }
+
+    private async Task<IReadOnlyDictionary<ulong, string>> ArchiveMessageAttachmentsAsync(
+        ulong guildId,
+        ulong channelId,
+        ulong messageId,
+        IReadOnlyCollection<IAttachment> attachments)
+    {
+        if (attachments.Count == 0 || string.IsNullOrWhiteSpace(_attachmentArchiveRootPath))
+        {
+            return new Dictionary<ulong, string>();
+        }
+
+        var nowUtc = DateTimeOffset.UtcNow;
+        var messageDir = Path.Combine(
+            _attachmentArchiveRootPath,
+            guildId.ToString(CultureInfo.InvariantCulture),
+            nowUtc.ToString("yyyy", CultureInfo.InvariantCulture),
+            nowUtc.ToString("MM", CultureInfo.InvariantCulture),
+            nowUtc.ToString("dd", CultureInfo.InvariantCulture),
+            channelId.ToString(CultureInfo.InvariantCulture),
+            messageId.ToString(CultureInfo.InvariantCulture));
+        Directory.CreateDirectory(messageDir);
+
+        var archivedPaths = new Dictionary<ulong, string>();
+        foreach (var attachment in attachments)
+        {
+            var fileName = BuildArchivedAttachmentFileName(attachment.Id, attachment.Filename);
+            var absolutePath = Path.Combine(messageDir, fileName);
+            var relativePath = ToRelativeArchivePath(absolutePath);
+            if (File.Exists(absolutePath))
+            {
+                archivedPaths[attachment.Id] = relativePath;
+                continue;
+            }
+
+            var sourceUrl = !string.IsNullOrWhiteSpace(attachment.Url) ? attachment.Url : attachment.ProxyUrl;
+            if (string.IsNullOrWhiteSpace(sourceUrl))
+            {
+                continue;
+            }
+
+            try
+            {
+                using var response = await AttachmentArchiveHttpClient.GetAsync(sourceUrl, HttpCompletionOption.ResponseHeadersRead);
+                if (!response.IsSuccessStatusCode)
+                {
+                    _logger.LogWarning(
+                        "Attachment download failed. StatusCode={StatusCode}, GuildId={GuildId}, ChannelId={ChannelId}, MessageId={MessageId}, AttachmentId={AttachmentId}",
+                        (int)response.StatusCode,
+                        guildId,
+                        channelId,
+                        messageId,
+                        attachment.Id);
+                    continue;
+                }
+
+                await using var input = await response.Content.ReadAsStreamAsync();
+                await using var output = new FileStream(
+                    absolutePath,
+                    FileMode.Create,
+                    FileAccess.Write,
+                    FileShare.Read,
+                    81920,
+                    useAsync: true);
+                await input.CopyToAsync(output);
+                archivedPaths[attachment.Id] = relativePath;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(
+                    ex,
+                    "Failed to archive attachment. GuildId={GuildId}, ChannelId={ChannelId}, MessageId={MessageId}, AttachmentId={AttachmentId}",
+                    guildId,
+                    channelId,
+                    messageId,
+                    attachment.Id);
+                TryDeleteFile(absolutePath);
+            }
+        }
+
+        return archivedPaths;
+    }
+
+    private int CleanupArchivedAttachmentFiles(int retentionDays)
+    {
+        if (retentionDays <= 0 || string.IsNullOrWhiteSpace(_attachmentArchiveRootPath) || !Directory.Exists(_attachmentArchiveRootPath))
+        {
+            return 0;
+        }
+
+        var threshold = DateTime.UtcNow.AddDays(-retentionDays);
+        var deleted = 0;
+
+        foreach (var filePath in Directory.EnumerateFiles(_attachmentArchiveRootPath, "*", SearchOption.AllDirectories))
+        {
+            try
+            {
+                if (File.GetLastWriteTimeUtc(filePath) >= threshold)
+                {
+                    continue;
+                }
+
+                File.Delete(filePath);
+                deleted++;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to delete archived attachment file. FilePath={FilePath}", filePath);
+            }
+        }
+
+        TryDeleteEmptyDirectories(_attachmentArchiveRootPath);
+        return deleted;
+    }
+
+    private static void TryDeleteEmptyDirectories(string rootDirectory)
+    {
+        IReadOnlyList<string> directories;
+        try
+        {
+            directories = Directory.EnumerateDirectories(rootDirectory, "*", SearchOption.AllDirectories)
+                .OrderByDescending(path => path.Length)
+                .ToList();
+        }
+        catch
+        {
+            return;
+        }
+
+        foreach (var directory in directories)
+        {
+            try
+            {
+                if (!Directory.EnumerateFileSystemEntries(directory).Any())
+                {
+                    Directory.Delete(directory);
+                }
+            }
+            catch
+            {
+            }
+        }
+    }
+
+    private static void TryDeleteFile(string filePath)
+    {
+        try
+        {
+            if (File.Exists(filePath))
+            {
+                File.Delete(filePath);
+            }
+        }
+        catch
+        {
+        }
+    }
+
+    private static string BuildArchivedAttachmentFileName(ulong attachmentId, string? fileName)
+    {
+        var safeName = SanitizeFileName(fileName);
+        if (string.IsNullOrWhiteSpace(safeName))
+        {
+            safeName = "attachment.bin";
+        }
+
+        return $"{attachmentId}_{safeName}";
+    }
+
+    private static string SanitizeFileName(string? fileName)
+    {
+        var source = string.IsNullOrWhiteSpace(fileName) ? string.Empty : fileName.Trim();
+        if (string.IsNullOrWhiteSpace(source))
+        {
+            return string.Empty;
+        }
+
+        var invalidChars = Path.GetInvalidFileNameChars();
+        var chars = source
+            .Select(ch => invalidChars.Contains(ch) ? '_' : ch)
+            .ToArray();
+        return new string(chars);
+    }
+
+    private string ToRelativeArchivePath(string absolutePath)
+    {
+        if (string.IsNullOrWhiteSpace(_attachmentArchiveRootPath))
+        {
+            return absolutePath.Replace('\\', '/');
+        }
+
+        return Path.GetRelativePath(_attachmentArchiveRootPath, absolutePath).Replace('\\', '/');
+    }
+
+    private static string? TryGetArchivedPath(IReadOnlyDictionary<ulong, string>? archivedPaths, ulong attachmentId)
+    {
+        if (archivedPaths is null)
+        {
+            return null;
+        }
+
+        return archivedPaths.TryGetValue(attachmentId, out var path) ? path : null;
+    }
+
+    private static string? BuildAttachmentsJson(
+        IReadOnlyCollection<IAttachment> attachments,
+        IReadOnlyDictionary<ulong, string>? archivedPaths = null)
+    {
+        if (attachments.Count == 0)
+        {
+            return null;
+        }
+
+        var snapshots = attachments
+            .Select(attachment => new MessageAttachmentSnapshot(
+                attachment.Id,
+                attachment.Url,
+                attachment.ProxyUrl,
+                attachment.Filename,
+                attachment.Size,
+                attachment.ContentType,
+                attachment.Height,
+                attachment.Width,
+                attachment.IsSpoiler(),
+                TryGetArchivedPath(archivedPaths, attachment.Id)))
+            .ToList();
+
+        return JsonSerializer.Serialize(snapshots);
+    }
+
+    private static string? BuildEmbedsJson(IReadOnlyCollection<Embed> embeds)
+    {
+        if (embeds.Count == 0)
+        {
+            return null;
+        }
+
+        var snapshots = embeds
+            .Select(embed => new MessageEmbedSnapshot(
+                embed.Type.ToString(),
+                embed.Title,
+                embed.Description,
+                embed.Url,
+                embed.Author?.Name,
+                embed.Footer?.Text,
+                embed.Image.HasValue ? embed.Image.Value.Url : null,
+                embed.Thumbnail.HasValue ? embed.Thumbnail.Value.Url : null))
+            .ToList();
+
+        return JsonSerializer.Serialize(snapshots);
+    }
+
+    private static IReadOnlyList<string> ListAttachmentUrls(IMessage? message, MessageLog? stored)
+    {
+        var urls = new List<string>();
+
+        if (message is not null && message.Attachments.Count > 0)
+        {
+            urls.AddRange(message.Attachments
+                .Select(attachment => attachment.Url)
+                .Where(url => !string.IsNullOrWhiteSpace(url))!);
+        }
+
+        foreach (var attachment in ParseAttachmentSnapshots(stored?.AttachmentsJson))
+        {
+            if (!string.IsNullOrWhiteSpace(attachment.Url))
+            {
+                urls.Add(attachment.Url!);
+            }
+        }
+
+        return urls
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Take(10)
+            .ToList();
+    }
+
+    private static string? ResolvePreviewImageUrl(IMessage? message, MessageLog? stored)
+    {
+        if (message is not null)
+        {
+            foreach (var attachment in message.Attachments)
+            {
+                if (!IsImageAttachment(attachment))
+                {
+                    continue;
+                }
+
+                if (!string.IsNullOrWhiteSpace(attachment.Url))
+                {
+                    return attachment.Url;
+                }
+            }
+
+            foreach (var embed in message.Embeds)
+            {
+                if (embed.Image.HasValue && !string.IsNullOrWhiteSpace(embed.Image.Value.Url))
+                {
+                    return embed.Image.Value.Url;
+                }
+
+                if (embed.Thumbnail.HasValue && !string.IsNullOrWhiteSpace(embed.Thumbnail.Value.Url))
+                {
+                    return embed.Thumbnail.Value.Url;
+                }
+            }
+        }
+
+        foreach (var attachment in ParseAttachmentSnapshots(stored?.AttachmentsJson))
+        {
+            if (!string.IsNullOrWhiteSpace(attachment.Url) && IsImageLike(attachment.ContentType, attachment.Filename))
+            {
+                return attachment.Url;
+            }
+        }
+
+        foreach (var embed in ParseEmbedSnapshots(stored?.EmbedsJson))
+        {
+            if (!string.IsNullOrWhiteSpace(embed.ImageUrl))
+            {
+                return embed.ImageUrl;
+            }
+
+            if (!string.IsNullOrWhiteSpace(embed.ThumbnailUrl))
+            {
+                return embed.ThumbnailUrl;
+            }
+        }
+
+        return null;
+    }
+
+    private static IReadOnlyList<MessageAttachmentSnapshot> ParseAttachmentSnapshots(string? json)
+    {
+        if (string.IsNullOrWhiteSpace(json))
+        {
+            return Array.Empty<MessageAttachmentSnapshot>();
+        }
+
+        try
+        {
+            return JsonSerializer.Deserialize<List<MessageAttachmentSnapshot>>(json) ?? new List<MessageAttachmentSnapshot>();
+        }
+        catch
+        {
+            return Array.Empty<MessageAttachmentSnapshot>();
+        }
+    }
+
+    private static IReadOnlyList<MessageEmbedSnapshot> ParseEmbedSnapshots(string? json)
+    {
+        if (string.IsNullOrWhiteSpace(json))
+        {
+            return Array.Empty<MessageEmbedSnapshot>();
+        }
+
+        try
+        {
+            return JsonSerializer.Deserialize<List<MessageEmbedSnapshot>>(json) ?? new List<MessageEmbedSnapshot>();
+        }
+        catch
+        {
+            return Array.Empty<MessageEmbedSnapshot>();
+        }
+    }
+
+    private static bool IsImageLike(string? contentType, string? filename)
+    {
+        if (!string.IsNullOrWhiteSpace(contentType) &&
+            contentType.StartsWith("image/", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        var name = filename ?? string.Empty;
+        return name.EndsWith(".png", StringComparison.OrdinalIgnoreCase)
+            || name.EndsWith(".jpg", StringComparison.OrdinalIgnoreCase)
+            || name.EndsWith(".jpeg", StringComparison.OrdinalIgnoreCase)
+            || name.EndsWith(".gif", StringComparison.OrdinalIgnoreCase)
+            || name.EndsWith(".webp", StringComparison.OrdinalIgnoreCase)
+            || name.EndsWith(".bmp", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsImageAttachment(IAttachment attachment)
+    {
+        return IsImageLike(attachment.ContentType, attachment.Filename);
+    }
+
+    private static bool IsFirstHumanJoinInChannel(SocketVoiceChannel? beforeChannel, SocketVoiceChannel? afterChannel)
+    {
+        if (afterChannel is null)
+        {
+            return false;
+        }
+
+        if (beforeChannel is not null && beforeChannel.Id == afterChannel.Id)
+        {
+            return false;
+        }
+
+        var humanCount = afterChannel.ConnectedUsers.Count(member => !member.IsBot);
+        return humanCount == 1;
+    }
+
+    private static SocketVoiceChannel? ResolveEndedVoiceChannel(SocketVoiceChannel? beforeChannel, SocketVoiceChannel? afterChannel)
+    {
+        if (beforeChannel is null)
+        {
+            return null;
+        }
+
+        if (afterChannel is not null && beforeChannel.Id == afterChannel.Id)
+        {
+            return null;
+        }
+
+        var humanCount = beforeChannel.ConnectedUsers.Count(member => !member.IsBot);
+        return humanCount == 0 ? beforeChannel : null;
+    }
+
+    private async Task<TimeSpan?> ResolveVoiceDurationAsync(SocketGuild guild, SocketUser user, SocketVoiceChannel? beforeChannel, DateTimeOffset now)
+    {
+        if (beforeChannel is null)
+        {
+            return null;
+        }
+
+        var session = await _db.GetOpenVoiceSessionAsync(guild.Id, user.Id);
+        if (session is null || session.JoinedAt == default)
+        {
+            return null;
+        }
+
+        var duration = now - session.JoinedAt;
+        return duration < TimeSpan.Zero ? TimeSpan.Zero : duration;
+    }
+
+    private async Task CloseVoiceSessionAsync(SocketGuild guild, SocketUser user, SocketVoiceChannel channel, DateTimeOffset leftAt)
+    {
+        var closed = await _db.EndVoiceSessionAsync(guild.Id, channel.Id, user.Id, leftAt);
+        if (closed is not null)
+        {
+            return;
+        }
+
+        var open = await _db.GetOpenVoiceSessionAsync(guild.Id, user.Id);
+        if (open is null)
+        {
+            return;
+        }
+
+        await _db.EndVoiceSessionAsync(guild.Id, ToUlong(open.ChannelId), user.Id, leftAt);
+    }
+
+    private async Task CloseOpenVoiceSessionAsync(SocketGuild guild, SocketUser user, DateTimeOffset leftAt)
+    {
+        var open = await _db.GetOpenVoiceSessionAsync(guild.Id, user.Id);
+        if (open is null)
+        {
+            return;
+        }
+
+        await _db.EndVoiceSessionAsync(guild.Id, ToUlong(open.ChannelId), user.Id, leftAt);
+    }
+
+    private static string FormatDuration(TimeSpan duration)
+    {
+        if (duration < TimeSpan.Zero)
+        {
+            duration = TimeSpan.Zero;
+        }
+
+        if (duration.TotalHours >= 1)
+        {
+            return $"{(int)duration.TotalHours:00}:{duration.Minutes:00}:{duration.Seconds:00}";
+        }
+
+        return $"{duration.Minutes:00}:{duration.Seconds:00}";
+    }
+
+    private static string FormatVoiceUser(SocketGuild guild, SocketUser user)
+    {
+        var guildUser = guild.GetUser(user.Id);
+        var display = guildUser?.DisplayName ?? guildUser?.GlobalName ?? user.GlobalName ?? user.Username;
+        return $"{MentionUser(user.Id)} ({display})";
+    }
+
+    private async Task SendVoiceJoinEmbedAsync(SocketVoiceChannel channel, SocketUser user, DateTimeOffset joinedAt)
+    {
+        var textChannel = await ResolveVoiceTextChannelAsync(channel);
+        if (textChannel is null)
+        {
+            return;
+        }
+
+        var embed = await _profileEmbeds.BuildProfileEmbedAsync(user, channel.Guild, "VC参加", Color.Blue);
+        await textChannel.SendMessageAsync(embed: embed, flags: MessageFlags.SuppressNotification);
+    }
+
+    private async Task<IMessageChannel?> ResolveVoiceTextChannelAsync(SocketVoiceChannel channel)
+    {
+        if (channel is IMessageChannel messageChannel)
+        {
+            return messageChannel;
+        }
+
+        try
+        {
+            var restChannel = await _client.Rest.GetChannelAsync(channel.Id);
+            return restChannel as IMessageChannel;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to resolve voice text channel for {ChannelId}.", channel.Id);
+            return null;
+        }
+    }
+
+    private async Task EnsureTempVoiceLobbyAsync(SocketGuild guild, IRole adminRole, IRole memberRole)
+    {
+        var lobbyName = _options.TempVoiceLobbyName;
+        if (string.IsNullOrWhiteSpace(lobbyName))
+        {
+            return;
+        }
+
+        var lobby = FindTempVoiceLobby(guild);
+        if (lobby is null)
+        {
+            ICategoryChannel? category = null;
+            if (!string.IsNullOrWhiteSpace(_options.TempVoiceCategoryName))
+            {
+                category = guild.CategoryChannels.FirstOrDefault(c =>
+                    string.Equals(c.Name, _options.TempVoiceCategoryName, StringComparison.OrdinalIgnoreCase));
+                if (category is null)
+                {
+                    category = await guild.CreateCategoryChannelAsync(_options.TempVoiceCategoryName);
+                    await _audit.SendSystemAsync(
+                        guild,
+                        "VCカテゴリ自動作成",
+                        $"📁 カテゴリ: {category.Name} (<#{category.Id}>)",
+                        Color.LightGrey);
+                }
+            }
+
+            var created = await guild.CreateVoiceChannelAsync(lobbyName, props =>
+            {
+                if (category is not null)
+                {
+                    props.CategoryId = category.Id;
+                }
+
+                if (_options.TempVoiceUserLimit > 0)
+                {
+                    props.UserLimit = _options.TempVoiceUserLimit;
+                }
+            });
+            await _audit.SendSystemAsync(
+                guild,
+                "VCロビー自動作成",
+                $"🎙️ チャンネル: <#{created.Id}> ({created.Name})",
+                Color.LightGrey);
+
+            lobby = await WaitForVoiceChannelAsync(guild, created.Id);
+            if (lobby is null)
+            {
+                await _audit.SendSystemAsync(
+                    guild,
+                    "VCロビー解決失敗",
+                    $"❌ 作成後にチャンネル取得に失敗しました: <#{created.Id}>",
+                    Color.Orange);
+                return;
+            }
+        }
+
+        await EnsureVoicePermissionsAsync(lobby, adminRole, memberRole);
+    }
+
+    private SocketVoiceChannel? FindTempVoiceLobby(SocketGuild guild)
+    {
+        var lobbyName = _options.TempVoiceLobbyName;
+        if (string.IsNullOrWhiteSpace(lobbyName))
+        {
+            return null;
+        }
+
+        return guild.VoiceChannels.FirstOrDefault(channel =>
+            string.Equals(channel.Name, lobbyName, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private async Task<bool> HandleTempVoiceLobbyJoinAsync(SocketGuild guild, SocketVoiceChannel lobby, SocketUser user)
+    {
+        if (user is not SocketGuildUser guildUser)
+        {
+            return false;
+        }
+
+        RestVoiceChannel? createdRest = null;
+        await _tempVoiceLock.WaitAsync();
+        try
+        {
+            var baseName = BuildTempVoiceChannelName(guildUser);
+            var name = await EnsureUniqueVoiceChannelNameAsync(guild, baseName);
+
+            createdRest = await guild.CreateVoiceChannelAsync(name, props =>
+            {
+                if (lobby.CategoryId.HasValue)
+                {
+                    props.CategoryId = lobby.CategoryId.Value;
+                }
+
+                if (_options.TempVoiceUserLimit > 0)
+                {
+                    props.UserLimit = _options.TempVoiceUserLimit;
+                }
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to create temp voice channel for {UserId}.", user.Id);
+            await _audit.SendAsync(
+                guild,
+                "一時VC作成失敗",
+                $"👤 ユーザー: {MentionUser(user.Id)} ({user})\n🎙️ ロビー: <#{lobby.Id}>\n❌ Error: {ex.Message}",
+                Color.Red,
+                user);
+        }
+        finally
+        {
+            _tempVoiceLock.Release();
+        }
+
+        if (createdRest is null)
+        {
+            return false;
+        }
+
+        await guildUser.ModifyAsync(props => props.Channel = Optional.Create<IVoiceChannel>(createdRest));
+
+        await _db.UpsertTempVoiceChannelAsync(guild.Id, createdRest.Id, guildUser.Id);
+        _tempVoiceChannelIds.TryAdd(createdRest.Id, 0);
+        await _audit.SendAsync(
+            guild,
+            "一時VC自動作成",
+            $"👤 作成者: {guildUser.Mention} ({guildUser})\n🎙️ チャンネル: <#{createdRest.Id}> ({createdRest.Name})",
+            Color.LightGrey,
+            guildUser);
+
+        try
+        {
+            await CopyVoicePermissionsAsync(lobby.PermissionOverwrites, createdRest, guild);
+            var ownerOverwrite = new OverwritePermissions(viewChannel: PermValue.Allow, connect: PermValue.Allow, speak: PermValue.Allow, manageChannel: PermValue.Allow);
+            await createdRest.AddPermissionOverwriteAsync(guildUser, ownerOverwrite);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to apply permissions for temp voice channel {ChannelId}.", createdRest.Id);
+            await _audit.SendAsync(
+                guild,
+                "一時VC権限設定失敗",
+                $"👤 作成者: {guildUser.Mention} ({guildUser})\n🎙️ チャンネル: <#{createdRest.Id}> ({createdRest.Name})\n❌ Error: {ex.Message}",
+                Color.Red,
+                guildUser);
+        }
+
+        return true;
+    }
+
+    private async Task<string> EnsureUniqueVoiceChannelNameAsync(SocketGuild guild, string baseName)
+    {
+        var name = baseName;
+        var index = 2;
+        while (guild.VoiceChannels.Any(channel => string.Equals(channel.Name, name, StringComparison.OrdinalIgnoreCase)))
+        {
+            name = $"{baseName}-{index}";
+            index++;
+        }
+
+        return await Task.FromResult(name);
+    }
+
+    private string BuildTempVoiceChannelName(SocketGuildUser user)
+    {
+        var displayName = user.DisplayName ?? user.GlobalName ?? user.Username;
+        var prefix = string.IsNullOrWhiteSpace(_options.TempVoiceChannelPrefix) ? "VC-" : _options.TempVoiceChannelPrefix;
+        var sanitized = displayName.Replace('\n', ' ').Replace('\r', ' ').Trim();
+        var name = $"{prefix}{sanitized}".Trim();
+        const int maxLength = 90;
+        return name.Length > maxLength ? name[..maxLength] : name;
+    }
+
+    private bool IsTempVoiceChannel(SocketVoiceChannel channel, SocketVoiceChannel? lobby)
+    {
+        if (lobby is not null && channel.Id == lobby.Id)
+        {
+            return false;
+        }
+
+        if (_tempVoiceChannelIds.ContainsKey(channel.Id))
+        {
+            return true;
+        }
+
+        if (string.IsNullOrWhiteSpace(_options.TempVoiceChannelPrefix))
+        {
+            return false;
+        }
+
+        return channel.Name.StartsWith(_options.TempVoiceChannelPrefix, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private async Task DeleteTempVoiceChannelAsync(SocketVoiceChannel channel)
+    {
+        CancelTempVoiceDeletion(channel.Id);
+        _tempVoiceChannelIds.TryRemove(channel.Id, out _);
+        try
+        {
+            await channel.DeleteAsync();
+            await _db.RemoveTempVoiceChannelAsync(channel.Id);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to delete temp voice channel {ChannelId}.", channel.Id);
+        }
+    }
+
+    private async Task HandleTempVoiceOwnerLeftAsync(SocketVoiceChannel channel, SocketUser user)
+    {
+        var ownerId = await _db.GetTempVoiceOwnerAsync(channel.Id);
+        if (!ownerId.HasValue || ownerId.Value != ToDbId(user.Id))
+        {
+            return;
+        }
+
+        if (channel.ConnectedUsers.Count == 0)
+        {
+            return;
+        }
+
+        var nextOwner = channel.ConnectedUsers.FirstOrDefault(u => !u.IsBot);
+        if (nextOwner is null)
+        {
+            return;
+        }
+
+        try
+        {
+            var oldOwner = channel.Guild.GetUser(ToUlong(ownerId.Value));
+            if (oldOwner is not null)
+            {
+                await channel.RemovePermissionOverwriteAsync(oldOwner);
+            }
+
+            var ownerOverwrite = new OverwritePermissions(viewChannel: PermValue.Allow, connect: PermValue.Allow, speak: PermValue.Allow, manageChannel: PermValue.Allow);
+            await channel.AddPermissionOverwriteAsync(nextOwner, ownerOverwrite);
+            await _db.UpsertTempVoiceChannelAsync(channel.Guild.Id, channel.Id, nextOwner.Id);
+
+            await _voiceTextService.PostOwnerTransferAsync(channel, oldOwner, nextOwner, null);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to transfer temp voice owner for {ChannelId}.", channel.Id);
+        }
+    }
+
+    private async Task ScheduleTempVoiceDeletionAsync(SocketVoiceChannel channel)
+    {
+        var delaySeconds = _options.TempVoiceAutoDeleteDelaySeconds;
+        if (delaySeconds <= 0)
+        {
+            await DeleteTempVoiceChannelAsync(channel);
+            return;
+        }
+
+        var cts = new CancellationTokenSource();
+        if (!_tempVoiceDeleteTokens.TryAdd(channel.Id, cts))
+        {
+            return;
+        }
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await Task.Delay(TimeSpan.FromSeconds(delaySeconds), cts.Token);
+                var current = channel.Guild.GetVoiceChannel(channel.Id);
+                if (current is null)
+                {
+                    return;
+                }
+
+                if (current.ConnectedUsers.Count == 0)
+                {
+                    await DeleteTempVoiceChannelAsync(current);
+                }
+            }
+            catch (TaskCanceledException)
+            {
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to auto delete temp voice channel {ChannelId}.", channel.Id);
+            }
+            finally
+            {
+                _tempVoiceDeleteTokens.TryRemove(channel.Id, out _);
+                cts.Dispose();
+            }
+        });
+    }
+
+    private void CancelTempVoiceDeletion(ulong channelId)
+    {
+        if (_tempVoiceDeleteTokens.TryRemove(channelId, out var cts))
+        {
+            cts.Cancel();
+            cts.Dispose();
+        }
+    }
+
+    private async Task EnsureVoicePermissionsAsync(SocketVoiceChannel channel, IRole adminRole, IRole memberRole)
+    {
+        var everyoneRole = channel.Guild.EveryoneRole;
+        var deny = new OverwritePermissions(viewChannel: PermValue.Deny, connect: PermValue.Deny);
+        var allow = new OverwritePermissions(viewChannel: PermValue.Allow, connect: PermValue.Allow, speak: PermValue.Allow);
+
+        await channel.AddPermissionOverwriteAsync(everyoneRole, deny);
+        await channel.AddPermissionOverwriteAsync(memberRole, allow);
+        await channel.AddPermissionOverwriteAsync(adminRole, allow);
+    }
+
+    private async Task CopyVoicePermissionsAsync(IReadOnlyCollection<Overwrite> overwrites, IGuildChannel target, SocketGuild guild)
+    {
+        foreach (var overwrite in overwrites)
+        {
+            if (overwrite.TargetType == PermissionTarget.Role)
+            {
+                var role = guild.GetRole(overwrite.TargetId);
+                if (role is not null)
+                {
+                    await target.AddPermissionOverwriteAsync(role, overwrite.Permissions);
+                }
+            }
+            else if (overwrite.TargetType == PermissionTarget.User)
+            {
+                var user = guild.GetUser(overwrite.TargetId);
+                if (user is not null)
+                {
+                    await target.AddPermissionOverwriteAsync(user, overwrite.Permissions);
+                }
+            }
+        }
+    }
+
+    private static async Task<SocketVoiceChannel?> WaitForVoiceChannelAsync(SocketGuild guild, ulong channelId)
+    {
+        for (var i = 0; i < 5; i++)
+        {
+            var channel = guild.GetVoiceChannel(channelId);
+            if (channel is not null)
+            {
+                return channel;
+            }
+
+            await Task.Delay(200);
+        }
+
+        return null;
+    }
+
+    private sealed record MessageAttachmentSnapshot(
+        ulong Id,
+        string? Url,
+        string? ProxyUrl,
+        string? Filename,
+        int Size,
+        string? ContentType,
+        int? Height,
+        int? Width,
+        bool IsSpoiler,
+        string? LocalPath);
+
+    private sealed record MessageEmbedSnapshot(
+        string? Type,
+        string? Title,
+        string? Description,
+        string? Url,
+        string? AuthorName,
+        string? FooterText,
+        string? ImageUrl,
+        string? ThumbnailUrl);
+
+}
