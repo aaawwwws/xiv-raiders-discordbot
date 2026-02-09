@@ -54,50 +54,99 @@ public sealed class VoiceStatsService {
         var vcTop = voiceRows
             .Take(Math.Clamp(topCount, 1, 20))
             .ToList();
+        var totalVcSeconds = Math.Max(0, voiceRows.Sum(x => x.DurationSeconds));
         var messageTop = nonAdminMessageCounts
             .OrderByDescending(x => x.Value)
             .ThenBy(x => x.Key)
             .Take(Math.Clamp(topCount, 1, 20))
             .ToList();
+        var totalMessages = Math.Max(0, nonAdminMessageCounts.Values.Sum());
 
         var fromJst = fromUtc.ToOffset(TimeSpan.FromHours(9));
         var toJst = toUtc.ToOffset(TimeSpan.FromHours(9));
         var period = $"{fromJst:MM/dd HH:mm} - {toJst:MM/dd HH:mm} (JST)";
+        var themedTitle = BuildThemedTitle(title);
+        var color = ResolveRankingColor(title);
 
         var builder = new EmbedBuilder()
-            .WithTitle(title)
-            .WithColor(new Color(52, 152, 219))
+            .WithTitle(themedTitle)
+            .WithColor(color)
             .WithCurrentTimestamp()
-            .WithDescription($"集計期間: {period}\nアクティブ人数: {activeUsers.Count}");
+            .WithDescription(
+                "📅 **集計期間**\n" +
+                $"`{period}`\n" +
+                $"👥 **アクティブ人数**: `{activeUsers.Count}人`\n" +
+                $"🎙️ **VC合計**: `{FormatDuration(totalVcSeconds)}`\n" +
+                $"💬 **発言合計**: `{totalMessages}件`");
 
         var vcLines = new List<string>();
         for (var i = 0; i < vcTop.Count; i++) {
             var row = vcTop[i];
             var userId = unchecked((ulong)row.UserId);
-            var mention = $"<@{userId}>";
             var display = guild.GetUser(userId)?.DisplayName ?? userId.ToString();
-            vcLines.Add($"{i + 1}. {mention} ({display}) - {FormatDuration(row.DurationSeconds)}");
+            vcLines.Add($"{ToRankBadge(i + 1)} **{display}**  `{FormatDuration(row.DurationSeconds)}`");
         }
 
         if (vcLines.Count == 0) {
-            vcLines.Add("データなし");
+            vcLines.Add("😴 データなし");
         }
 
         var messageLines = new List<string>();
         for (var i = 0; i < messageTop.Count; i++) {
             var row = messageTop[i];
-            var mention = $"<@{row.Key}>";
             var display = guild.GetUser(row.Key)?.DisplayName ?? row.Key.ToString();
-            messageLines.Add($"{i + 1}. {mention} ({display}) - {row.Value}件");
+            messageLines.Add($"{ToRankBadge(i + 1)} **{display}**  `{row.Value}件`");
         }
 
         if (messageLines.Count == 0) {
-            messageLines.Add("データなし");
+            messageLines.Add("😴 データなし");
         }
 
-        builder.AddField("VC滞在ランキング", string.Join('\n', vcLines));
-        builder.AddField("発言数ランキング", string.Join('\n', messageLines));
+        builder.AddField("🎙️ VC滞在 TOP", string.Join('\n', vcLines));
+        builder.AddField("💬 発言数 TOP", string.Join('\n', messageLines));
+        builder.WithFooter("Raid DC Activity");
         return builder.Build();
+    }
+
+    private static string ToRankBadge(int rank)
+    {
+        return rank switch
+        {
+            1 => "🥇",
+            2 => "🥈",
+            3 => "🥉",
+            _ => $"`{rank,2}.`"
+        };
+    }
+
+    private static string BuildThemedTitle(string rawTitle)
+    {
+        if (rawTitle.Contains("今日", StringComparison.Ordinal))
+        {
+            return $"📊 {rawTitle}";
+        }
+
+        if (rawTitle.Contains("週", StringComparison.Ordinal))
+        {
+            return $"🏆 {rawTitle}";
+        }
+
+        return $"✨ {rawTitle}";
+    }
+
+    private static Color ResolveRankingColor(string title)
+    {
+        if (title.Contains("今日", StringComparison.Ordinal))
+        {
+            return new Color(46, 204, 113);
+        }
+
+        if (title.Contains("週", StringComparison.Ordinal))
+        {
+            return new Color(241, 196, 15);
+        }
+
+        return new Color(52, 152, 219);
     }
 
     private static string FormatDuration(long durationSeconds) {

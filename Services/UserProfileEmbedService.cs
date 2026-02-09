@@ -121,7 +121,7 @@ public sealed class UserProfileEmbedService
             authorName,
             avatar,
             thumbnail,
-            BuildVoiceBasicInfo(user),
+            BuildVoiceBasicInfo(user, guildUser),
             BuildVoiceRoleInfo(guildUser),
             BuildVoiceCharacterInfo(character, profile),
             BuildVoiceSnsInfo(profile),
@@ -170,10 +170,19 @@ public sealed class UserProfileEmbedService
         }
     }
 
-    private static string BuildVoiceBasicInfo(SocketUser user)
+    private static string BuildVoiceBasicInfo(SocketUser user, SocketGuildUser? guildUser)
     {
         var discordName = user.Username;
-        return $"Discord: {MentionUser(user.Id)} (@{discordName})";
+        var joinedAtText = guildUser?.JoinedAt.HasValue == true
+            ? FormatTimestamp(guildUser.JoinedAt.Value)
+            : "不明";
+
+        return string.Join('\n', new[]
+        {
+            $"Discord: {MentionUser(user.Id)} (@{discordName})",
+            $"Discord開始日: {FormatTimestamp(user.CreatedAt)}",
+            $"サーバー参加日: {joinedAtText}"
+        });
     }
 
     private static string BuildVoiceRoleInfo(SocketGuildUser? guildUser)
@@ -246,6 +255,7 @@ public sealed class UserProfileEmbedService
     }
 
     private static string MentionUser(ulong userId) => $"<@{userId}>";
+    private static string FormatTimestamp(DateTimeOffset time) => $"<t:{time.ToUnixTimeSeconds()}:F>";
 
     private sealed record ProfileSnapshot(
         string AuthorName,

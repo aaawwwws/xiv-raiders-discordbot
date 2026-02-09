@@ -14,6 +14,9 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
 {
     private const string MemberRegistrationDcPrefix = "member_registration_dc";
     private const string MemberRegistrationWorldPrefix = "member_registration_world";
+    private const string MemberRegistrationSubmitCustomId = "member_registration_submit";
+    private const string MemberRegistrationApprovePrefix = "member_registration_review_approve";
+    private const string MemberRegistrationRejectPrefix = "member_registration_review_reject";
     private static readonly TimeSpan MemberRegistrationDraftTimeout = TimeSpan.FromMinutes(15);
 
     private readonly Db _db;
@@ -371,22 +374,226 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
             draft.BlueskyHandle,
             draft.Bio);
 
-        await GrantMemberRoleAsync();
-        await GrantDcRoleAsync(dataCenterName);
-        await UpdateNicknameAsync(draft.FfxivName, worldName);
-        await LogMemberRegistrationCompletedAsync(draft.FfxivName, worldName, dataCenterName, draft.XHandle, draft.BlueskyHandle);
-        _ = _stats.RefreshIfConfiguredAsync(Context.Guild!);
-
         var contentRoleDefinitions = await LoadMemberContentRoleDefinitionsAsync(Context.Guild!.Id);
         var contentRoleComponents = MemberContentRolePanel.BuildComponents(contentRoleDefinitions);
         var completedMessage =
-            $"メンバー登録を完了しました: {draft.FfxivName}@{worldName} [{dataCenterName}]\n" +
-            "次に、プレイしているコンテンツのロールを選択してください（必要に応じて後から変更できます）。";
+            $"登録情報を受け付けました: {draft.FfxivName}@{worldName} [{dataCenterName}]\n" +
+            "プレイ中のコンテンツロールを選択し、最後に「登録申請を送信」を押してください。";
         await RespondAsync(completedMessage, components: contentRoleComponents, ephemeral: true);
+        await FollowupAsync(
+            "ロール選択が終わったら、こちらから申請を送信してください。",
+            components: BuildMemberRegistrationSubmitComponents(),
+            ephemeral: true);
+    }
+
+    [ComponentInteraction(MemberRegistrationSubmitCustomId, ignoreGroupNames: true)]
+    public async Task SubmitMemberRegistrationAsync()
+    {
+        if (Context.Guild is null || Context.User is not SocketGuildUser guildUser)
+        {
+            await RespondAsync("この操作はサーバー内でのみ使えます。", ephemeral: true);
+            return;
+        }
+
+        await DeferAsync(ephemeral: true);
+
+        var settings = await _db.GetGuildSettingsAsync(Context.Guild.Id);
+        var memberRole = ResolveMemberRole(Context.Guild, settings);
+        if (memberRole is not null && guildUser.Roles.Any(role => role.Id == memberRole.Id))
+        {
+            await FollowupAsync("既にメンバー登録済みです。", ephemeral: true);
+            return;
+        }
+
+        var profile = await _db.GetDiscordUserProfileAsync(Context.User.Id);
+        if (!HasCompletedRegistrationProfile(profile))
+        {
+            await FollowupAsync("登録情報が不足しています。もう一度「メンバー登録」から入力してください。", ephemeral: true);
+            return;
+        }
+
+        var completedProfile = profile!;
+        var provisionalRole = ResolveProvisionalRole(Context.Guild, settings);
+        if (provisionalRole is null)
+        {
+            await FollowupAsync("仮登録ロールを取得できませんでした。管理者に連絡してください。", ephemeral: true);
+            return;
+        }
+
+        if (guildUser.Roles.Any(role => role.Id == provisionalRole.Id))
+        {
+            await FollowupAsync("登録申請は送信済みです。管理者の確認をお待ちください。", ephemeral: true);
+            return;
+        }
+
+        var reviewChannel = ResolveRegistrationReviewChannel(Context.Guild, settings);
+        if (reviewChannel is null)
+        {
+            await FollowupAsync("登録確認チャンネルを取得できませんでした。管理者に連絡してください。", ephemeral: true);
+            return;
+        }
+
+        try
+        {
+            await guildUser.AddRoleAsync(provisionalRole);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to grant provisional role. GuildId={GuildId}, UserId={UserId}", Context.Guild.Id, guildUser.Id);
+            await FollowupAsync("仮登録ロールの付与に失敗しました。Botの権限を確認してください。", ephemeral: true);
+            return;
+        }
+
+        try
+        {
+            var embed = await BuildMemberRegistrationReviewEmbedAsync(guildUser, completedProfile);
+            await reviewChannel.SendMessageAsync(
+                embed: embed,
+                components: BuildMemberRegistrationReviewComponents(guildUser.Id),
+                flags: MessageFlags.SuppressNotification);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to submit member registration review. GuildId={GuildId}, UserId={UserId}", Context.Guild.Id, guildUser.Id);
+            try
+            {
+                if (guildUser.Roles.Any(role => role.Id == provisionalRole.Id))
+                {
+                    await guildUser.RemoveRoleAsync(provisionalRole);
+                }
+            }
+            catch (Exception removeEx)
+            {
+                _logger.LogWarning(removeEx, "Failed to rollback provisional role. GuildId={GuildId}, UserId={UserId}", Context.Guild.Id, guildUser.Id);
+            }
+
+            await FollowupAsync("申請の送信に失敗しました。時間を置いて再試行してください。", ephemeral: true);
+            return;
+        }
+
+        await LogMemberRegistrationRequestedAsync(completedProfile, guildUser);
+        await FollowupAsync("登録申請を送信しました。管理者の許可後にメンバーロールが付与されます。", ephemeral: true);
+    }
+
+    [RequireBotAdmin]
+    [ComponentInteraction("member_registration_review_approve:*", ignoreGroupNames: true)]
+    public Task ApproveMemberRegistrationAsync(string userIdToken)
+        => HandleMemberRegistrationReviewAsync(userIdToken, approved: true);
+
+    [RequireBotAdmin]
+    [ComponentInteraction("member_registration_review_reject:*", ignoreGroupNames: true)]
+    public Task RejectMemberRegistrationAsync(string userIdToken)
+        => HandleMemberRegistrationReviewAsync(userIdToken, approved: false);
+
+    private async Task HandleMemberRegistrationReviewAsync(string userIdToken, bool approved)
+    {
+        if (Context.Guild is null)
+        {
+            await RespondAsync("この操作はサーバー内でのみ使えます。", ephemeral: true);
+            return;
+        }
+
+        if (!ulong.TryParse(userIdToken, out var targetUserId))
+        {
+            await RespondAsync("対象ユーザーを判定できませんでした。", ephemeral: true);
+            return;
+        }
+
+        await DeferAsync(ephemeral: true);
+
+        var targetUser = Context.Guild.GetUser(targetUserId);
+        if (targetUser is null)
+        {
+            await Context.Guild.DownloadUsersAsync();
+            targetUser = Context.Guild.GetUser(targetUserId);
+        }
+
+        if (targetUser is null)
+        {
+            await FinalizeMemberRegistrationReviewMessageAsync(
+                approved,
+                $"対象ユーザー ({targetUserId}) がサーバー内で見つかりませんでした。",
+                markError: true);
+            await FollowupAsync("対象ユーザーが見つかりませんでした。", ephemeral: true);
+            return;
+        }
+
+        var settings = await _db.GetGuildSettingsAsync(Context.Guild.Id);
+        var memberRole = ResolveMemberRole(Context.Guild, settings);
+        var provisionalRole = ResolveProvisionalRole(Context.Guild, settings);
+        var profile = await _db.GetDiscordUserProfileAsync(targetUser.Id);
+
+        if (approved && memberRole is null)
+        {
+            await FollowupAsync("メンバーロールを取得できませんでした。", ephemeral: true);
+            return;
+        }
+
+        try
+        {
+            if (provisionalRole is not null && targetUser.Roles.Any(role => role.Id == provisionalRole.Id))
+            {
+                await targetUser.RemoveRoleAsync(provisionalRole);
+            }
+
+            if (approved && memberRole is not null && targetUser.Roles.All(role => role.Id != memberRole.Id))
+            {
+                await targetUser.AddRoleAsync(memberRole);
+            }
+
+            if (approved && profile is not null)
+            {
+                await GrantDcRoleAsync(targetUser, profile.FfxivDataCenter);
+                await UpdateNicknameAsync(targetUser, profile.FfxivName ?? string.Empty, profile.FfxivWorld ?? string.Empty);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to process member registration review. GuildId={GuildId}, UserId={UserId}, Approved={Approved}", Context.Guild.Id, targetUser.Id, approved);
+            await FollowupAsync("ロール付与処理に失敗しました。Botの権限を確認してください。", ephemeral: true);
+            return;
+        }
+
+        if (approved)
+        {
+            await LogMemberRegistrationCompletedAsync(
+                targetUser,
+                profile?.FfxivName ?? "(unknown)",
+                profile?.FfxivWorld ?? "(unknown)",
+                profile?.FfxivDataCenter ?? "(unknown)",
+                profile?.XHandle,
+                profile?.BlueskyHandle);
+            _ = _stats.RefreshIfConfiguredAsync(Context.Guild);
+        }
+        else
+        {
+            await LogMemberRegistrationRejectedAsync(targetUser);
+        }
+
+        var status = approved ? "許可" : "拒否";
+        await FinalizeMemberRegistrationReviewMessageAsync(
+            approved,
+            $"対応: {status}\n対象: {FormatUser(targetUser)}\n対応者: {FormatUser(Context.User)}",
+            markError: false);
+
+        await FollowupAsync(
+            approved ? $"登録申請を許可しました: {targetUser.Mention}" : $"登録申請を拒否しました: {targetUser.Mention}",
+            ephemeral: true);
     }
 
     private static MessageComponent BuildMemberRegistrationStartComponents()
         => MemberRegistrationPanel.BuildComponents();
+
+    private static MessageComponent BuildMemberRegistrationSubmitComponents()
+        => new ComponentBuilder()
+            .WithButton("登録申請を送信", MemberRegistrationSubmitCustomId, ButtonStyle.Primary)
+            .Build();
+
+    private static MessageComponent BuildMemberRegistrationReviewComponents(ulong userId)
+        => new ComponentBuilder()
+            .WithButton("許可", $"{MemberRegistrationApprovePrefix}:{userId}", ButtonStyle.Success)
+            .WithButton("拒否", $"{MemberRegistrationRejectPrefix}:{userId}", ButtonStyle.Danger)
+            .Build();
 
     private static MessageComponent BuildDataCenterSelectComponents()
     {
@@ -495,44 +702,143 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
         }
     }
 
-    private async Task GrantMemberRoleAsync()
+    private IRole? ResolveMemberRole(SocketGuild guild, GuildSettings? settings)
     {
-        if (Context.Guild is null || Context.User is not SocketGuildUser guildUser)
-        {
-            return;
-        }
-
-        IRole? memberRole = null;
-        var settings = await _db.GetGuildSettingsAsync(Context.Guild.Id);
         if (settings is not null && settings.MemberRoleId != 0)
         {
-            memberRole = Context.Guild.GetRole(ToUlong(settings.MemberRoleId));
+            var byId = guild.GetRole(ToUlong(settings.MemberRoleId));
+            if (byId is not null)
+            {
+                return byId;
+            }
         }
 
-        memberRole ??= Context.Guild.Roles.FirstOrDefault(role =>
+        return guild.Roles.FirstOrDefault(role =>
             string.Equals(role.Name, _options.MemberRoleName, StringComparison.OrdinalIgnoreCase));
-
-        if (memberRole is null)
-        {
-            return;
-        }
-
-        if (guildUser.Roles.Any(role => role.Id == memberRole.Id))
-        {
-            return;
-        }
-
-        await guildUser.AddRoleAsync(memberRole);
     }
 
-    private async Task GrantDcRoleAsync(string? dataCenter)
+    private IRole? ResolveProvisionalRole(SocketGuild guild, GuildSettings? settings)
     {
-        if (string.IsNullOrWhiteSpace(dataCenter))
+        if (settings is not null && settings.ProvisionalRoleId != 0)
+        {
+            var byId = guild.GetRole(ToUlong(settings.ProvisionalRoleId));
+            if (byId is not null)
+            {
+                return byId;
+            }
+        }
+
+        return guild.Roles.FirstOrDefault(role =>
+            string.Equals(role.Name, _options.ProvisionalRoleName, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private SocketTextChannel? ResolveRegistrationReviewChannel(SocketGuild guild, GuildSettings? settings)
+    {
+        if (settings is not null && settings.RegistrationReviewChannelId != 0)
+        {
+            var byId = guild.GetTextChannel(ToUlong(settings.RegistrationReviewChannelId));
+            if (byId is not null)
+            {
+                return byId;
+            }
+        }
+
+        var channelName = string.IsNullOrWhiteSpace(_options.RegistrationReviewChannelName)
+            ? "登録確認"
+            : _options.RegistrationReviewChannelName;
+        return guild.TextChannels.FirstOrDefault(channel =>
+            string.Equals(channel.Name, channelName, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static bool HasCompletedRegistrationProfile(DiscordUserProfile? profile)
+    {
+        return profile is not null
+               && !string.IsNullOrWhiteSpace(profile.FfxivName)
+               && !string.IsNullOrWhiteSpace(profile.FfxivWorld)
+               && !string.IsNullOrWhiteSpace(profile.FfxivDataCenter)
+               && !string.IsNullOrWhiteSpace(profile.Bio);
+    }
+
+    private async Task<Embed> BuildMemberRegistrationReviewEmbedAsync(SocketGuildUser guildUser, DiscordUserProfile profile)
+    {
+        var guild = Context.Guild!;
+        var roleDefinitions = await LoadMemberContentRoleDefinitionsAsync(guild.Id);
+        var selectedRoleText = BuildSelectedContentRoleText(guildUser, roleDefinitions);
+
+        var ffxivName = string.IsNullOrWhiteSpace(profile.FfxivName) ? "(未設定)" : profile.FfxivName;
+        var ffxivWorld = string.IsNullOrWhiteSpace(profile.FfxivWorld) ? "(未設定)" : profile.FfxivWorld;
+        var dataCenter = string.IsNullOrWhiteSpace(profile.FfxivDataCenter) ? "(未設定)" : profile.FfxivDataCenter;
+        var xText = string.IsNullOrWhiteSpace(profile.XHandle) ? "(なし)" : profile.XHandle;
+        var blueskyText = string.IsNullOrWhiteSpace(profile.BlueskyHandle) ? "(なし)" : profile.BlueskyHandle;
+        var bio = string.IsNullOrWhiteSpace(profile.Bio) ? "(なし)" : TruncateForLog(profile.Bio, 900);
+        var displayName = string.IsNullOrWhiteSpace(profile.DisplayName) ? guildUser.DisplayName : profile.DisplayName;
+        var discordName = string.IsNullOrWhiteSpace(profile.DiscordName) ? guildUser.Username : profile.DiscordName;
+
+        var avatar = guildUser.GetAvatarUrl() ?? guildUser.GetDisplayAvatarUrl();
+        var embed = new EmbedBuilder()
+            .WithTitle("メンバー登録申請")
+            .WithColor(Color.Orange)
+            .WithCurrentTimestamp()
+            .WithDescription($"申請者: {guildUser.Mention}\nUserId: `{guildUser.Id}`")
+            .AddField("Discord", $"表示名: {TruncateForLog(displayName, 120)}\nユーザー名: {TruncateForLog(discordName, 120)}", false)
+            .AddField("FFXIV", $"{ffxivName}@{ffxivWorld} [{dataCenter}]", false)
+            .AddField("SNS", $"𝕏: {TruncateForLog(xText, 120)}\nBluesky: {TruncateForLog(blueskyText, 120)}", false)
+            .AddField("一言", bio, false)
+            .AddField("コンテンツロール", selectedRoleText, false);
+
+        if (!string.IsNullOrWhiteSpace(avatar))
+        {
+            embed.WithThumbnailUrl(avatar);
+        }
+
+        return embed.Build();
+    }
+
+    private static string BuildSelectedContentRoleText(SocketGuildUser guildUser, IReadOnlyList<ContentRoleDefinition> roleDefinitions)
+    {
+        var selectedLabels = roleDefinitions
+            .Where(definition => guildUser.Roles.Any(role =>
+                string.Equals(role.Name, definition.RoleName, StringComparison.OrdinalIgnoreCase)))
+            .Select(definition => definition.Label)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        if (selectedLabels.Count == 0)
+        {
+            return "（未選択）";
+        }
+
+        var text = string.Join('\n', selectedLabels.Select(label => $"・{label}"));
+        return TruncateForLog(text, 900);
+    }
+
+    private async Task FinalizeMemberRegistrationReviewMessageAsync(bool approved, string summary, bool markError)
+    {
+        if (Context.Interaction is not SocketMessageComponent component || component.Message is not IUserMessage message)
         {
             return;
         }
 
-        if (Context.Guild is null || Context.User is not SocketGuildUser guildUser)
+        var state = markError ? "処理失敗" : approved ? "承認済み" : "拒否済み";
+        var content = $"[{state}]\n{summary}";
+
+        try
+        {
+            await message.ModifyAsync(props =>
+            {
+                props.Content = content;
+                props.Components = new ComponentBuilder().Build();
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to finalize member registration review message. GuildId={GuildId}", Context.Guild?.Id);
+        }
+    }
+
+    private async Task GrantDcRoleAsync(SocketGuildUser guildUser, string? dataCenter)
+    {
+        if (string.IsNullOrWhiteSpace(dataCenter) || Context.Guild is null)
         {
             return;
         }
@@ -572,9 +878,9 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
         }
     }
 
-    private async Task UpdateNicknameAsync(string characterName, string world)
+    private async Task UpdateNicknameAsync(SocketGuildUser guildUser, string characterName, string world)
     {
-        if (Context.Guild is null || Context.User is not SocketGuildUser guildUser)
+        if (Context.Guild is null)
         {
             return;
         }
@@ -663,7 +969,24 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
         await _audit.SendAsync(Context.Guild, "Lodestone連携完了", description, Color.Blue, Context.User);
     }
 
-    private async Task LogMemberRegistrationCompletedAsync(string ffxivName, string world, string dataCenter, string? xHandle, string? blueskyHandle)
+    private async Task LogMemberRegistrationRequestedAsync(DiscordUserProfile profile, SocketGuildUser applicant)
+    {
+        if (Context.Guild is null)
+        {
+            return;
+        }
+
+        var description = string.Join('\n', new[]
+        {
+            $"👤 申請者: {FormatUser(applicant)}",
+            $"🧩 FFXIV名: {profile.FfxivName}",
+            $"🌐 ワールド: {profile.FfxivWorld} [{profile.FfxivDataCenter}]"
+        });
+
+        await _audit.SendAsync(Context.Guild, "メンバー登録申請", description, Color.Orange, applicant);
+    }
+
+    private async Task LogMemberRegistrationCompletedAsync(IUser targetUser, string ffxivName, string world, string dataCenter, string? xHandle, string? blueskyHandle)
     {
         if (Context.Guild is null)
         {
@@ -674,14 +997,31 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
         var blueskyText = string.IsNullOrWhiteSpace(blueskyHandle) ? "(none)" : blueskyHandle;
         var description = string.Join('\n', new[]
         {
-            $"👤 ユーザー: {FormatUser(Context.User)}",
+            $"👤 対象ユーザー: {FormatUser(targetUser)}",
+            $"✅ 対応者: {FormatUser(Context.User)}",
             $"🧩 FFXIV名: {ffxivName}",
             $"🌐 ワールド: {world} [{dataCenter}]",
             $"𝕏: {xText}",
             $"🦋 Bluesky: {blueskyText}"
         });
 
-        await _audit.SendAsync(Context.Guild, "メンバー登録完了", description, Color.Green, Context.User);
+        await _audit.SendAsync(Context.Guild, "メンバー登録完了", description, Color.Green, targetUser);
+    }
+
+    private async Task LogMemberRegistrationRejectedAsync(IUser targetUser)
+    {
+        if (Context.Guild is null)
+        {
+            return;
+        }
+
+        var description = string.Join('\n', new[]
+        {
+            $"👤 対象ユーザー: {FormatUser(targetUser)}",
+            $"⛔ 対応者: {FormatUser(Context.User)}"
+        });
+
+        await _audit.SendAsync(Context.Guild, "メンバー登録拒否", description, Color.DarkRed, targetUser);
     }
 
     private Task LogRateLimitAsync(string title, int waitSeconds)

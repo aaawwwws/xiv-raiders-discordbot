@@ -137,6 +137,37 @@ CREATE TABLE IF NOT EXISTS guild_daily_activity_panels (
         await conn.ExecuteAsync(sql);
     }
 
+    public async Task EnsureGuildWeeklyActivityPanelTableAsync()
+    {
+        const string sql = @"
+CREATE TABLE IF NOT EXISTS guild_weekly_activity_panels (
+    id SERIAL PRIMARY KEY,
+    guild_id BIGINT NOT NULL UNIQUE,
+    channel_id BIGINT NOT NULL,
+    message_id BIGINT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);";
+
+        await using var conn = CreateConnection();
+        await conn.ExecuteAsync(sql);
+    }
+
+    public async Task EnsureGuildSettingsColumnsAsync()
+    {
+        const string sql = @"
+ALTER TABLE IF EXISTS public.guild_settings
+ADD COLUMN IF NOT EXISTS provisional_role_id BIGINT NOT NULL DEFAULT 0,
+ADD COLUMN IF NOT EXISTS registration_channel_id BIGINT NOT NULL DEFAULT 0,
+ADD COLUMN IF NOT EXISTS registration_review_channel_id BIGINT NOT NULL DEFAULT 0,
+ADD COLUMN IF NOT EXISTS registration_approval_required BOOLEAN NOT NULL DEFAULT TRUE,
+ADD COLUMN IF NOT EXISTS inactive_auto_kick_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+ADD COLUMN IF NOT EXISTS log_channel_id BIGINT NOT NULL DEFAULT 0,
+ADD COLUMN IF NOT EXISTS control_channel_id BIGINT NOT NULL DEFAULT 0;";
+
+        await using var conn = CreateConnection();
+        await conn.ExecuteAsync(sql);
+    }
+
     public async Task EnsureRecruitTemplatesTableAsync()
     {
         const string sql = @"
@@ -2074,6 +2105,9 @@ SELECT guild_id AS GuildId,
        member_role_id AS MemberRoleId,
        provisional_role_id AS ProvisionalRoleId,
        registration_channel_id AS RegistrationChannelId,
+       registration_review_channel_id AS RegistrationReviewChannelId,
+       registration_approval_required AS RegistrationApprovalRequired,
+       inactive_auto_kick_enabled AS InactiveAutoKickEnabled,
        log_channel_id AS LogChannelId,
        control_channel_id AS ControlChannelId,
        updated_at AS UpdatedAt
@@ -2085,16 +2119,29 @@ LIMIT 1;";
         return await conn.QuerySingleOrDefaultAsync<GuildSettings>(sql, new { GuildId = ToDbId(guildId) });
     }
 
-    public async Task UpsertGuildSettingsAsync(ulong guildId, ulong adminRoleId, ulong memberRoleId, ulong provisionalRoleId, ulong registrationChannelId, ulong logChannelId, ulong controlChannelId)
+    public async Task UpsertGuildSettingsAsync(
+        ulong guildId,
+        ulong adminRoleId,
+        ulong memberRoleId,
+        ulong provisionalRoleId,
+        ulong registrationChannelId,
+        ulong registrationReviewChannelId,
+        bool registrationApprovalRequired,
+        bool inactiveAutoKickEnabled,
+        ulong logChannelId,
+        ulong controlChannelId)
     {
         const string sql = @"
-INSERT INTO guild_settings (guild_id, admin_role_id, member_role_id, provisional_role_id, registration_channel_id, log_channel_id, control_channel_id)
-VALUES (@GuildId, @AdminRoleId, @MemberRoleId, @ProvisionalRoleId, @RegistrationChannelId, @LogChannelId, @ControlChannelId)
+INSERT INTO guild_settings (guild_id, admin_role_id, member_role_id, provisional_role_id, registration_channel_id, registration_review_channel_id, registration_approval_required, inactive_auto_kick_enabled, log_channel_id, control_channel_id)
+VALUES (@GuildId, @AdminRoleId, @MemberRoleId, @ProvisionalRoleId, @RegistrationChannelId, @RegistrationReviewChannelId, @RegistrationApprovalRequired, @InactiveAutoKickEnabled, @LogChannelId, @ControlChannelId)
 ON CONFLICT (guild_id) DO UPDATE
 SET admin_role_id = EXCLUDED.admin_role_id,
     member_role_id = EXCLUDED.member_role_id,
     provisional_role_id = EXCLUDED.provisional_role_id,
     registration_channel_id = EXCLUDED.registration_channel_id,
+    registration_review_channel_id = EXCLUDED.registration_review_channel_id,
+    registration_approval_required = EXCLUDED.registration_approval_required,
+    inactive_auto_kick_enabled = EXCLUDED.inactive_auto_kick_enabled,
     log_channel_id = EXCLUDED.log_channel_id,
     control_channel_id = EXCLUDED.control_channel_id,
     updated_at = NOW();";
@@ -2107,9 +2154,38 @@ SET admin_role_id = EXCLUDED.admin_role_id,
             MemberRoleId = ToDbId(memberRoleId),
             ProvisionalRoleId = ToDbId(provisionalRoleId),
             RegistrationChannelId = ToDbId(registrationChannelId),
+            RegistrationReviewChannelId = ToDbId(registrationReviewChannelId),
+            RegistrationApprovalRequired = registrationApprovalRequired,
+            InactiveAutoKickEnabled = inactiveAutoKickEnabled,
             LogChannelId = ToDbId(logChannelId),
             ControlChannelId = ToDbId(controlChannelId)
         });
+    }
+
+    public async Task<bool> UpdateGuildRegistrationApprovalRequiredAsync(ulong guildId, bool required)
+    {
+        const string sql = @"
+UPDATE guild_settings
+SET registration_approval_required = @Required,
+    updated_at = NOW()
+WHERE guild_id = @GuildId;";
+
+        await using var conn = CreateConnection();
+        var affected = await conn.ExecuteAsync(sql, new { GuildId = ToDbId(guildId), Required = required });
+        return affected > 0;
+    }
+
+    public async Task<bool> UpdateGuildInactiveAutoKickEnabledAsync(ulong guildId, bool enabled)
+    {
+        const string sql = @"
+UPDATE guild_settings
+SET inactive_auto_kick_enabled = @Enabled,
+    updated_at = NOW()
+WHERE guild_id = @GuildId;";
+
+        await using var conn = CreateConnection();
+        var affected = await conn.ExecuteAsync(sql, new { GuildId = ToDbId(guildId), Enabled = enabled });
+        return affected > 0;
     }
 
     public async Task<GuildPanel?> GetGuildControlPanelAsync(ulong guildId)
@@ -2180,6 +2256,21 @@ SELECT guild_id AS GuildId,
        message_id AS MessageId,
        updated_at AS UpdatedAt
 FROM guild_daily_activity_panels
+WHERE guild_id = @GuildId
+LIMIT 1;";
+
+        await using var conn = CreateConnection();
+        return await conn.QuerySingleOrDefaultAsync<GuildPanel>(sql, new { GuildId = ToDbId(guildId) });
+    }
+
+    public async Task<GuildPanel?> GetGuildWeeklyActivityPanelAsync(ulong guildId)
+    {
+        const string sql = @"
+SELECT guild_id AS GuildId,
+       channel_id AS ChannelId,
+       message_id AS MessageId,
+       updated_at AS UpdatedAt
+FROM guild_weekly_activity_panels
 WHERE guild_id = @GuildId
 LIMIT 1;";
 
@@ -2267,6 +2358,25 @@ SET channel_id = EXCLUDED.channel_id,
     {
         const string sql = @"
 INSERT INTO guild_daily_activity_panels (guild_id, channel_id, message_id)
+VALUES (@GuildId, @ChannelId, @MessageId)
+ON CONFLICT (guild_id) DO UPDATE
+SET channel_id = EXCLUDED.channel_id,
+    message_id = EXCLUDED.message_id,
+    updated_at = NOW();";
+
+        await using var conn = CreateConnection();
+        await conn.ExecuteAsync(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            ChannelId = ToDbId(channelId),
+            MessageId = ToDbId(messageId)
+        });
+    }
+
+    public async Task UpsertGuildWeeklyActivityPanelAsync(ulong guildId, ulong channelId, ulong messageId)
+    {
+        const string sql = @"
+INSERT INTO guild_weekly_activity_panels (guild_id, channel_id, message_id)
 VALUES (@GuildId, @ChannelId, @MessageId)
 ON CONFLICT (guild_id) DO UPDATE
 SET channel_id = EXCLUDED.channel_id,

@@ -55,8 +55,8 @@ public sealed class StatsModule : InteractionModuleBase<SocketInteractionContext
     }
 
     [RequireBotAdmin]
-    [SlashCommand("ranking", "週間アクティビティランキングを表示します")]
-    public async Task RankingAsync([Summary("days", "集計日数(1-30)")] int days = 7)
+    [SlashCommand("week", "週間ランキングの自動投稿先をこのチャンネルに設定します")]
+    public async Task SetupWeeklyRankingAsync()
     {
         if (Context.Guild is null)
         {
@@ -64,10 +64,24 @@ public sealed class StatsModule : InteractionModuleBase<SocketInteractionContext
             return;
         }
 
-        var rangeDays = Math.Clamp(days, 1, 30);
-        await DeferAsync(ephemeral: false);
-        var embed = await _voiceStats.BuildWeeklyRankingEmbedAsync(Context.Guild, DateTimeOffset.UtcNow, rangeDays, topCount: 10);
-        await FollowupAsync(embed: embed);
+        if (Context.Channel is not IMessageChannel channel)
+        {
+            await RespondAsync("このチャンネルには投稿できません。", ephemeral: true);
+            return;
+        }
+
+        await DeferAsync(ephemeral: true);
+
+        var existing = await _db.GetGuildWeeklyActivityPanelAsync(Context.Guild.Id);
+        var lastMessageId = existing is null ? 0UL : ToUlong(existing.MessageId);
+        await _db.UpsertGuildWeeklyActivityPanelAsync(Context.Guild.Id, channel.Id, lastMessageId);
+
+        var day = ToJstDayName(Math.Clamp(_options.VoiceWeeklyRankingPostDayOfWeekJst, 0, 6));
+        var hour = Math.Clamp(_options.VoiceWeeklyRankingPostHourJst, 0, 23);
+        var rangeDays = Math.Clamp(_options.VoiceWeeklyRankingRangeDays, 1, 30);
+        await FollowupAsync(
+            $"週間ランキングの送信先を設定しました。\n対象: <#{channel.Id}>\n投稿タイミング: 毎週{day} {hour:00}:00 (JST)\n集計期間: 直前{rangeDays}日（確定分のみ）",
+            ephemeral: true);
     }
 
     [RequireBotAdmin]
@@ -158,4 +172,19 @@ public sealed class StatsModule : InteractionModuleBase<SocketInteractionContext
 
     private static ulong ToUlong(long value) => unchecked((ulong)value);
     private static long ToDbId(ulong value) => unchecked((long)value);
+
+    private static string ToJstDayName(int dayOfWeek)
+    {
+        return dayOfWeek switch
+        {
+            0 => "日曜日",
+            1 => "月曜日",
+            2 => "火曜日",
+            3 => "水曜日",
+            4 => "木曜日",
+            5 => "金曜日",
+            6 => "土曜日",
+            _ => "不明"
+        };
+    }
 }

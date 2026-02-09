@@ -9,6 +9,7 @@ public sealed class DiscordOptions
     public string AdminRoleName { get; init; } = "RaidDC Admin";
     public string MemberRoleName { get; init; } = "メンバー";
     public string ProvisionalRoleName { get; init; } = "仮登録";
+    public string RegistrationReviewChannelName { get; init; } = "登録確認";
     public bool AutoCreateDcRoles { get; init; } = true;
     public string LogChannelName { get; init; } = "log";
     public string NotificationChannelName { get; init; } = "notice";
@@ -54,6 +55,9 @@ public sealed class DiscordOptions
     public bool AutoCreateInactiveRole { get; init; } = true;
     public int InactiveRoleDays { get; init; } = 7;
     public int ActivityRoleSyncIntervalMinutes { get; init; } = 30;
+    public bool InactiveAutoKickEnabled { get; init; } = true;
+    public int InactiveAutoKickDays { get; init; } = 30;
+    public string[] InactiveAutoKickExemptRoleNames { get; init; } = ["管理者", "オフィサー", "宣伝係"];
     public bool ApplyChannelPermissionOverwritesOnStartup { get; init; }
     public bool ControlChannelMemberCanSend { get; init; }
     public string TempVoiceLobbyName { get; init; } = "VC作成";

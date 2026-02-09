@@ -35,6 +35,7 @@ public sealed class DiscordBotService : IHostedService
     private readonly ConcurrentDictionary<ulong, CancellationTokenSource> _tempVoiceDeleteTokens = new();
     private readonly ConcurrentDictionary<ulong, int> _dailyActivityRankingPosted = new();
     private readonly ConcurrentDictionary<ulong, int> _weeklyVoiceRankingPosted = new();
+    private readonly ConcurrentDictionary<ulong, int> _inactiveAutoKickProcessedDay = new();
     private readonly SemaphoreSlim _tempVoiceLock = new(1, 1);
     private static readonly HttpClient AttachmentArchiveHttpClient = CreateAttachmentArchiveHttpClient();
     private static readonly TimeSpan JapanTimeOffset = TimeSpan.FromHours(9);
@@ -90,6 +91,8 @@ public sealed class DiscordBotService : IHostedService
         await _db.EnsureGuildMemberContentRolesTableAsync();
         await _db.EnsureGuildStatsPanelTableAsync();
         await _db.EnsureGuildDailyActivityPanelTableAsync();
+        await _db.EnsureGuildWeeklyActivityPanelTableAsync();
+        await _db.EnsureGuildSettingsColumnsAsync();
         await _db.EnsureRecruitTemplatesTableAsync();
         await _db.EnsureMessageLogPayloadColumnsAsync();
         await _db.EnsureUserReactionLogsTableAsync();
@@ -188,7 +191,7 @@ public sealed class DiscordBotService : IHostedService
 
         _logger.LogInformation("Bot ready. Commands registered.");
         await EnsureGuildResourcesAsync();
-        if ((_options.ActiveRoleEnabled || _options.InactiveRoleEnabled) && _options.InactiveRoleDays > 0)
+        if (ShouldRunActivityMaintenance())
         {
             await SyncActivityRolesAsync(DateTimeOffset.UtcNow);
         }
@@ -421,7 +424,7 @@ public sealed class DiscordBotService : IHostedService
     {
         try
         {
-            if ((_options.ActiveRoleEnabled || _options.InactiveRoleEnabled) && _options.InactiveRoleDays > 0)
+            if (ShouldRunActivityMaintenance())
             {
                 await SyncActivityRolesAsync(DateTimeOffset.UtcNow);
             }
@@ -430,6 +433,39 @@ public sealed class DiscordBotService : IHostedService
         {
             _logger.LogWarning(ex, "Failed to sync activity roles in periodic loop.");
         }
+    }
+
+    private bool ShouldRunActivityMaintenance()
+    {
+        // Per-guild admin settings can enable/disable inactive auto-kick at runtime,
+        // so the maintenance loop should always run and decide inside each guild.
+        return true;
+    }
+
+    private bool ShouldRunInactiveAutoKickNow(ulong guildId, bool inactiveAutoKickEnabled, DateTimeOffset nowUtc, out int dayKey, out DateTimeOffset evaluationBaseUtc)
+    {
+        dayKey = 0;
+        evaluationBaseUtc = nowUtc;
+
+        if (!(inactiveAutoKickEnabled && _options.InactiveAutoKickDays > 0))
+        {
+            return false;
+        }
+
+        var nowJst = nowUtc.ToOffset(JapanTimeOffset);
+        if (nowJst.Hour != 0)
+        {
+            return false;
+        }
+
+        dayKey = (nowJst.Year * 10000) + (nowJst.Month * 100) + nowJst.Day;
+        if (_inactiveAutoKickProcessedDay.TryGetValue(guildId, out var processedDay) && processedDay == dayKey)
+        {
+            return false;
+        }
+
+        evaluationBaseUtc = new DateTimeOffset(nowJst.Year, nowJst.Month, nowJst.Day, 0, 0, 0, JapanTimeOffset).ToUniversalTime();
+        return true;
     }
 
     private async Task RunRecruitScheduleTickAsync()
@@ -490,10 +526,12 @@ public sealed class DiscordBotService : IHostedService
     {
         var roleName = string.IsNullOrWhiteSpace(_options.AdminRoleName) ? "RaidDC Admin" : _options.AdminRoleName;
         var memberRoleName = string.IsNullOrWhiteSpace(_options.MemberRoleName) ? "メンバー" : _options.MemberRoleName;
+        var provisionalRoleName = string.IsNullOrWhiteSpace(_options.ProvisionalRoleName) ? "仮登録" : _options.ProvisionalRoleName;
         var logChannelName = string.IsNullOrWhiteSpace(_options.LogChannelName) ? "log" : _options.LogChannelName;
         var notificationChannelName = string.IsNullOrWhiteSpace(_options.NotificationChannelName) ? "notice" : _options.NotificationChannelName;
         var activityRankingChannelName = string.IsNullOrWhiteSpace(_options.ActivityRankingChannelName) ? "ランキング" : _options.ActivityRankingChannelName;
         var voiceNotificationRoleName = string.IsNullOrWhiteSpace(_options.VoiceNotificationRoleName) ? "通話通知" : _options.VoiceNotificationRoleName;
+        var registrationReviewChannelName = string.IsNullOrWhiteSpace(_options.RegistrationReviewChannelName) ? "登録確認" : _options.RegistrationReviewChannelName;
         var controlChannelName = string.IsNullOrWhiteSpace(_options.ControlChannelName) ? "bot-control" : _options.ControlChannelName;
         var autoOps = new List<string>();
 
@@ -525,6 +563,20 @@ public sealed class DiscordBotService : IHostedService
             autoOps.Add($"🛠️ メンバーロール作成: {memberRole.Name} ({MentionRole(memberRole.Id)})");
         }
 
+        IRole? provisionalRole = null;
+        if (settings is not null && settings.ProvisionalRoleId != 0)
+        {
+            provisionalRole = guild.GetRole(ToUlong(settings.ProvisionalRoleId));
+        }
+        provisionalRole ??= guild.Roles.FirstOrDefault(role =>
+            string.Equals(role.Name, provisionalRoleName, StringComparison.OrdinalIgnoreCase));
+        if (provisionalRole is null)
+        {
+            provisionalRole = await guild.CreateRoleAsync(provisionalRoleName, GuildPermissions.None, color: new Color(230, 126, 34), isHoisted: false, isMentionable: false);
+            _logger.LogInformation("Provisional role created in guild {GuildId}.", guild.Id);
+            autoOps.Add($"🛠️ 仮登録ロール作成: {provisionalRole.Name} ({MentionRole(provisionalRole.Id)})");
+        }
+
         IRole? voiceNotificationRole = guild.Roles.FirstOrDefault(role =>
             string.Equals(role.Name, voiceNotificationRoleName, StringComparison.OrdinalIgnoreCase));
         if (voiceNotificationRole is null && _options.AutoCreateVoiceNotificationRole)
@@ -542,6 +594,23 @@ public sealed class DiscordBotService : IHostedService
         if (settings is not null && settings.RegistrationChannelId != 0)
         {
             registrationChannel = guild.GetTextChannel(ToUlong(settings.RegistrationChannelId));
+        }
+
+        IMessageChannel? registrationReviewChannel = null;
+        if (settings is not null && settings.RegistrationReviewChannelId != 0)
+        {
+            registrationReviewChannel = guild.GetTextChannel(ToUlong(settings.RegistrationReviewChannelId));
+        }
+        registrationReviewChannel ??= guild.TextChannels.FirstOrDefault(channel =>
+            string.Equals(channel.Name, registrationReviewChannelName, StringComparison.OrdinalIgnoreCase));
+        if (registrationReviewChannel is null)
+        {
+            registrationReviewChannel = await guild.CreateTextChannelAsync(registrationReviewChannelName, props =>
+            {
+                props.Topic = "メンバー登録申請の確認・許可/拒否を行います。";
+            });
+            _logger.LogInformation("Registration review channel created in guild {GuildId}.", guild.Id);
+            autoOps.Add($"🛠️ 登録確認チャンネル作成: <#{registrationReviewChannel.Id}>");
         }
 
         IMessageChannel? logChannel = null;
@@ -602,18 +671,33 @@ public sealed class DiscordBotService : IHostedService
             autoOps.Add($"🛠️ コントロールチャンネル作成: <#{controlChannel.Id}>");
         }
 
+        var registrationApprovalRequired = settings?.RegistrationApprovalRequired ?? true;
+        var inactiveAutoKickEnabled = settings?.InactiveAutoKickEnabled ?? _options.InactiveAutoKickEnabled;
+
         await _db.UpsertGuildSettingsAsync(
             guild.Id,
             adminRole.Id,
             memberRole.Id,
-            0,
+            provisionalRole.Id,
             registrationChannel?.Id ?? 0,
+            registrationReviewChannel.Id,
+            registrationApprovalRequired,
+            inactiveAutoKickEnabled,
             logChannel.Id,
             controlChannel.Id);
 
         if (_options.ApplyChannelPermissionOverwritesOnStartup)
         {
-            await EnsureVisibilityAsync(guild, adminRole, memberRole, registrationChannel, logChannel, notificationChannel, controlChannel, activityRankingChannel);
+            await EnsureVisibilityAsync(
+                guild,
+                adminRole,
+                memberRole,
+                registrationChannel,
+                registrationReviewChannel,
+                logChannel,
+                notificationChannel,
+                controlChannel,
+                activityRankingChannel);
             autoOps.Add("🔧 チャンネル権限オーバーライト同期を実施");
         }
         else
@@ -852,14 +936,8 @@ public sealed class DiscordBotService : IHostedService
     private async Task TryPostDailyActivityRankingAsync(DateTimeOffset nowUtc)
     {
         var topCount = Math.Clamp(_options.DailyActivityRankingTopCount, 1, 20);
-        var targetHour = Math.Clamp(_options.DailyActivityRankingPostHourJst, 0, 23);
         var intervalMinutes = Math.Clamp(_options.DailyActivityRankingUpdateIntervalMinutes, 5, 180);
         var nowJst = nowUtc.ToOffset(JapanTimeOffset);
-        if (nowJst.Hour < targetHour)
-        {
-            return;
-        }
-
         var slotKey = (int)(nowJst.ToUnixTimeSeconds() / (intervalMinutes * 60L));
         var dayStartJst = new DateTimeOffset(nowJst.Year, nowJst.Month, nowJst.Day, 0, 0, 0, JapanTimeOffset);
         var fromUtc = dayStartJst.ToUniversalTime();
@@ -872,7 +950,7 @@ public sealed class DiscordBotService : IHostedService
             }
 
             var panel = await _db.GetGuildDailyActivityPanelAsync(guild.Id);
-            if (panel is null || panel.ChannelId == 0 || panel.MessageId == 0)
+            if (panel is null || panel.ChannelId == 0)
             {
                 continue;
             }
@@ -886,7 +964,7 @@ public sealed class DiscordBotService : IHostedService
             try
             {
                 var embed = await _voiceStats.BuildActivityRankingEmbedAsync(guild, fromUtc, nowUtc, topCount, "今日のアクティビティランキング");
-                var message = await UpsertDailyActivityRankingMessageAsync(guild, channel, ToUlong(panel.MessageId), embed);
+                var message = await UpsertDailyActivityRankingMessageAsync(guild, channel, panel.MessageId == 0 ? 0 : ToUlong(panel.MessageId), nowJst, embed);
                 await _db.UpsertGuildDailyActivityPanelAsync(guild.Id, channel.Id, message.Id);
                 _dailyActivityRankingPosted[guild.Id] = slotKey;
             }
@@ -921,7 +999,14 @@ public sealed class DiscordBotService : IHostedService
                 continue;
             }
 
-            var channel = await ResolveActivityRankingChannelAsync(guild);
+            var panel = await _db.GetGuildWeeklyActivityPanelAsync(guild.Id);
+            IMessageChannel? channel = null;
+            if (panel is not null && panel.ChannelId != 0)
+            {
+                channel = guild.GetTextChannel(ToUlong(panel.ChannelId));
+            }
+
+            channel ??= await ResolveActivityRankingChannelAsync(guild);
             if (channel is null)
             {
                 continue;
@@ -929,8 +1014,26 @@ public sealed class DiscordBotService : IHostedService
 
             try
             {
-                var embed = await _voiceStats.BuildWeeklyRankingEmbedAsync(guild, nowUtc, rangeDays, topCount);
-                await channel.SendMessageAsync(embed: embed, flags: MessageFlags.SuppressNotification);
+                var periodEndJst = new DateTimeOffset(nowJst.Year, nowJst.Month, nowJst.Day, 0, 0, 0, JapanTimeOffset);
+                var periodStartJst = periodEndJst.AddDays(-rangeDays);
+                if (guild.CreatedAt.ToOffset(JapanTimeOffset) > periodStartJst)
+                {
+                    _logger.LogInformation(
+                        "Skip weekly ranking because full range has not elapsed yet. GuildId={GuildId}, PeriodStartJst={PeriodStartJst}, GuildCreatedAt={GuildCreatedAt}",
+                        guild.Id,
+                        periodStartJst,
+                        guild.CreatedAt);
+                    continue;
+                }
+
+                var embed = await _voiceStats.BuildActivityRankingEmbedAsync(
+                    guild,
+                    periodStartJst.ToUniversalTime(),
+                    periodEndJst.ToUniversalTime(),
+                    topCount,
+                    "週間アクティビティランキング");
+                var message = await channel.SendMessageAsync(embed: embed, flags: MessageFlags.SuppressNotification);
+                await _db.UpsertGuildWeeklyActivityPanelAsync(guild.Id, channel.Id, message.Id);
                 _weeklyVoiceRankingPosted[guild.Id] = weekKey;
             }
             catch (Exception ex)
@@ -957,6 +1060,18 @@ public sealed class DiscordBotService : IHostedService
 
     private async Task SyncActivityRolesInGuildAsync(SocketGuild guild, DateTimeOffset nowUtc)
     {
+        var guildSettings = await _db.GetGuildSettingsAsync(guild.Id);
+        var inactiveAutoKickEnabled = guildSettings?.InactiveAutoKickEnabled ?? _options.InactiveAutoKickEnabled;
+
+        var (activeRole, inactiveRole) = await ResolveActivityRolesAsync(guild);
+        var roleSyncEnabled = activeRole is not null || inactiveRole is not null;
+        var shouldRunKick = ShouldRunInactiveAutoKickNow(guild.Id, inactiveAutoKickEnabled, nowUtc, out var kickDayKey, out var kickEvaluationBaseUtc);
+        var kickEnabled = shouldRunKick;
+        if (!roleSyncEnabled && !kickEnabled)
+        {
+            return;
+        }
+
         // Guild member cache can be incomplete right after startup unless downloaded explicitly.
         try
         {
@@ -967,28 +1082,34 @@ public sealed class DiscordBotService : IHostedService
             _logger.LogWarning(ex, "Failed to download guild users before activity role sync. GuildId={GuildId}", guild.Id);
         }
 
-        var (activeRole, inactiveRole) = await ResolveActivityRolesAsync(guild);
-
-        if (inactiveRole is null && activeRole is null)
-        {
-            return;
-        }
-
         if (inactiveRole is not null && activeRole is not null && inactiveRole.Id == activeRole.Id)
         {
             _logger.LogWarning("Active role and inactive role are identical in guild {GuildId}. Active role sync is skipped.", guild.Id);
             activeRole = null;
+            roleSyncEnabled = inactiveRole is not null || activeRole is not null;
         }
 
-        var cutoff = nowUtc.AddDays(-Math.Max(1, _options.InactiveRoleDays));
-        var activeUserIds = await _db.ListActiveUserIdsSinceAsync(guild.Id, cutoff);
+        var roleCutoff = nowUtc.AddDays(-Math.Max(1, _options.InactiveRoleDays));
+        var activeUserIds = roleSyncEnabled
+            ? await _db.ListActiveUserIdsSinceAsync(guild.Id, roleCutoff)
+            : Array.Empty<ulong>();
+        var kickDays = Math.Max(1, _options.InactiveAutoKickDays);
+        var kickCutoff = kickEvaluationBaseUtc.AddDays(-kickDays);
+        var activeUserIdsForKick = kickEnabled
+            ? await _db.ListActiveUserIdsSinceAsync(guild.Id, kickCutoff)
+            : Array.Empty<ulong>();
+        var kickExemptRoleNames = BuildInactiveKickExemptRoleNameSet();
+        var currentBotUser = guild.CurrentUser;
         var addedActive = 0;
         var removedActive = 0;
         var addedInactive = 0;
         var removedInactive = 0;
+        var kickedUsers = 0;
+        var kickExemptUsers = 0;
+        var kickPermissionSkippedUsers = 0;
         var eligibleUsers = 0;
 
-        foreach (var user in guild.Users)
+        foreach (var user in guild.Users.ToArray())
         {
             if (user.IsBot || user.Id == guild.OwnerId)
             {
@@ -1000,7 +1121,38 @@ public sealed class DiscordBotService : IHostedService
             var hasActiveRole = activeRole is not null && user.Roles.Any(role => role.Id == activeRole.Id);
             var isActive = activeUserIds.Contains(user.Id);
             var joinedAt = user.JoinedAt ?? user.CreatedAt;
-            var joinedRecently = joinedAt > cutoff;
+            var joinedRecently = joinedAt > roleCutoff;
+            var isActiveForKick = activeUserIdsForKick.Contains(user.Id);
+
+            if (kickEnabled && !isActiveForKick && joinedAt <= kickCutoff)
+            {
+                if (IsInactiveKickExemptUser(user, kickExemptRoleNames))
+                {
+                    kickExemptUsers++;
+                }
+                else if (CanKickMember(currentBotUser, user, guild.OwnerId))
+                {
+                    try
+                    {
+                        await user.KickAsync($"Inactive for {kickDays} days.");
+                        kickedUsers++;
+                        continue;
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Failed to auto-kick inactive user. GuildId={GuildId}, UserId={UserId}", guild.Id, user.Id);
+                    }
+                }
+                else
+                {
+                    kickPermissionSkippedUsers++;
+                }
+            }
+
+            if (!roleSyncEnabled)
+            {
+                continue;
+            }
 
             if (isActive)
             {
@@ -1078,15 +1230,23 @@ public sealed class DiscordBotService : IHostedService
             }
         }
 
+        if (shouldRunKick)
+        {
+            _inactiveAutoKickProcessedDay[guild.Id] = kickDayKey;
+        }
+
         _logger.LogInformation(
-            "Activity role sync completed. GuildId={GuildId}, EligibleUsers={EligibleUsers}, ActiveUsers={ActiveUsers}, +Active={AddedActive}, -Active={RemovedActive}, +Inactive={AddedInactive}, -Inactive={RemovedInactive}",
+            "Activity sync completed. GuildId={GuildId}, EligibleUsers={EligibleUsers}, ActiveUsers={ActiveUsers}, +Active={AddedActive}, -Active={RemovedActive}, +Inactive={AddedInactive}, -Inactive={RemovedInactive}, Kicked={KickedUsers}, KickExempt={KickExemptUsers}, KickSkippedByPermission={KickPermissionSkippedUsers}",
             guild.Id,
             eligibleUsers,
             activeUserIds.Count,
             addedActive,
             removedActive,
             addedInactive,
-            removedInactive);
+            removedInactive,
+            kickedUsers,
+            kickExemptUsers,
+            kickPermissionSkippedUsers);
     }
 
     private async Task<(IRole? ActiveRole, IRole? InactiveRole)> ResolveActivityRolesAsync(SocketGuild guild)
@@ -1134,6 +1294,68 @@ public sealed class DiscordBotService : IHostedService
         }
 
         return (activeRole, inactiveRole);
+    }
+
+    private HashSet<string> BuildInactiveKickExemptRoleNameSet()
+    {
+        var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var roleName in _options.InactiveAutoKickExemptRoleNames ?? Array.Empty<string>())
+        {
+            if (!string.IsNullOrWhiteSpace(roleName))
+            {
+                names.Add(roleName.Trim());
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(_options.AdminRoleName))
+        {
+            names.Add(_options.AdminRoleName.Trim());
+        }
+
+        return names;
+    }
+
+    private static bool IsInactiveKickExemptUser(SocketGuildUser user, IReadOnlySet<string> exemptRoleNames)
+    {
+        if (user.GuildPermissions.Administrator)
+        {
+            return true;
+        }
+
+        if (exemptRoleNames.Count == 0)
+        {
+            return false;
+        }
+
+        foreach (var role in user.Roles)
+        {
+            if (exemptRoleNames.Contains(role.Name))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool CanKickMember(SocketGuildUser? botUser, SocketGuildUser targetUser, ulong guildOwnerId)
+    {
+        if (botUser is null)
+        {
+            return false;
+        }
+
+        if (targetUser.Id == guildOwnerId || targetUser.Id == botUser.Id)
+        {
+            return false;
+        }
+
+        if (!botUser.GuildPermissions.KickMembers)
+        {
+            return false;
+        }
+
+        return botUser.Hierarchy > targetUser.Hierarchy;
     }
 
     private async Task MarkUserActiveNowAsync(SocketGuild guild, ulong userId)
@@ -1508,6 +1730,7 @@ public sealed class DiscordBotService : IHostedService
         IRole adminRole,
         IRole memberRole,
         IMessageChannel? registrationChannel,
+        IMessageChannel registrationReviewChannel,
         IMessageChannel logChannel,
         IMessageChannel notificationChannel,
         IMessageChannel controlChannel,
@@ -1528,6 +1751,13 @@ public sealed class DiscordBotService : IHostedService
 
         var denyView = new OverwritePermissions(viewChannel: PermValue.Deny);
         var allowView = new OverwritePermissions(viewChannel: PermValue.Allow, readMessageHistory: PermValue.Allow);
+
+        if (registrationReviewChannel is IGuildChannel reviewGuildChannel && reviewGuildChannel is not IThreadChannel)
+        {
+            var reviewAdmin = new OverwritePermissions(viewChannel: PermValue.Allow, readMessageHistory: PermValue.Allow, sendMessages: PermValue.Allow);
+            await reviewGuildChannel.AddPermissionOverwriteAsync(everyoneRole, denyView);
+            await reviewGuildChannel.AddPermissionOverwriteAsync(adminRole, reviewAdmin);
+        }
 
         if (logChannel is IGuildChannel logGuildChannel && logGuildChannel is not IThreadChannel)
         {
@@ -1572,6 +1802,7 @@ public sealed class DiscordBotService : IHostedService
             }
 
             if ((registrationChannel is not null && channel.Id == registrationChannel.Id)
+                || channel.Id == registrationReviewChannel.Id
                 || channel.Id == logChannel.Id
                 || channel.Id == notificationChannel.Id
                 || channel.Id == controlChannel.Id
@@ -2090,6 +2321,7 @@ public sealed class DiscordBotService : IHostedService
         SocketGuild guild,
         IMessageChannel channel,
         ulong existingMessageId,
+        DateTimeOffset nowJst,
         Embed embed)
     {
         IUserMessage? existing = null;
@@ -2105,31 +2337,18 @@ public sealed class DiscordBotService : IHostedService
             }
         }
 
-        try
-        {
-            if (existing is null)
-            {
-                var recent = await channel.GetMessagesAsync(50).FlattenAsync();
-                existing = recent
-                    .OfType<IUserMessage>()
-                    .FirstOrDefault(message =>
-                        message.Author.Id == _client.CurrentUser.Id &&
-                        string.Equals(message.Content, ActivityRankingPanel.DailyMessageHeader, StringComparison.Ordinal));
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Failed to find daily activity ranking message. GuildId={GuildId}", guild.Id);
-        }
-
         if (existing is not null)
         {
-            await existing.ModifyAsync(props =>
+            var createdAtJst = existing.Timestamp.ToOffset(JapanTimeOffset).Date;
+            if (createdAtJst == nowJst.Date)
             {
-                props.Content = ActivityRankingPanel.DailyMessageHeader;
-                props.Embed = embed;
-            });
-            return existing;
+                await existing.ModifyAsync(props =>
+                {
+                    props.Content = ActivityRankingPanel.DailyMessageHeader;
+                    props.Embed = embed;
+                });
+                return existing;
+            }
         }
 
         return await channel.SendMessageAsync(
@@ -2374,6 +2593,7 @@ public sealed class DiscordBotService : IHostedService
 
     private static string BuildVoiceSummary(SocketGuild guild, SocketUser user, SocketVoiceChannel? beforeChannel, SocketVoiceChannel? afterChannel, TimeSpan? duration)
     {
+        var guildUser = guild.GetUser(user.Id);
         var lines = new List<string>
         {
             $"👤 ユーザー: {FormatVoiceUser(guild, user)}",
@@ -2384,6 +2604,8 @@ public sealed class DiscordBotService : IHostedService
         {
             lines.Add($"🎧 動作: 入室");
             lines.Add($"📢 チャンネル: {ChannelMention(afterChannel)}");
+            lines.Add($"🕒 Discord開始日: {FormatTimestamp(user.CreatedAt)}");
+            lines.Add($"🏠 サーバー参加日: {(guildUser?.JoinedAt.HasValue == true ? FormatTimestamp(guildUser.JoinedAt.Value) : "(不明)")}");
         }
         else if (beforeChannel is not null && afterChannel is null)
         {

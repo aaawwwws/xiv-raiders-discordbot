@@ -3,6 +3,7 @@ using Discord.Interactions;
 using Discord.WebSocket;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using RaidDcBot.Data;
 using RaidDcBot.Models;
 
 namespace RaidDcBot.Bot;
@@ -10,11 +11,13 @@ namespace RaidDcBot.Bot;
 [Group("vcnotify", "VC通知ロール")]
 public sealed class VoiceNotificationRoleModule : InteractionModuleBase<SocketInteractionContext>
 {
+    private readonly Db _db;
     private readonly DiscordOptions _options;
     private readonly ILogger<VoiceNotificationRoleModule> _logger;
 
-    public VoiceNotificationRoleModule(IOptions<DiscordOptions> options, ILogger<VoiceNotificationRoleModule> logger)
+    public VoiceNotificationRoleModule(Db db, IOptions<DiscordOptions> options, ILogger<VoiceNotificationRoleModule> logger)
     {
+        _db = db;
         _options = options.Value;
         _logger = logger;
     }
@@ -81,12 +84,16 @@ public sealed class VoiceNotificationRoleModule : InteractionModuleBase<SocketIn
             if (hasRole)
             {
                 await guildUser.RemoveRoleAsync(role);
-                await RespondAsync($"VC通知ロールを外しました: {role.Name}", ephemeral: true);
+                var selfNotify = await _db.GetVoiceNotificationEnabledAsync(guildUser.Id);
+                var embed = BuildVoiceNotificationStateEmbed(guildUser, role.Name, hasRoleAfter: false, selfNotify);
+                await RespondAsync(embed: embed, ephemeral: true);
                 return;
             }
 
             await guildUser.AddRoleAsync(role);
-            await RespondAsync($"VC通知ロールを付与しました: {role.Name}", ephemeral: true);
+            var enabled = await _db.GetVoiceNotificationEnabledAsync(guildUser.Id);
+            var updatedEmbed = BuildVoiceNotificationStateEmbed(guildUser, role.Name, hasRoleAfter: true, enabled);
+            await RespondAsync(embed: updatedEmbed, ephemeral: true);
         }
         catch (Exception ex)
         {
@@ -136,5 +143,20 @@ public sealed class VoiceNotificationRoleModule : InteractionModuleBase<SocketIn
             VoiceNotificationRolePanel.PanelMessage,
             components: components,
             flags: MessageFlags.SuppressNotification);
+    }
+
+    private static Embed BuildVoiceNotificationStateEmbed(SocketGuildUser user, string roleName, bool hasRoleAfter, bool selfNotifyEnabled)
+    {
+        var roleState = hasRoleAfter ? "ON" : "OFF";
+        var selfState = selfNotifyEnabled ? "ON" : "OFF";
+        return new EmbedBuilder()
+            .WithTitle("通知設定を更新しました")
+            .WithColor(hasRoleAfter ? Color.Green : Color.Orange)
+            .WithCurrentTimestamp()
+            .WithAuthor(user.DisplayName, user.GetAvatarUrl() ?? user.GetDefaultAvatarUrl())
+            .AddField("ユーザー", $"{user.Mention}\nID: `{user.Id}`", false)
+            .AddField("通話通知ロール", $"{roleState} (`{roleName}`)", true)
+            .AddField("自分のVC通知表示", selfState, true)
+            .Build();
     }
 }
