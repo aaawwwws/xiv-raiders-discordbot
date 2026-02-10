@@ -399,6 +399,12 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
 
         var settings = await _db.GetGuildSettingsAsync(Context.Guild.Id);
         var memberRole = ResolveMemberRole(Context.Guild, settings);
+        if (memberRole is null)
+        {
+            await FollowupAsync("メンバーロールを取得できませんでした。管理者に連絡してください。", ephemeral: true);
+            return;
+        }
+
         if (memberRole is not null && guildUser.Roles.Any(role => role.Id == memberRole.Id))
         {
             await FollowupAsync("既にメンバー登録済みです。", ephemeral: true);
@@ -461,8 +467,7 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
             var embed = await BuildMemberRegistrationReviewEmbedAsync(guildUser, completedProfile);
             await reviewChannel.SendMessageAsync(
                 embed: embed,
-                components: BuildMemberRegistrationReviewComponents(guildUser.Id),
-                flags: MessageFlags.SuppressNotification);
+                components: BuildMemberRegistrationReviewComponents(guildUser.Id));
         }
         catch (Exception ex)
         {

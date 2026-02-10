@@ -384,9 +384,13 @@ public sealed class DiscordBotService : IHostedService
 
         try
         {
-            if (_options.MessageLogRetentionDays > 0)
+            var reactionRetentionDays = _options.MessageLogRetentionDays > 0
+                ? Math.Max(_options.MessageLogRetentionDays, Math.Max(0, _options.InactiveAutoKickDays))
+                : 0;
+
+            if (reactionRetentionDays > 0)
             {
-                var deleted = await _db.CleanupReactionLogsAsync(_options.MessageLogRetentionDays);
+                var deleted = await _db.CleanupReactionLogsAsync(reactionRetentionDays);
                 if (deleted > 0)
                 {
                     _logger.LogInformation("Cleaned up {Count} reaction logs.", deleted);
@@ -2104,7 +2108,7 @@ public sealed class DiscordBotService : IHostedService
             : "申請送信時に即時でメンバーロールを付与します。";
         var autoKickText = inactiveAutoKickEnabled ? "ON" : "OFF";
         var autoKickNote = inactiveAutoKickEnabled
-            ? "毎日 00:00 (JST) に30日非アクティブのユーザーを判定して自動キックします。"
+            ? "毎日 00:00 (JST) に30日非アクティブのユーザーを判定して自動キックします。(メッセージ / VC / リアクション)"
             : "30日非アクティブ自動キックは無効です。";
 
         return new EmbedBuilder()

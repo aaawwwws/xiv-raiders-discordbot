@@ -454,6 +454,7 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
             .WithCurrentTimestamp()
             .AddField("設定", $"自動キック: **{stateText}** / 日数: **{kickDays}日**", false)
             .AddField("次回判定(JST)", $"{evaluationBaseJst:yyyy/MM/dd HH:mm}", true)
+            .AddField("活動判定", "メッセージ / VC参加 / リアクション", true)
             .AddField("判定基準", $"{kickCutoffUtc.ToOffset(JapanTimeOffset):yyyy/MM/dd HH:mm} 以降の活動なし", true)
             .AddField("キック対象", $"{kickTargets.Count}人", true)
             .AddField("除外(管理者/除外ロール)", $"{exemptUsers.Count}人", true)
