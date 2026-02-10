@@ -60,6 +60,27 @@ public static class MemberContentRolePanel
 
         return content.StartsWith(PanelTitle, StringComparison.Ordinal);
     }
+
+    public static bool LooksLikePanelComponents(IReadOnlyCollection<IMessageComponent> components)
+    {
+        foreach (var root in components)
+        {
+            if (root is ActionRowComponent row)
+            {
+                foreach (var component in row.Components)
+                {
+                    if (component is ButtonComponent button &&
+                        button.CustomId is not null &&
+                        button.CustomId.StartsWith($"{Prefix}:", StringComparison.Ordinal))
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        return false;
+    }
 }
 
 public sealed record ContentRoleDefinition(string Key, string Label, string RoleName, ButtonStyle Style, int Row);

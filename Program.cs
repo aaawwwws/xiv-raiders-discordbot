@@ -22,16 +22,13 @@ builder.Services.Configure<DiscordOptions>(builder.Configuration.GetSection("Dis
 builder.Services.Configure<DatabaseOptions>(builder.Configuration.GetSection("Database"));
 builder.Services.Configure<LodestoneOptions>(builder.Configuration.GetSection("Lodestone"));
 
-builder.Services.AddSingleton(sp =>
-{
+builder.Services.AddSingleton(sp => {
     var lodestone = sp.GetRequiredService<IConfiguration>().GetSection("Lodestone").Get<LodestoneOptions>() ?? new LodestoneOptions();
-    var handler = new SocketsHttpHandler
-    {
+    var handler = new SocketsHttpHandler {
         AutomaticDecompression = DecompressionMethods.All
     };
 
-    var client = new HttpClient(handler)
-    {
+    var client = new HttpClient(handler) {
         Timeout = TimeSpan.FromSeconds(lodestone.TimeoutSeconds > 0 ? lodestone.TimeoutSeconds : 15)
     };
 
@@ -65,8 +62,7 @@ builder.Services.AddSingleton<MemberRegistrationDraftContextTracker>();
 
 var discordOptions = builder.Configuration.GetSection("Discord").Get<DiscordOptions>() ?? new DiscordOptions();
 
-builder.Services.AddSingleton(new DiscordSocketClient(new DiscordSocketConfig
-{
+builder.Services.AddSingleton(new DiscordSocketClient(new DiscordSocketConfig {
     GatewayIntents = GatewayIntents.Guilds
         | GatewayIntents.GuildMembers
         | GatewayIntents.GuildMessages
@@ -79,8 +75,7 @@ builder.Services.AddSingleton(new DiscordSocketClient(new DiscordSocketConfig
 
 builder.Services.AddSingleton(sp => new InteractionService(
     sp.GetRequiredService<DiscordSocketClient>(),
-    new InteractionServiceConfig
-    {
+    new InteractionServiceConfig {
         LogLevel = LogSeverity.Info,
         UseCompiledLambda = true
     }));

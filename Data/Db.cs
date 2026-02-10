@@ -782,19 +782,18 @@ SELECT user_id AS UserId,
        SUM(
            GREATEST(
                0,
-               EXTRACT(EPOCH FROM (LEAST(left_at, @ToUtcExclusive) - GREATEST(joined_at, @FromUtcInclusive)))
+               EXTRACT(EPOCH FROM (LEAST(COALESCE(left_at, @ToUtcExclusive), @ToUtcExclusive) - GREATEST(joined_at, @FromUtcInclusive)))
            )
        )::BIGINT AS DurationSeconds
 FROM voice_sessions
 WHERE guild_id = @GuildId
-  AND left_at IS NOT NULL
-  AND left_at > @FromUtcInclusive
+  AND COALESCE(left_at, @ToUtcExclusive) > @FromUtcInclusive
   AND joined_at < @ToUtcExclusive
 GROUP BY user_id
 HAVING SUM(
            GREATEST(
                0,
-               EXTRACT(EPOCH FROM (LEAST(left_at, @ToUtcExclusive) - GREATEST(joined_at, @FromUtcInclusive)))
+               EXTRACT(EPOCH FROM (LEAST(COALESCE(left_at, @ToUtcExclusive), @ToUtcExclusive) - GREATEST(joined_at, @FromUtcInclusive)))
            )
        ) > 0
 ORDER BY DurationSeconds DESC, user_id ASC
@@ -912,6 +911,97 @@ LIMIT @MaxRows;";
             MaxRows = Math.Clamp(maxRows, 1, 500000)
         });
 
+        return rows.ToList();
+    }
+
+    public async Task<IReadOnlyList<MessageLog>> ListRecentMessageLogsAsync(
+        ulong guildId,
+        DateTimeOffset fromUtcInclusive,
+        DateTimeOffset toUtcExclusive,
+        ulong? userId = null,
+        int maxRows = 100,
+        bool includeDeleted = false)
+    {
+        const string sql = @"
+SELECT message_id AS MessageId,
+       guild_id AS GuildId,
+       channel_id AS ChannelId,
+       author_id AS AuthorId,
+       author_name AS AuthorName,
+       author_display_name AS AuthorDisplayName,
+       content AS Content,
+       attachment_count AS AttachmentCount,
+       embed_count AS EmbedCount,
+       attachments_json::text AS AttachmentsJson,
+       embeds_json::text AS EmbedsJson,
+       created_at AS CreatedAt,
+       edited_at AS EditedAt,
+       deleted_at AS DeletedAt
+FROM message_logs
+WHERE guild_id = @GuildId
+  AND created_at >= @FromUtcInclusive
+  AND created_at < @ToUtcExclusive
+  AND (@UserId IS NULL OR author_id = @UserId)
+  AND (@IncludeDeleted OR deleted_at IS NULL)
+ORDER BY created_at DESC, message_id DESC
+LIMIT @MaxRows;";
+
+        await using var conn = CreateConnection();
+        long? userDbId = userId.HasValue ? ToDbId(userId.Value) : null;
+        var rows = await conn.QueryAsync<MessageLog>(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            FromUtcInclusive = fromUtcInclusive,
+            ToUtcExclusive = toUtcExclusive,
+            UserId = userDbId,
+            IncludeDeleted = includeDeleted,
+            MaxRows = Math.Clamp(maxRows, 1, 200)
+        });
+        return rows.ToList();
+    }
+
+    public async Task<IReadOnlyList<VoiceSession>> ListRecentVoiceSessionsAsync(
+        ulong guildId,
+        DateTimeOffset fromUtcInclusive,
+        DateTimeOffset toUtcExclusive,
+        ulong? userId = null,
+        int maxRows = 100)
+    {
+        const string sql = @"
+SELECT id AS Id,
+       guild_id AS GuildId,
+       channel_id AS ChannelId,
+       user_id AS UserId,
+       user_name AS UserName,
+       joined_at AS JoinedAt,
+       left_at AS LeftAt,
+       GREATEST(
+           0,
+           EXTRACT(
+               EPOCH FROM (
+                   LEAST(COALESCE(left_at, @ToUtcExclusive), @ToUtcExclusive)
+                   - GREATEST(joined_at, @FromUtcInclusive)
+               )
+           )::INT
+       ) AS DurationSeconds
+FROM voice_sessions
+WHERE guild_id = @GuildId
+  AND (@UserId IS NULL OR user_id = @UserId)
+  AND COALESCE(left_at, @ToUtcExclusive) > @FromUtcInclusive
+  AND joined_at < @ToUtcExclusive
+ORDER BY joined_at DESC, id DESC
+LIMIT @MaxRows;";
+
+        await using var conn = CreateConnection();
+        long? userDbId = userId.HasValue ? ToDbId(userId.Value) : null;
+        var rows = await conn.QueryAsync<VoiceSession>(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            FromUtcInclusive = fromUtcInclusive,
+            ToUtcExclusive = toUtcExclusive,
+            UserId = userDbId,
+            MaxRows = Math.Clamp(maxRows, 1, 200)
+        });
         return rows.ToList();
     }
 

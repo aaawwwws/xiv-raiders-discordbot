@@ -328,7 +328,8 @@ public sealed class ContentRoleModule : InteractionModuleBase<SocketInteractionC
             .OfType<IUserMessage>()
             .FirstOrDefault(message =>
                 message.Author.Id == Context.Client.CurrentUser.Id &&
-                MemberContentRolePanel.LooksLikePanelMessage(message.Content));
+                (MemberContentRolePanel.LooksLikePanelMessage(message.Content) ||
+                 MemberContentRolePanel.LooksLikePanelComponents(message.Components)));
 
         if (Context.Guild is null)
         {
@@ -341,13 +342,13 @@ public sealed class ContentRoleModule : InteractionModuleBase<SocketInteractionC
         {
             await existing.ModifyAsync(props =>
             {
-                props.Content = MemberContentRolePanel.PanelMessage;
+                props.Content = null;
                 props.Components = components;
             });
             return existing;
         }
 
-        return await channel.SendMessageAsync(MemberContentRolePanel.PanelMessage, components: components, flags: MessageFlags.SuppressNotification);
+        return await channel.SendMessageAsync(components: components, flags: MessageFlags.SuppressNotification);
     }
 
     private async Task<IReadOnlyList<ContentRoleDefinition>> LoadContentRoleDefinitionsAsync(ulong guildId)

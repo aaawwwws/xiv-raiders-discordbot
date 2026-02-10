@@ -36,9 +36,11 @@ public sealed class DiscordBotService : IHostedService
     private readonly ConcurrentDictionary<ulong, int> _dailyActivityRankingPosted = new();
     private readonly ConcurrentDictionary<ulong, int> _weeklyVoiceRankingPosted = new();
     private readonly ConcurrentDictionary<ulong, int> _inactiveAutoKickProcessedDay = new();
+    private readonly ConcurrentDictionary<string, DateTimeOffset> _failureAlerts = new();
     private readonly SemaphoreSlim _tempVoiceLock = new(1, 1);
     private static readonly HttpClient AttachmentArchiveHttpClient = CreateAttachmentArchiveHttpClient();
     private static readonly TimeSpan JapanTimeOffset = TimeSpan.FromHours(9);
+    private static readonly TimeSpan FailureAlertCooldown = TimeSpan.FromMinutes(15);
     private const string RecruitScheduleFormat = "yyyy/MM/dd HH:mm";
     private CancellationTokenSource? _cleanupCts;
     private Task? _cleanupTask;
@@ -837,7 +839,11 @@ public sealed class DiscordBotService : IHostedService
             }
 
             var components = ControlPanel.BuildComponents();
-            await message.ModifyAsync(props => props.Components = components);
+            await message.ModifyAsync(props =>
+            {
+                props.Content = null;
+                props.Components = components;
+            });
         }
         catch (Exception ex)
         {
@@ -874,9 +880,7 @@ public sealed class DiscordBotService : IHostedService
             var components = RecruitmentPanel.BuildPanelComponents(_options.RecruitFeatureEnabled);
             await message.ModifyAsync(props =>
             {
-                props.Content = _options.RecruitFeatureEnabled
-                    ? RecruitmentPanel.PanelMessage
-                    : RecruitmentPanel.DisabledPanelMessage;
+                props.Content = null;
                 props.Components = components;
             });
         }
@@ -971,6 +975,12 @@ public sealed class DiscordBotService : IHostedService
             catch (Exception ex)
             {
                 _logger.LogWarning(ex, "Failed to post daily activity ranking. GuildId={GuildId}", guild.Id);
+                await NotifyFailureAsync(
+                    guild,
+                    "daily-ranking-update",
+                    "障害通知: 今日ランキング更新失敗",
+                    $"チャンネル: <#{channel.Id}>",
+                    ex);
             }
         }
     }
@@ -1039,6 +1049,12 @@ public sealed class DiscordBotService : IHostedService
             catch (Exception ex)
             {
                 _logger.LogWarning(ex, "Failed to post weekly voice ranking. GuildId={GuildId}", guild.Id);
+                await NotifyFailureAsync(
+                    guild,
+                    "weekly-ranking-update",
+                    "障害通知: 週間ランキング更新失敗",
+                    $"チャンネル: <#{channel.Id}>",
+                    ex);
             }
         }
     }
@@ -1665,7 +1681,7 @@ public sealed class DiscordBotService : IHostedService
             .ToString(RecruitScheduleFormat, System.Globalization.CultureInfo.InvariantCulture);
     }
 
-    private async Task EnsurePanelMessageAsync(ulong guildId, IMessageChannel channel, ulong? existingMessageId)
+    private async Task<IUserMessage> EnsurePanelMessageAsync(ulong guildId, IMessageChannel channel, ulong? existingMessageId)
     {
         IUserMessage? existing = null;
         if (existingMessageId.HasValue)
@@ -1689,15 +1705,16 @@ public sealed class DiscordBotService : IHostedService
                 props.Components = components;
             });
             _logger.LogInformation("Panel message updated in channel {ChannelId}.", channel.Id);
-            return;
+            return existing;
         }
 
         var posted = await channel.SendMessageAsync(MemberRegistrationPanel.PanelMessage, components: components, flags: MessageFlags.SuppressNotification);
         await _db.UpsertGuildPanelAsync(guildId, channel.Id, posted.Id);
         _logger.LogInformation("Panel message posted in channel {ChannelId}.", channel.Id);
+        return posted;
     }
 
-    private async Task EnsureControlPanelMessageAsync(ulong guildId, IMessageChannel channel)
+    private async Task<IUserMessage> EnsureControlPanelMessageAsync(ulong guildId, IMessageChannel channel)
     {
         var panel = await _db.GetGuildControlPanelAsync(guildId);
         ulong? existingMessageId = panel is null || panel.MessageId == 0 ? null : ToUlong(panel.MessageId);
@@ -1717,12 +1734,388 @@ public sealed class DiscordBotService : IHostedService
         var components = ControlPanel.BuildComponents();
         if (existing is not null)
         {
-            await existing.ModifyAsync(props => props.Components = components);
+            await existing.ModifyAsync(props =>
+            {
+                props.Content = null;
+                props.Components = components;
+            });
+            return existing;
+        }
+
+        var posted = await channel.SendMessageAsync(components: components, flags: MessageFlags.SuppressNotification);
+        await _db.UpsertGuildControlPanelAsync(guildId, channel.Id, posted.Id);
+        return posted;
+    }
+
+    private async Task TrySelfHealDeletedPanelsAsync(
+        SocketGuild guild,
+        SocketGuildChannel deletedChannel,
+        ulong deletedMessageId,
+        IMessage? deletedMessage)
+    {
+        await TrySelfHealTrackedPanelAsync(
+            guild,
+            deletedChannel,
+            deletedMessageId,
+            await _db.GetGuildPanelAsync(guild.Id),
+            "メンバー登録パネル",
+            async channel =>
+            {
+                var restored = await EnsurePanelMessageAsync(guild.Id, channel, null);
+                await _db.UpsertGuildPanelAsync(guild.Id, channel.Id, restored.Id);
+                return restored;
+            });
+
+        await TrySelfHealTrackedPanelAsync(
+            guild,
+            deletedChannel,
+            deletedMessageId,
+            await _db.GetGuildLodestonePanelAsync(guild.Id),
+            "Lodestone連携パネル",
+            async channel =>
+            {
+                var restored = await EnsureLodestonePanelMessageAsync(guild.Id, channel, null);
+                await _db.UpsertGuildLodestonePanelAsync(guild.Id, channel.Id, restored.Id);
+                return restored;
+            });
+
+        await TrySelfHealTrackedPanelAsync(
+            guild,
+            deletedChannel,
+            deletedMessageId,
+            await _db.GetGuildControlPanelAsync(guild.Id),
+            "管理パネル",
+            async channel =>
+            {
+                var restored = await EnsureControlPanelMessageAsync(guild.Id, channel);
+                await _db.UpsertGuildControlPanelAsync(guild.Id, channel.Id, restored.Id);
+                return restored;
+            });
+
+        await TrySelfHealTrackedPanelAsync(
+            guild,
+            deletedChannel,
+            deletedMessageId,
+            await _db.GetGuildAdminControlPanelAsync(guild.Id),
+            "ADMINコントロールパネル",
+            async channel =>
+            {
+                var restored = await EnsureAdminControlPanelMessageAsync(guild.Id, channel, null);
+                await _db.UpsertGuildAdminControlPanelAsync(guild.Id, channel.Id, restored.Id);
+                return restored;
+            });
+
+        await TrySelfHealTrackedPanelAsync(
+            guild,
+            deletedChannel,
+            deletedMessageId,
+            await _db.GetGuildRecruitPanelAsync(guild.Id),
+            "募集パネル",
+            async channel =>
+            {
+                var restored = await EnsureRecruitPanelMessageAsync(guild.Id, channel, null);
+                await _db.UpsertGuildRecruitPanelAsync(guild.Id, channel.Id, restored.Id);
+                return restored;
+            });
+
+        await TrySelfHealTrackedPanelAsync(
+            guild,
+            deletedChannel,
+            deletedMessageId,
+            await _db.GetGuildRecruitListPanelAsync(guild.Id),
+            "募集一覧",
+            async channel =>
+            {
+                var restored = await _recruitListService.EnsureListMessageAsync(guild, channel, null);
+                if (restored is null)
+                {
+                    throw new InvalidOperationException("Failed to recreate recruit list panel message.");
+                }
+
+                await _db.UpsertGuildRecruitListPanelAsync(guild.Id, channel.Id, restored.Id);
+                return restored;
+            });
+
+        await TrySelfHealContentRolePanelFromCacheAsync(guild, deletedChannel, deletedMessage);
+    }
+
+    private async Task TrySelfHealTrackedPanelAsync(
+        SocketGuild guild,
+        SocketGuildChannel deletedChannel,
+        ulong deletedMessageId,
+        GuildPanel? panel,
+        string panelName,
+        Func<SocketTextChannel, Task<IUserMessage>> recreateAsync)
+    {
+        if (panel is null || panel.MessageId == 0 || ToUlong(panel.MessageId) != deletedMessageId)
+        {
             return;
         }
 
-        var posted = await channel.SendMessageAsync(ControlPanel.PanelMessage, components: components, flags: MessageFlags.SuppressNotification);
-        await _db.UpsertGuildControlPanelAsync(guildId, channel.Id, posted.Id);
+        var channel = ResolveSelfHealChannel(guild, panel, deletedChannel);
+        if (channel is null)
+        {
+            await NotifyFailureAsync(
+                guild,
+                $"self-heal-{panelName}",
+                "障害通知: パネル自己修復失敗",
+                $"{panelName}: チャンネル未解決 (message: {deletedMessageId})");
+            return;
+        }
+
+        try
+        {
+            var restored = await recreateAsync(channel);
+            await _audit.SendSystemAsync(
+                guild,
+                "パネル自己修復",
+                $"{panelName} を再作成しました。\nチャンネル: <#{channel.Id}>\n旧message: {deletedMessageId}\n新message: {restored.Id}",
+                Color.Orange);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "Failed to self-heal panel {PanelName}. GuildId={GuildId}, DeletedMessageId={MessageId}",
+                panelName,
+                guild.Id,
+                deletedMessageId);
+            await NotifyFailureAsync(
+                guild,
+                $"self-heal-{panelName}",
+                "障害通知: パネル自己修復失敗",
+                $"{panelName} (message: {deletedMessageId})",
+                ex);
+        }
+    }
+
+    private static SocketTextChannel? ResolveSelfHealChannel(SocketGuild guild, GuildPanel? panel, SocketGuildChannel deletedChannel)
+    {
+        if (panel is not null && panel.ChannelId != 0)
+        {
+            var byId = guild.GetTextChannel(ToUlong(panel.ChannelId));
+            if (byId is not null)
+            {
+                return byId;
+            }
+        }
+
+        return deletedChannel as SocketTextChannel;
+    }
+
+    private async Task TrySelfHealContentRolePanelFromCacheAsync(
+        SocketGuild guild,
+        SocketGuildChannel deletedChannel,
+        IMessage? deletedMessage)
+    {
+        if (deletedChannel is not SocketTextChannel textChannel ||
+            deletedMessage is not IUserMessage deletedUserMessage ||
+            deletedUserMessage.Author.Id != _client.CurrentUser.Id ||
+            !MemberContentRolePanel.LooksLikePanelComponents(deletedUserMessage.Components))
+        {
+            return;
+        }
+
+        try
+        {
+            var recent = await textChannel.GetMessagesAsync(30).FlattenAsync();
+            var existingPanel = recent
+                .OfType<IUserMessage>()
+                .Any(message =>
+                    message.Author.Id == _client.CurrentUser.Id &&
+                    MemberContentRolePanel.LooksLikePanelComponents(message.Components));
+
+            if (existingPanel)
+            {
+                return;
+            }
+
+            var definitions = await LoadMemberContentRoleDefinitionsAsync(guild.Id);
+            var components = MemberContentRolePanel.BuildComponents(definitions);
+            var restored = await textChannel.SendMessageAsync(components: components, flags: MessageFlags.SuppressNotification);
+            await _audit.SendSystemAsync(
+                guild,
+                "パネル自己修復",
+                $"コンテンツロールパネルを再作成しました。\nチャンネル: <#{textChannel.Id}>\n新message: {restored.Id}",
+                Color.Orange);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to self-heal content role panel. GuildId={GuildId}", guild.Id);
+            await NotifyFailureAsync(
+                guild,
+                "self-heal-content-role-panel",
+                "障害通知: パネル自己修復失敗",
+                "コンテンツロールパネル",
+                ex);
+        }
+    }
+
+    private async Task<IUserMessage> EnsureLodestonePanelMessageAsync(ulong guildId, IMessageChannel channel, ulong? existingMessageId)
+    {
+        IUserMessage? existing = null;
+        if (existingMessageId.HasValue)
+        {
+            try
+            {
+                existing = await channel.GetMessageAsync(existingMessageId.Value) as IUserMessage;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to fetch existing lodestone panel message.");
+            }
+        }
+
+        var components = LodestonePanel.BuildComponents();
+        if (existing is not null)
+        {
+            await existing.ModifyAsync(props =>
+            {
+                props.Content = LodestonePanel.PanelMessage;
+                props.Components = components;
+            });
+            return existing;
+        }
+
+        var posted = await channel.SendMessageAsync(LodestonePanel.PanelMessage, components: components, flags: MessageFlags.SuppressNotification);
+        await _db.UpsertGuildLodestonePanelAsync(guildId, channel.Id, posted.Id);
+        return posted;
+    }
+
+    private async Task<IUserMessage> EnsureAdminControlPanelMessageAsync(ulong guildId, IMessageChannel channel, ulong? existingMessageId)
+    {
+        IUserMessage? existing = null;
+        if (existingMessageId.HasValue)
+        {
+            try
+            {
+                existing = await channel.GetMessageAsync(existingMessageId.Value) as IUserMessage;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to fetch existing admin control panel message.");
+            }
+        }
+
+        var settings = await _db.GetGuildSettingsAsync(guildId);
+        var approvalRequired = settings?.RegistrationApprovalRequired ?? true;
+        var inactiveAutoKickEnabled = settings?.InactiveAutoKickEnabled ?? _options.InactiveAutoKickEnabled;
+        var embed = BuildAdminPanelStatusEmbed(approvalRequired, inactiveAutoKickEnabled);
+        var components = AdminControlPanel.BuildComponents(approvalRequired, inactiveAutoKickEnabled);
+
+        if (existing is not null)
+        {
+            await existing.ModifyAsync(props =>
+            {
+                props.Content = null;
+                props.Embed = embed;
+                props.Components = components;
+            });
+            return existing;
+        }
+
+        var posted = await channel.SendMessageAsync(embed: embed, components: components, flags: MessageFlags.SuppressNotification);
+        await _db.UpsertGuildAdminControlPanelAsync(guildId, channel.Id, posted.Id);
+        return posted;
+    }
+
+    private async Task<IUserMessage> EnsureRecruitPanelMessageAsync(ulong guildId, IMessageChannel channel, ulong? existingMessageId)
+    {
+        IUserMessage? existing = null;
+        if (existingMessageId.HasValue)
+        {
+            try
+            {
+                existing = await channel.GetMessageAsync(existingMessageId.Value) as IUserMessage;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to fetch existing recruit panel message.");
+            }
+        }
+
+        var components = RecruitmentPanel.BuildPanelComponents(_options.RecruitFeatureEnabled);
+        if (existing is not null)
+        {
+            await existing.ModifyAsync(props =>
+            {
+                props.Content = null;
+                props.Components = components;
+            });
+            return existing;
+        }
+
+        var posted = await channel.SendMessageAsync(components: components, flags: MessageFlags.SuppressNotification);
+        await _db.UpsertGuildRecruitPanelAsync(guildId, channel.Id, posted.Id);
+        return posted;
+    }
+
+    private async Task<IReadOnlyList<ContentRoleDefinition>> LoadMemberContentRoleDefinitionsAsync(ulong guildId)
+    {
+        var defaults = MemberContentRolePanel.DefaultDefinitions.ToList();
+        var indexByKey = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        for (var i = 0; i < defaults.Count; i++)
+        {
+            indexByKey[defaults[i].Key] = i;
+        }
+
+        var custom = await _db.ListMemberContentRoleSettingsAsync(guildId);
+        foreach (var row in custom)
+        {
+            var definition = new ContentRoleDefinition(
+                row.RoleKey,
+                row.Label,
+                row.RoleName,
+                NormalizeContentRoleButtonStyle(row.ButtonStyle),
+                Math.Clamp(row.ButtonRow, 0, 4));
+
+            if (indexByKey.TryGetValue(definition.Key, out var existingIndex))
+            {
+                defaults[existingIndex] = definition;
+                continue;
+            }
+
+            indexByKey[definition.Key] = defaults.Count;
+            defaults.Add(definition);
+        }
+
+        return defaults
+            .OrderBy(x => x.Row)
+            .ThenBy(x => x.Key, StringComparer.OrdinalIgnoreCase)
+            .Take(25)
+            .ToList();
+    }
+
+    private static ButtonStyle NormalizeContentRoleButtonStyle(int style)
+        => style switch
+        {
+            1 => ButtonStyle.Primary,
+            2 => ButtonStyle.Secondary,
+            3 => ButtonStyle.Success,
+            4 => ButtonStyle.Danger,
+            _ => ButtonStyle.Secondary
+        };
+
+    private static Embed BuildAdminPanelStatusEmbed(bool approvalRequired, bool inactiveAutoKickEnabled)
+    {
+        var stateText = approvalRequired ? "必要" : "不要";
+        var note = approvalRequired
+            ? "申請は登録確認チャンネルで管理者が許可/拒否します。"
+            : "申請送信時に即時でメンバーロールを付与します。";
+        var autoKickText = inactiveAutoKickEnabled ? "ON" : "OFF";
+        var autoKickNote = inactiveAutoKickEnabled
+            ? "毎日 00:00 (JST) に30日非アクティブのユーザーを判定して自動キックします。"
+            : "30日非アクティブ自動キックは無効です。";
+
+        return new EmbedBuilder()
+            .WithTitle("ADMIN設定")
+            .WithColor(inactiveAutoKickEnabled ? Color.Orange : Color.Green)
+            .WithCurrentTimestamp()
+            .AddField("登録確認フロー", stateText, true)
+            .AddField("動作", note, false)
+            .AddField("30日非アクティブ自動キック", autoKickText, true)
+            .AddField("キック動作", autoKickNote, false)
+            .Build();
     }
 
     private async Task EnsureVisibilityAsync(
@@ -1968,6 +2361,22 @@ public sealed class DiscordBotService : IHostedService
     {
         if (channelCache.HasValue && channelCache.Value is SocketGuildChannel guildChannel)
         {
+            var deletedMessage = cache.HasValue ? cache.Value : null;
+            try
+            {
+                await TrySelfHealDeletedPanelsAsync(guildChannel.Guild, guildChannel, cache.Id, deletedMessage);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to self-heal deleted panels. GuildId={GuildId}, MessageId={MessageId}", guildChannel.Guild.Id, cache.Id);
+                await NotifyFailureAsync(
+                    guildChannel.Guild,
+                    "panel-self-heal",
+                    "障害通知: パネル自己修復失敗",
+                    $"message: {cache.Id}",
+                    ex);
+            }
+
             var recruitPost = await _db.GetRecruitPostByMessageIdAsync(cache.Id);
             if (recruitPost is not null)
             {
@@ -1981,7 +2390,7 @@ public sealed class DiscordBotService : IHostedService
                 }
             }
 
-            var message = cache.HasValue ? cache.Value : null;
+            var message = deletedMessage;
             var fromDb = await _db.GetMessageAsync(cache.Id);
 
             if (fromDb is null && message?.Author?.IsBot == true)
@@ -2274,6 +2683,42 @@ public sealed class DiscordBotService : IHostedService
         await channel.SendMessageAsync(text: MentionRole(role.Id), embed: embed);
     }
 
+    private async Task NotifyFailureAsync(
+        SocketGuild guild,
+        string key,
+        string title,
+        string detail,
+        Exception? exception = null)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var throttleKey = $"{guild.Id}:{key}";
+        if (_failureAlerts.TryGetValue(throttleKey, out var last) &&
+            now - last < FailureAlertCooldown)
+        {
+            return;
+        }
+
+        _failureAlerts[throttleKey] = now;
+
+        var description = detail;
+        if (exception is not null)
+        {
+            var exceptionText = $"{exception.GetType().Name}: {exception.Message}";
+            description = string.IsNullOrWhiteSpace(detail)
+                ? Truncate(exceptionText, 900)
+                : $"{detail}\n{Truncate(exceptionText, 900)}";
+        }
+
+        try
+        {
+            await _audit.SendSystemAsync(guild, title, description, Color.Red);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to send failure alert. GuildId={GuildId}, Key={Key}", guild.Id, key);
+        }
+    }
+
     private async Task<bool> ShouldNotifyUserVoiceActivityAsync(ulong userId)
     {
         try
@@ -2344,7 +2789,7 @@ public sealed class DiscordBotService : IHostedService
             {
                 await existing.ModifyAsync(props =>
                 {
-                    props.Content = ActivityRankingPanel.DailyMessageHeader;
+                    props.Content = null;
                     props.Embed = embed;
                 });
                 return existing;
@@ -2352,7 +2797,6 @@ public sealed class DiscordBotService : IHostedService
         }
 
         return await channel.SendMessageAsync(
-            text: ActivityRankingPanel.DailyMessageHeader,
             embed: embed,
             flags: MessageFlags.SuppressNotification);
     }

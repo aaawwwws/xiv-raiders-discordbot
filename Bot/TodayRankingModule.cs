@@ -1,6 +1,7 @@
 using Discord;
 using Discord.Interactions;
 using Microsoft.Extensions.Options;
+using System.Globalization;
 using RaidDcBot.Data;
 using RaidDcBot.Models;
 using RaidDcBot.Services;
@@ -117,7 +118,7 @@ public sealed class TodayRankingModule : InteractionModuleBase<SocketInteraction
                     .OfType<IUserMessage>()
                     .FirstOrDefault(message =>
                         message.Author.Id == Context.Client.CurrentUser.Id &&
-                        string.Equals(message.Content, ActivityRankingPanel.DailyMessageHeader, StringComparison.Ordinal));
+                        LooksLikeDailyRankingMessage(message));
             }
             catch
             {
@@ -128,20 +129,42 @@ public sealed class TodayRankingModule : InteractionModuleBase<SocketInteraction
         {
             await existing.ModifyAsync(props =>
             {
-                props.Content = ActivityRankingPanel.DailyMessageHeader;
+                props.Content = null;
                 props.Embed = embed;
             });
             return existing;
         }
 
         return await channel.SendMessageAsync(
-            text: ActivityRankingPanel.DailyMessageHeader,
             embed: embed,
             flags: MessageFlags.SuppressNotification);
     }
 
     private static ulong ToUlong(long value) => unchecked((ulong)value);
     private static long ToDbId(ulong value) => unchecked((long)value);
+
+    private static bool LooksLikeDailyRankingMessage(IUserMessage message)
+    {
+        var title = message.Embeds.FirstOrDefault()?.Title;
+        if (string.IsNullOrWhiteSpace(title))
+        {
+            return false;
+        }
+
+        if (DateTime.TryParseExact(title, "yyyy/MM/dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out _))
+        {
+            return true;
+        }
+
+        const string suffix = "のランキング";
+        if (!title.EndsWith(suffix, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        var datePart = title[..^suffix.Length];
+        return DateTime.TryParseExact(datePart, "yyyy/MM/dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out _);
+    }
 
     private static string ToJstDayName(int dayOfWeek)
     {

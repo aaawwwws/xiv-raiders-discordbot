@@ -152,7 +152,7 @@ public sealed class SettingsPanelModule : InteractionModuleBase<SocketInteractio
                 Context.Guild,
                 await _db.GetGuildControlPanelAsync(Context.Guild.Id),
                 fallbackChannel,
-                ControlPanel.PanelMessage,
+                null,
                 ControlPanel.BuildComponents()))
         {
             updated++;
@@ -166,7 +166,7 @@ public sealed class SettingsPanelModule : InteractionModuleBase<SocketInteractio
                 Context.Guild,
                 await _db.GetGuildAdminControlPanelAsync(Context.Guild.Id),
                 fallbackChannel,
-                AdminControlPanel.PanelMessage,
+                null,
                 AdminControlPanel.BuildComponents(registrationApprovalRequired, inactiveAutoKickEnabled),
                 BuildAdminPanelStatusEmbed(registrationApprovalRequired, inactiveAutoKickEnabled)))
         {
@@ -178,7 +178,7 @@ public sealed class SettingsPanelModule : InteractionModuleBase<SocketInteractio
                 Context.Guild,
                 await _db.GetGuildRecruitPanelAsync(Context.Guild.Id),
                 fallbackChannel,
-                RecruitmentPanel.PanelMessage,
+                null,
                 RecruitmentPanel.BuildPanelComponents()))
         {
             updated++;
@@ -309,7 +309,7 @@ public sealed class SettingsPanelModule : InteractionModuleBase<SocketInteractio
         SocketGuild guild,
         GuildPanel? panel,
         IMessageChannel fallbackChannel,
-        string messageText,
+        string? messageText,
         MessageComponent components,
         Embed? embed = null)
     {

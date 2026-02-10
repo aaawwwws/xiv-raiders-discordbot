@@ -6,6 +6,8 @@ public static class AdminControlPanel
 {
     public const string PanelMessage = "ADMINコントロールパネル";
     public const string ExportMessageCsvCustomId = "admin_export_message_csv_7d";
+    public const string PreviewInactiveKickCustomId = "admin_preview_inactive_kick";
+    public const string HealthCheckCustomId = "admin_health_check";
     public const string ToggleRegistrationApprovalCustomId = "admin_toggle_registration_approval";
     public const string ToggleInactiveAutoKickCustomId = "admin_toggle_inactive_auto_kick";
 
@@ -18,6 +20,8 @@ public static class AdminControlPanel
 
         return new ComponentBuilder()
             .WithButton("メッセージCSV(全期間)", ExportMessageCsvCustomId, ButtonStyle.Secondary, row: 0)
+            .WithButton("自動キック候補", PreviewInactiveKickCustomId, ButtonStyle.Primary, row: 0)
+            .WithButton("ヘルスチェック", HealthCheckCustomId, ButtonStyle.Secondary, row: 0)
             .WithButton(statusLabel, ToggleRegistrationApprovalCustomId, statusStyle, row: 1)
             .WithButton(autoKickLabel, ToggleInactiveAutoKickCustomId, autoKickStyle, row: 1)
             .Build();

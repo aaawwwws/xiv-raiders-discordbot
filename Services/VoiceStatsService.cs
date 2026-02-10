@@ -1,5 +1,6 @@
 using Discord;
 using Discord.WebSocket;
+using System.Globalization;
 using RaidDcBot.Data;
 using RaidDcBot.Models;
 
@@ -65,11 +66,11 @@ public sealed class VoiceStatsService {
         var fromJst = fromUtc.ToOffset(TimeSpan.FromHours(9));
         var toJst = toUtc.ToOffset(TimeSpan.FromHours(9));
         var period = $"{fromJst:MM/dd HH:mm} - {toJst:MM/dd HH:mm} (JST)";
-        var themedTitle = BuildThemedTitle(title);
+        var embedTitle = ResolveRankingTitle(title, fromJst, toJst);
         var color = ResolveRankingColor(title);
 
         var builder = new EmbedBuilder()
-            .WithTitle(themedTitle)
+            .WithTitle(embedTitle)
             .WithColor(color)
             .WithCurrentTimestamp()
             .WithDescription(
@@ -132,6 +133,21 @@ public sealed class VoiceStatsService {
         }
 
         return $"✨ {rawTitle}";
+    }
+
+    private static string ResolveRankingTitle(string rawTitle, DateTimeOffset fromJst, DateTimeOffset toJst)
+    {
+        if (rawTitle.Contains("今日", StringComparison.Ordinal))
+        {
+            return $"{toJst.ToString("yyyy/MM/dd", CultureInfo.InvariantCulture)}のランキング";
+        }
+
+        if (rawTitle.Contains("週", StringComparison.Ordinal))
+        {
+            return $"{fromJst.ToString("yyyy/MM/dd", CultureInfo.InvariantCulture)}-{toJst.ToString("yyyy/MM/dd", CultureInfo.InvariantCulture)}のランキング";
+        }
+
+        return BuildThemedTitle(rawTitle);
     }
 
     private static Color ResolveRankingColor(string title)

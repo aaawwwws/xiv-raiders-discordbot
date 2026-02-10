@@ -55,4 +55,25 @@ public static class RecruitmentPanel {
 
         return builder.Build();
     }
+
+    public static bool LooksLikePanelComponents(IReadOnlyCollection<IMessageComponent> components)
+    {
+        foreach (var root in components)
+        {
+            if (root is ActionRowComponent row)
+            {
+                foreach (var component in row.Components)
+                {
+                    if (component is ButtonComponent button &&
+                        button.CustomId is not null &&
+                        button.CustomId is "recruit_create" or "recruit_manage_close" or "recruit_manage_cancel")
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        return false;
+    }
 }

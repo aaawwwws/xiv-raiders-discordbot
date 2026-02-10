@@ -1598,17 +1598,23 @@ public sealed class RecruitmentModule : InteractionModuleBase<SocketInteractionC
                 .OfType<IUserMessage>()
                 .FirstOrDefault(message =>
                     message.Author.Id == Context.Client.CurrentUser.Id &&
-                    message.Content.StartsWith(RecruitmentPanel.PanelMessage, StringComparison.Ordinal));
+                    (message.Content.StartsWith(RecruitmentPanel.PanelMessage, StringComparison.Ordinal) ||
+                     message.Content.StartsWith(RecruitmentPanel.DisabledPanelMessage, StringComparison.Ordinal) ||
+                     RecruitmentPanel.LooksLikePanelComponents(message.Components)));
         }
 
         var components = RecruitmentPanel.BuildPanelComponents();
         if (existing is not null)
         {
-            await existing.ModifyAsync(props => props.Components = components);
+            await existing.ModifyAsync(props =>
+            {
+                props.Content = null;
+                props.Components = components;
+            });
             return existing;
         }
 
-        return await channel.SendMessageAsync(RecruitmentPanel.PanelMessage, components: components);
+        return await channel.SendMessageAsync(components: components);
     }
 
     private async Task UpdateRecruitMessageAsync(RecruitPost post)

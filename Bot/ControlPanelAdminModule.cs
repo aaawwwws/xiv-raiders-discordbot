@@ -61,11 +61,15 @@ public sealed class ControlPanelAdminModule : InteractionModuleBase<SocketIntera
         var components = ControlPanel.BuildComponents();
         if (existing is not null)
         {
-            await existing.ModifyAsync(props => props.Components = components);
+            await existing.ModifyAsync(props =>
+            {
+                props.Content = null;
+                props.Components = components;
+            });
             return existing;
         }
 
-        return await channel.SendMessageAsync(ControlPanel.PanelMessage, components: components, flags: MessageFlags.SuppressNotification);
+        return await channel.SendMessageAsync(components: components, flags: MessageFlags.SuppressNotification);
     }
 
     private static ulong ToUlong(long value) => unchecked((ulong)value);
