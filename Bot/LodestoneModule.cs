@@ -398,6 +398,7 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
         await DeferAsync(ephemeral: true);
 
         var settings = await _db.GetGuildSettingsAsync(Context.Guild.Id);
+        var approvalRequired = settings?.RegistrationApprovalRequired ?? true;
         var memberRole = ResolveMemberRole(Context.Guild, settings);
         if (memberRole is null)
         {
@@ -419,6 +420,63 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
         }
 
         var completedProfile = profile!;
+        if (!approvalRequired)
+        {
+            var directProvisionalRole = ResolveProvisionalRole(Context.Guild, settings);
+            try
+            {
+                if (directProvisionalRole is not null && guildUser.Roles.Any(role => role.Id == directProvisionalRole.Id))
+                {
+                    if (!TryValidateRoleOperation(Context.Guild, guildUser, directProvisionalRole, out var removeReason))
+                    {
+                        _logger.LogWarning(
+                            "Skipped provisional role revoke on direct registration due to permission/hierarchy. GuildId={GuildId}, UserId={UserId}, RoleId={RoleId}, Reason={Reason}",
+                            Context.Guild.Id,
+                            guildUser.Id,
+                            directProvisionalRole.Id,
+                            removeReason);
+                        await FollowupAsync($"仮登録ロールを解除できません: {removeReason}", ephemeral: true);
+                        return;
+                    }
+
+                    await guildUser.RemoveRoleAsync(directProvisionalRole);
+                }
+
+                if (!TryValidateRoleOperation(Context.Guild, guildUser, memberRole!, out var grantReason))
+                {
+                    _logger.LogWarning(
+                        "Skipped direct member role grant due to permission/hierarchy. GuildId={GuildId}, UserId={UserId}, RoleId={RoleId}, Reason={Reason}",
+                        Context.Guild.Id,
+                        guildUser.Id,
+                        memberRole!.Id,
+                        grantReason);
+                    await FollowupAsync($"メンバーロールを付与できません: {grantReason}", ephemeral: true);
+                    return;
+                }
+
+                await guildUser.AddRoleAsync(memberRole!);
+                await GrantDcRoleAsync(guildUser, completedProfile.FfxivDataCenter);
+                await UpdateNicknameAsync(guildUser, completedProfile.FfxivName ?? string.Empty, completedProfile.FfxivWorld ?? string.Empty);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to complete direct member registration. GuildId={GuildId}, UserId={UserId}", Context.Guild.Id, guildUser.Id);
+                await FollowupAsync("登録処理に失敗しました。Botの権限を確認してください。", ephemeral: true);
+                return;
+            }
+
+            await LogMemberRegistrationCompletedAsync(
+                guildUser,
+                completedProfile.FfxivName ?? "(unknown)",
+                completedProfile.FfxivWorld ?? "(unknown)",
+                completedProfile.FfxivDataCenter ?? "(unknown)",
+                completedProfile.XHandle,
+                completedProfile.BlueskyHandle);
+            _ = _stats.RefreshIfConfiguredAsync(Context.Guild);
+            await FollowupAsync("登録を完了しました。メンバーロールを付与しました。", ephemeral: true);
+            return;
+        }
+
         var provisionalRole = ResolveProvisionalRole(Context.Guild, settings);
         if (provisionalRole is null)
         {
