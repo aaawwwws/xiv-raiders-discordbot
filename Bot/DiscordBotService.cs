@@ -34,7 +34,9 @@ public sealed class DiscordBotService : IHostedService
     private readonly ConcurrentDictionary<ulong, byte> _tempVoiceChannelIds = new();
     private readonly ConcurrentDictionary<ulong, CancellationTokenSource> _tempVoiceDeleteTokens = new();
     private readonly ConcurrentDictionary<ulong, int> _dailyActivityRankingPosted = new();
+    private readonly ConcurrentDictionary<ulong, int> _dailyReactionRankingPosted = new();
     private readonly ConcurrentDictionary<ulong, int> _weeklyVoiceRankingPosted = new();
+    private readonly ConcurrentDictionary<ulong, int> _weeklyReactionRankingPosted = new();
     private readonly ConcurrentDictionary<ulong, int> _inactiveAutoKickProcessedDay = new();
     private readonly ConcurrentDictionary<string, DateTimeOffset> _failureAlerts = new();
     private readonly SemaphoreSlim _tempVoiceLock = new(1, 1);
@@ -94,6 +96,8 @@ public sealed class DiscordBotService : IHostedService
         await _db.EnsureGuildStatsPanelTableAsync();
         await _db.EnsureGuildDailyActivityPanelTableAsync();
         await _db.EnsureGuildWeeklyActivityPanelTableAsync();
+        await _db.EnsureGuildDailyReactionPostPanelTableAsync();
+        await _db.EnsureGuildWeeklyReactionPostPanelTableAsync();
         await _db.EnsureGuildSettingsColumnsAsync();
         await _db.EnsureRecruitTemplatesTableAsync();
         await _db.EnsureMessageLogPayloadColumnsAsync();
@@ -113,6 +117,7 @@ public sealed class DiscordBotService : IHostedService
         _client.MessageUpdated += OnMessageUpdatedAsync;
         _client.MessageReceived += OnMessageReceivedAsync;
         _client.ReactionAdded += OnReactionAddedAsync;
+        _client.ReactionRemoved += OnReactionRemovedAsync;
 
         _cleanupCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         _cleanupTask = Task.Run(() => CleanupLoopAsync(_cleanupCts.Token), _cleanupCts.Token);
@@ -502,11 +507,13 @@ public sealed class DiscordBotService : IHostedService
             if (_options.DailyActivityRankingEnabled)
             {
                 await TryPostDailyActivityRankingAsync(nowUtc);
+                await TryPostDailyReactionRankingAsync(nowUtc);
             }
 
             if (_options.VoiceWeeklyRankingEnabled)
             {
                 await TryPostWeeklyVoiceRankingAsync(nowUtc);
+                await TryPostWeeklyReactionRankingAsync(nowUtc);
             }
         }
         catch (Exception ex)
@@ -989,6 +996,54 @@ public sealed class DiscordBotService : IHostedService
         }
     }
 
+    private async Task TryPostDailyReactionRankingAsync(DateTimeOffset nowUtc)
+    {
+        var topCount = Math.Clamp(_options.DailyActivityRankingTopCount, 1, 20);
+        var intervalMinutes = Math.Clamp(_options.DailyActivityRankingUpdateIntervalMinutes, 5, 180);
+        var nowJst = nowUtc.ToOffset(JapanTimeOffset);
+        var slotKey = (int)(nowJst.ToUnixTimeSeconds() / (intervalMinutes * 60L));
+        var dayStartJst = new DateTimeOffset(nowJst.Year, nowJst.Month, nowJst.Day, 0, 0, 0, JapanTimeOffset);
+        var fromUtc = dayStartJst.ToUniversalTime();
+
+        foreach (var guild in _client.Guilds)
+        {
+            if (_dailyReactionRankingPosted.TryGetValue(guild.Id, out var postedSlot) && postedSlot == slotKey)
+            {
+                continue;
+            }
+
+            var panel = await _db.GetGuildDailyReactionPostPanelAsync(guild.Id);
+            if (panel is null || panel.ChannelId == 0)
+            {
+                continue;
+            }
+
+            var channel = guild.GetTextChannel(ToUlong(panel.ChannelId));
+            if (channel is null)
+            {
+                continue;
+            }
+
+            try
+            {
+                var embed = await _voiceStats.BuildReactionPostRankingEmbedAsync(guild, fromUtc, nowUtc, topCount, "今日のリアクション獲得ランキング");
+                var message = await UpsertDailyActivityRankingMessageAsync(guild, channel, panel.MessageId == 0 ? 0 : ToUlong(panel.MessageId), nowJst, embed);
+                await _db.UpsertGuildDailyReactionPostPanelAsync(guild.Id, channel.Id, message.Id);
+                _dailyReactionRankingPosted[guild.Id] = slotKey;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to post daily reaction ranking. GuildId={GuildId}", guild.Id);
+                await NotifyFailureAsync(
+                    guild,
+                    "daily-reaction-ranking-update",
+                    "障害通知: 今日リアクション獲得ランキング更新失敗",
+                    $"チャンネル: <#{channel.Id}>",
+                    ex);
+            }
+        }
+    }
+
     private async Task TryPostWeeklyVoiceRankingAsync(DateTimeOffset nowUtc)
     {
         var rangeDays = Math.Clamp(_options.VoiceWeeklyRankingRangeDays, 1, 30);
@@ -1057,6 +1112,80 @@ public sealed class DiscordBotService : IHostedService
                     guild,
                     "weekly-ranking-update",
                     "障害通知: 週間ランキング更新失敗",
+                    $"チャンネル: <#{channel.Id}>",
+                    ex);
+            }
+        }
+    }
+
+    private async Task TryPostWeeklyReactionRankingAsync(DateTimeOffset nowUtc)
+    {
+        var rangeDays = Math.Clamp(_options.VoiceWeeklyRankingRangeDays, 1, 30);
+        var topCount = Math.Clamp(_options.VoiceWeeklyRankingTopCount, 1, 20);
+        var targetHour = Math.Clamp(_options.VoiceWeeklyRankingPostHourJst, 0, 23);
+        var targetDay = Math.Clamp(_options.VoiceWeeklyRankingPostDayOfWeekJst, 0, 6);
+
+        var nowJst = nowUtc.ToOffset(JapanTimeOffset);
+        if ((int)nowJst.DayOfWeek != targetDay || nowJst.Hour != targetHour)
+        {
+            return;
+        }
+
+        var week = ISOWeek.GetWeekOfYear(nowJst.DateTime);
+        var year = ISOWeek.GetYear(nowJst.DateTime);
+        var weekKey = (year * 100) + week;
+
+        foreach (var guild in _client.Guilds)
+        {
+            if (_weeklyReactionRankingPosted.TryGetValue(guild.Id, out var postedWeek) && postedWeek == weekKey)
+            {
+                continue;
+            }
+
+            var panel = await _db.GetGuildWeeklyReactionPostPanelAsync(guild.Id);
+            IMessageChannel? channel = null;
+            if (panel is not null && panel.ChannelId != 0)
+            {
+                channel = guild.GetTextChannel(ToUlong(panel.ChannelId));
+            }
+
+            channel ??= await ResolveActivityRankingChannelAsync(guild);
+            if (channel is null)
+            {
+                continue;
+            }
+
+            try
+            {
+                var periodEndJst = new DateTimeOffset(nowJst.Year, nowJst.Month, nowJst.Day, 0, 0, 0, JapanTimeOffset);
+                var periodStartJst = periodEndJst.AddDays(-rangeDays);
+                if (guild.CreatedAt.ToOffset(JapanTimeOffset) > periodStartJst)
+                {
+                    _logger.LogInformation(
+                        "Skip weekly reaction ranking because full range has not elapsed yet. GuildId={GuildId}, PeriodStartJst={PeriodStartJst}, GuildCreatedAt={GuildCreatedAt}",
+                        guild.Id,
+                        periodStartJst,
+                        guild.CreatedAt);
+                    continue;
+                }
+
+                var embed = await _voiceStats.BuildReactionPostRankingEmbedAsync(
+                    guild,
+                    periodStartJst.ToUniversalTime(),
+                    periodEndJst.ToUniversalTime(),
+                    topCount,
+                    "週間リアクション獲得ランキング");
+                var message = await channel.SendMessageAsync(embed: embed, flags: MessageFlags.SuppressNotification);
+                await _db.UpsertGuildWeeklyReactionPostPanelAsync(guild.Id, channel.Id, message.Id);
+                _weeklyReactionRankingPosted[guild.Id] = weekKey;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to post weekly reaction ranking. GuildId={GuildId}", guild.Id);
+                await NotifyFailureAsync(
+                    guild,
+                    "weekly-reaction-ranking-update",
+                    "障害通知: 週間リアクション獲得ランキング更新失敗",
                     $"チャンネル: <#{channel.Id}>",
                     ex);
             }
@@ -2621,6 +2750,56 @@ public sealed class DiscordBotService : IHostedService
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Failed to upsert reaction activity. GuildId={GuildId}, UserId={UserId}", guildChannel.Guild.Id, reaction.UserId);
+        }
+    }
+
+    private async Task OnReactionRemovedAsync(Cacheable<IUserMessage, ulong> _, Cacheable<IMessageChannel, ulong> channelCache, SocketReaction reaction)
+    {
+        if (reaction.UserId == _client.CurrentUser.Id)
+        {
+            return;
+        }
+
+        if (reaction.User.IsSpecified && reaction.User.Value.IsBot)
+        {
+            return;
+        }
+
+        IMessageChannel? channel = null;
+        if (channelCache.HasValue)
+        {
+            channel = channelCache.Value;
+        }
+        else
+        {
+            try
+            {
+                channel = await channelCache.GetOrDownloadAsync();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to resolve reaction channel on remove. ChannelId={ChannelId}", channelCache.Id);
+                return;
+            }
+        }
+
+        if (channel is not SocketGuildChannel guildChannel)
+        {
+            return;
+        }
+
+        try
+        {
+            var emojiKey = BuildEmojiKey(reaction.Emote);
+            await _db.RemoveReactionAsync(
+                guildChannel.Guild.Id,
+                reaction.MessageId,
+                reaction.UserId,
+                emojiKey);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to remove reaction activity. GuildId={GuildId}, UserId={UserId}", guildChannel.Guild.Id, reaction.UserId);
         }
     }
 

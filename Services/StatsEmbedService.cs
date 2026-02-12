@@ -145,13 +145,12 @@ public sealed class StatsEmbedService
         var source = "このサーバーの在籍メンバー";
 
         var specs = BuildChartSpecs(registered);
-        var existingMessages = await ListManagedStatsMessagesAsync(channel);
+        var desiredTitles = new HashSet<string>(specs.Select(spec => spec.EmbedTitle), StringComparer.Ordinal);
+        var existingMessages = await ListManagedStatsMessagesAsync(channel, guild.CurrentUser.Id, desiredTitles);
         var existingByTitle = existingMessages
             .Where(message => message.Embeds.FirstOrDefault()?.Title is not null)
             .GroupBy(message => message.Embeds.First().Title!, StringComparer.Ordinal)
             .ToDictionary(group => group.Key, group => group.First(), StringComparer.Ordinal);
-
-        var desiredTitles = new HashSet<string>(specs.Select(spec => spec.EmbedTitle), StringComparer.Ordinal);
         var createdByTitle = new Dictionary<string, IUserMessage>(StringComparer.Ordinal);
 
         foreach (var spec in specs)
@@ -260,15 +259,65 @@ public sealed class StatsEmbedService
         return specs;
     }
 
-    private async Task<IReadOnlyList<IUserMessage>> ListManagedStatsMessagesAsync(IMessageChannel channel)
+    private async Task<IReadOnlyList<IUserMessage>> ListManagedStatsMessagesAsync(
+        IMessageChannel channel,
+        ulong botUserId,
+        IReadOnlySet<string> desiredTitles)
     {
-        var messages = await channel.GetMessagesAsync(150).FlattenAsync();
-        return messages
-            .OfType<IUserMessage>()
-            .Where(message =>
-                message.Author.IsBot &&
-                IsManagedStatsTitle(message.Embeds.FirstOrDefault()?.Title))
-            .ToList();
+        const int pageSize = 100;
+        const int maxScanMessages = 2000;
+
+        var managed = new List<IUserMessage>();
+        var foundDesired = new HashSet<string>(StringComparer.Ordinal);
+        ulong? beforeMessageId = null;
+        var scanned = 0;
+
+        while (scanned < maxScanMessages)
+        {
+            var page = beforeMessageId.HasValue
+                ? await channel.GetMessagesAsync(beforeMessageId.Value, Direction.Before, pageSize).FlattenAsync()
+                : await channel.GetMessagesAsync(pageSize).FlattenAsync();
+
+            var pageMessages = page.OfType<IUserMessage>().ToList();
+            if (pageMessages.Count == 0)
+            {
+                break;
+            }
+
+            scanned += pageMessages.Count;
+            foreach (var message in pageMessages)
+            {
+                if (message.Author.Id != botUserId)
+                {
+                    continue;
+                }
+
+                var title = message.Embeds.FirstOrDefault()?.Title;
+                if (!IsManagedStatsTitle(title))
+                {
+                    continue;
+                }
+
+                managed.Add(message);
+                if (!string.IsNullOrWhiteSpace(title) && desiredTitles.Contains(title))
+                {
+                    foundDesired.Add(title);
+                }
+            }
+
+            if (desiredTitles.Count > 0 && foundDesired.Count >= desiredTitles.Count)
+            {
+                break;
+            }
+
+            beforeMessageId = pageMessages.Min(message => message.Id);
+            if (pageMessages.Count < pageSize)
+            {
+                break;
+            }
+        }
+
+        return managed;
     }
 
     private static bool IsManagedStatsTitle(string? title)

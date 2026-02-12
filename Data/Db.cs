@@ -152,6 +152,36 @@ CREATE TABLE IF NOT EXISTS guild_weekly_activity_panels (
         await conn.ExecuteAsync(sql);
     }
 
+    public async Task EnsureGuildDailyReactionPostPanelTableAsync()
+    {
+        const string sql = @"
+CREATE TABLE IF NOT EXISTS guild_daily_reaction_post_panels (
+    id SERIAL PRIMARY KEY,
+    guild_id BIGINT NOT NULL UNIQUE,
+    channel_id BIGINT NOT NULL,
+    message_id BIGINT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);";
+
+        await using var conn = CreateConnection();
+        await conn.ExecuteAsync(sql);
+    }
+
+    public async Task EnsureGuildWeeklyReactionPostPanelTableAsync()
+    {
+        const string sql = @"
+CREATE TABLE IF NOT EXISTS guild_weekly_reaction_post_panels (
+    id SERIAL PRIMARY KEY,
+    guild_id BIGINT NOT NULL UNIQUE,
+    channel_id BIGINT NOT NULL,
+    message_id BIGINT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);";
+
+        await using var conn = CreateConnection();
+        await conn.ExecuteAsync(sql);
+    }
+
     public async Task EnsureGuildSettingsColumnsAsync()
     {
         const string sql = @"
@@ -551,6 +581,25 @@ SET reacted_at = EXCLUDED.reacted_at,
         });
     }
 
+    public async Task RemoveReactionAsync(ulong guildId, ulong messageId, ulong userId, string emojiKey)
+    {
+        const string sql = @"
+DELETE FROM public.user_reaction_logs
+WHERE guild_id = @GuildId
+  AND message_id = @MessageId
+  AND user_id = @UserId
+  AND emoji_key = @EmojiKey;";
+
+        await using var conn = CreateConnection();
+        await conn.ExecuteAsync(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            MessageId = ToDbId(messageId),
+            UserId = ToDbId(userId),
+            EmojiKey = string.IsNullOrWhiteSpace(emojiKey) ? "unknown" : emojiKey
+        });
+    }
+
     public async Task UpdateMessageAsync(ulong messageId, string content, int attachmentCount, int embedCount, string? attachmentsJson, string? embedsJson)
     {
         const string sql = @"
@@ -870,6 +919,73 @@ GROUP BY channel_id, author_id;";
             GuildId = ToDbId(guildId),
             FromUtcInclusive = fromUtcInclusive,
             ToUtcExclusive = toUtcExclusive
+        });
+        return rows.ToList();
+    }
+
+    public async Task<IReadOnlyList<ReactionCountByChannel>> ListReactionCountsByChannelAsync(
+        ulong guildId,
+        DateTimeOffset fromUtcInclusive,
+        DateTimeOffset toUtcExclusive)
+    {
+        const string sql = @"
+SELECT channel_id AS ChannelId,
+       user_id AS UserId,
+       COUNT(1)::INT AS ReactionCount
+FROM public.user_reaction_logs
+WHERE guild_id = @GuildId
+  AND reacted_at >= @FromUtcInclusive
+  AND reacted_at < @ToUtcExclusive
+GROUP BY channel_id, user_id;";
+
+        await using var conn = CreateConnection();
+        var rows = await conn.QueryAsync<ReactionCountByChannel>(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            FromUtcInclusive = fromUtcInclusive,
+            ToUtcExclusive = toUtcExclusive
+        });
+        return rows.ToList();
+    }
+
+    public async Task<IReadOnlyList<ReactionPostSummary>> ListTopReactedPostsAsync(
+        ulong guildId,
+        DateTimeOffset fromUtcInclusive,
+        DateTimeOffset toUtcExclusive,
+        int topCount = 10,
+        bool includeDeleted = false)
+    {
+        const string sql = @"
+SELECT r.message_id AS MessageId,
+       MIN(r.channel_id) AS ChannelId,
+       COUNT(1)::INT AS ReactionCount,
+       COUNT(DISTINCT r.user_id)::INT AS ReactorCount,
+       MAX(r.reacted_at) AS LastReactedAt,
+       m.author_id AS AuthorId,
+       m.author_name AS AuthorName,
+       m.author_display_name AS AuthorDisplayName,
+       m.content AS Content,
+       m.deleted_at AS DeletedAt
+FROM public.user_reaction_logs r
+LEFT JOIN public.message_logs m
+  ON m.guild_id = r.guild_id
+ AND m.message_id = r.message_id
+WHERE r.guild_id = @GuildId
+  AND r.reacted_at >= @FromUtcInclusive
+  AND r.reacted_at < @ToUtcExclusive
+  AND (@IncludeDeleted OR m.deleted_at IS NULL OR m.message_id IS NULL)
+GROUP BY r.message_id, m.author_id, m.author_name, m.author_display_name, m.content, m.deleted_at
+ORDER BY ReactionCount DESC, ReactorCount DESC, LastReactedAt DESC, r.message_id DESC
+LIMIT @TopCount;";
+
+        await using var conn = CreateConnection();
+        var rows = await conn.QueryAsync<ReactionPostSummary>(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            FromUtcInclusive = fromUtcInclusive,
+            ToUtcExclusive = toUtcExclusive,
+            IncludeDeleted = includeDeleted,
+            TopCount = Math.Clamp(topCount, 1, 50)
         });
         return rows.ToList();
     }
@@ -2368,6 +2484,36 @@ LIMIT 1;";
         return await conn.QuerySingleOrDefaultAsync<GuildPanel>(sql, new { GuildId = ToDbId(guildId) });
     }
 
+    public async Task<GuildPanel?> GetGuildDailyReactionPostPanelAsync(ulong guildId)
+    {
+        const string sql = @"
+SELECT guild_id AS GuildId,
+       channel_id AS ChannelId,
+       message_id AS MessageId,
+       updated_at AS UpdatedAt
+FROM guild_daily_reaction_post_panels
+WHERE guild_id = @GuildId
+LIMIT 1;";
+
+        await using var conn = CreateConnection();
+        return await conn.QuerySingleOrDefaultAsync<GuildPanel>(sql, new { GuildId = ToDbId(guildId) });
+    }
+
+    public async Task<GuildPanel?> GetGuildWeeklyReactionPostPanelAsync(ulong guildId)
+    {
+        const string sql = @"
+SELECT guild_id AS GuildId,
+       channel_id AS ChannelId,
+       message_id AS MessageId,
+       updated_at AS UpdatedAt
+FROM guild_weekly_reaction_post_panels
+WHERE guild_id = @GuildId
+LIMIT 1;";
+
+        await using var conn = CreateConnection();
+        return await conn.QuerySingleOrDefaultAsync<GuildPanel>(sql, new { GuildId = ToDbId(guildId) });
+    }
+
     public async Task UpsertGuildControlPanelAsync(ulong guildId, ulong channelId, ulong messageId)
     {
         const string sql = @"
@@ -2467,6 +2613,44 @@ SET channel_id = EXCLUDED.channel_id,
     {
         const string sql = @"
 INSERT INTO guild_weekly_activity_panels (guild_id, channel_id, message_id)
+VALUES (@GuildId, @ChannelId, @MessageId)
+ON CONFLICT (guild_id) DO UPDATE
+SET channel_id = EXCLUDED.channel_id,
+    message_id = EXCLUDED.message_id,
+    updated_at = NOW();";
+
+        await using var conn = CreateConnection();
+        await conn.ExecuteAsync(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            ChannelId = ToDbId(channelId),
+            MessageId = ToDbId(messageId)
+        });
+    }
+
+    public async Task UpsertGuildDailyReactionPostPanelAsync(ulong guildId, ulong channelId, ulong messageId)
+    {
+        const string sql = @"
+INSERT INTO guild_daily_reaction_post_panels (guild_id, channel_id, message_id)
+VALUES (@GuildId, @ChannelId, @MessageId)
+ON CONFLICT (guild_id) DO UPDATE
+SET channel_id = EXCLUDED.channel_id,
+    message_id = EXCLUDED.message_id,
+    updated_at = NOW();";
+
+        await using var conn = CreateConnection();
+        await conn.ExecuteAsync(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            ChannelId = ToDbId(channelId),
+            MessageId = ToDbId(messageId)
+        });
+    }
+
+    public async Task UpsertGuildWeeklyReactionPostPanelAsync(ulong guildId, ulong channelId, ulong messageId)
+    {
+        const string sql = @"
+INSERT INTO guild_weekly_reaction_post_panels (guild_id, channel_id, message_id)
 VALUES (@GuildId, @ChannelId, @MessageId)
 ON CONFLICT (guild_id) DO UPDATE
 SET channel_id = EXCLUDED.channel_id,
