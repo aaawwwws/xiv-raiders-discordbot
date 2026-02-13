@@ -99,7 +99,7 @@ public sealed class SettingsPanelModule : InteractionModuleBase<SocketInteractio
     }
 
     [RequireBotAdmin]
-    [ComponentInteraction(SettingsPanel.ResyncPanelsCustomId, ignoreGroupNames: true)]
+    [ComponentInteraction(AdminControlPanel.ResyncPanelsCustomId, ignoreGroupNames: true)]
     public async Task ResyncPanelsAsync()
     {
         if (Context.Guild is null)

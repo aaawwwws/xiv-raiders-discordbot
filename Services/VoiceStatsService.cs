@@ -18,43 +18,6 @@ public sealed class VoiceStatsService {
         return await BuildActivityRankingEmbedAsync(guild, fromUtc, nowUtc, topCount, "週間アクティビティランキング");
     }
 
-    public async Task<Embed> BuildReactionPostRankingEmbedAsync(
-        SocketGuild guild,
-        DateTimeOffset fromUtc,
-        DateTimeOffset toUtc,
-        int topCount,
-        string title) {
-        if (toUtc <= fromUtc) {
-            toUtc = fromUtc.AddMinutes(1);
-        }
-
-        var rows = await _db.ListTopReactedPostsAsync(guild.Id, fromUtc, toUtc, topCount);
-        var fromJst = fromUtc.ToOffset(TimeSpan.FromHours(9));
-        var toJst = toUtc.ToOffset(TimeSpan.FromHours(9));
-        var period = $"{fromJst:MM/dd HH:mm} - {toJst:MM/dd HH:mm} (JST)";
-        var embedTitle = ResolveReactionRankingTitle(title, fromJst, toJst);
-
-        var totalReactions = Math.Max(0, rows.Sum(x => x.ReactionCount));
-        var lines = rows
-            .Select((row, index) => BuildReactionPostLine(guild.Id, row, index + 1))
-            .ToList();
-        var description = JoinWithinLimit(lines, 3800);
-
-        var builder = new EmbedBuilder()
-            .WithTitle(embedTitle)
-            .WithColor(new Color(241, 196, 15))
-            .WithCurrentTimestamp()
-            .WithDescription(
-                "📅 **集計期間**\n" +
-                $"`{period}`\n" +
-                $"📝 **対象投稿数**: `{rows.Count}件`\n" +
-                $"👏 **リアクション合計**: `{totalReactions}件`")
-            .AddField("👏 投稿 TOP", description);
-
-        builder.WithFooter("Raid DC Activity");
-        return builder.Build();
-    }
-
     public async Task<Embed> BuildActivityRankingEmbedAsync(
         SocketGuild guild,
         DateTimeOffset fromUtc,
@@ -65,9 +28,12 @@ public sealed class VoiceStatsService {
             toUtc = fromUtc.AddMinutes(1);
         }
 
-        var voiceRows = await _db.ListVoiceDurationSummaryAsync(guild.Id, fromUtc, toUtc, topCount);
+        var topLimit = Math.Clamp(topCount, 1, 10);
+        var voiceRows = await _db.ListVoiceDurationSummaryAsync(guild.Id, fromUtc, toUtc, topLimit);
         var messageRows = await _db.ListMessageCountsByChannelAsync(guild.Id, fromUtc, toUtc);
-        var reactionRows = await _db.ListReactionCountsByChannelAsync(guild.Id, fromUtc, toUtc);
+        var reactionGivenRows = await _db.ListReactionCountsByChannelAsync(guild.Id, fromUtc, toUtc);
+        var reactionReceivedRows = await _db.ListReactionReceivedCountsByChannelAsync(guild.Id, fromUtc, toUtc);
+        var reactionReceivedTopPostRows = await _db.ListTopReactionReceivedPostsByUserAsync(guild.Id, fromUtc, toUtc);
         var activeUsers = await _db.ListActiveUserIdsSinceAsync(guild.Id, fromUtc);
 
         var nonAdminMessageCounts = new Dictionary<ulong, int>();
@@ -90,8 +56,8 @@ public sealed class VoiceStatsService {
             }
         }
 
-        var nonAdminReactionCounts = new Dictionary<ulong, int>();
-        foreach (var row in reactionRows) {
+        var nonAdminReactionGivenCounts = new Dictionary<ulong, int>();
+        foreach (var row in reactionGivenRows) {
             var userId = unchecked((ulong)row.UserId);
             var channelId = unchecked((ulong)row.ChannelId);
             if (userId == 0 || channelId == 0 || row.ReactionCount <= 0) {
@@ -104,28 +70,71 @@ public sealed class VoiceStatsService {
             }
 
             if (!IsAdminCategoryChannel(guild, guildChannel)) {
-                nonAdminReactionCounts[userId] = nonAdminReactionCounts.TryGetValue(userId, out var prev)
+                nonAdminReactionGivenCounts[userId] = nonAdminReactionGivenCounts.TryGetValue(userId, out var prev)
                     ? prev + row.ReactionCount
                     : row.ReactionCount;
             }
         }
 
+        var nonAdminReactionReceivedCounts = new Dictionary<ulong, int>();
+        foreach (var row in reactionReceivedRows) {
+            var userId = unchecked((ulong)row.UserId);
+            var channelId = unchecked((ulong)row.ChannelId);
+            if (userId == 0 || channelId == 0 || row.ReactionCount <= 0) {
+                continue;
+            }
+
+            var guildChannel = ResolveBaseGuildChannel(guild, channelId);
+            if (guildChannel is null) {
+                continue;
+            }
+
+            if (!IsAdminCategoryChannel(guild, guildChannel)) {
+                nonAdminReactionReceivedCounts[userId] = nonAdminReactionReceivedCounts.TryGetValue(userId, out var prev)
+                    ? prev + row.ReactionCount
+                    : row.ReactionCount;
+            }
+        }
+
+        var nonAdminReactionReceivedTopPosts = new Dictionary<ulong, ReactionReceivedTopPost>();
+        foreach (var row in reactionReceivedTopPostRows) {
+            var userId = unchecked((ulong)row.UserId);
+            var channelId = unchecked((ulong)row.ChannelId);
+            if (userId == 0 || channelId == 0 || row.MessageId == 0 || row.ReactionCount <= 0) {
+                continue;
+            }
+
+            var guildChannel = ResolveBaseGuildChannel(guild, channelId);
+            if (guildChannel is null || IsAdminCategoryChannel(guild, guildChannel)) {
+                continue;
+            }
+
+            nonAdminReactionReceivedTopPosts[userId] = row;
+        }
+
         var vcTop = voiceRows
-            .Take(Math.Clamp(topCount, 1, 20))
+            .Take(topLimit)
             .ToList();
         var totalVcSeconds = Math.Max(0, voiceRows.Sum(x => x.DurationSeconds));
         var messageTop = nonAdminMessageCounts
             .OrderByDescending(x => x.Value)
             .ThenBy(x => x.Key)
-            .Take(Math.Clamp(topCount, 1, 20))
+            .Take(topLimit)
             .ToList();
-        var reactionTop = nonAdminReactionCounts
+        var reactionGivenTop = nonAdminReactionGivenCounts
             .OrderByDescending(x => x.Value)
             .ThenBy(x => x.Key)
-            .Take(Math.Clamp(topCount, 1, 20))
+            .Take(topLimit)
+            .ToList();
+        const int reactionReceivedTopLimit = 5;
+        var reactionReceivedTop = nonAdminReactionReceivedCounts
+            .OrderByDescending(x => x.Value)
+            .ThenBy(x => x.Key)
+            .Take(reactionReceivedTopLimit)
             .ToList();
         var totalMessages = Math.Max(0, nonAdminMessageCounts.Values.Sum());
-        var totalReactions = Math.Max(0, nonAdminReactionCounts.Values.Sum());
+        var totalReactionGiven = Math.Max(0, nonAdminReactionGivenCounts.Values.Sum());
+        var totalReactionReceived = Math.Max(0, nonAdminReactionReceivedCounts.Values.Sum());
 
         var fromJst = fromUtc.ToOffset(TimeSpan.FromHours(9));
         var toJst = toUtc.ToOffset(TimeSpan.FromHours(9));
@@ -143,7 +152,8 @@ public sealed class VoiceStatsService {
                 $"👥 **アクティブ人数**: `{activeUsers.Count}人`\n" +
                 $"🎙️ **VC合計**: `{FormatDuration(totalVcSeconds)}`\n" +
                 $"💬 **発言合計**: `{totalMessages}件`\n" +
-                $"👏 **リアクション合計**: `{totalReactions}件`");
+                $"👏 **付与リアクション合計**: `{totalReactionGiven}件`\n" +
+                $"🎯 **被リアクション合計**: `{totalReactionReceived}件`");
 
         var vcLines = new List<string>();
         for (var i = 0; i < vcTop.Count; i++) {
@@ -168,20 +178,38 @@ public sealed class VoiceStatsService {
             messageLines.Add("😴 データなし");
         }
 
-        var reactionLines = new List<string>();
-        for (var i = 0; i < reactionTop.Count; i++) {
-            var row = reactionTop[i];
+        var reactionGivenLines = new List<string>();
+        for (var i = 0; i < reactionGivenTop.Count; i++) {
+            var row = reactionGivenTop[i];
             var display = guild.GetUser(row.Key)?.DisplayName ?? row.Key.ToString();
-            reactionLines.Add($"{ToRankBadge(i + 1)} **{display}**  `{row.Value}件`");
+            reactionGivenLines.Add($"{ToRankBadge(i + 1)} **{display}**  `{row.Value}件`");
         }
 
-        if (reactionLines.Count == 0) {
-            reactionLines.Add("😴 データなし");
+        if (reactionGivenLines.Count == 0) {
+            reactionGivenLines.Add("😴 データなし");
         }
 
-        builder.AddField("🎙️ VC滞在 TOP", string.Join('\n', vcLines));
-        builder.AddField("💬 発言数 TOP", string.Join('\n', messageLines));
-        builder.AddField("👏 リアクション TOP", string.Join('\n', reactionLines));
+        var reactionReceivedLines = new List<string>();
+        for (var i = 0; i < reactionReceivedTop.Count; i++) {
+            var row = reactionReceivedTop[i];
+            var display = guild.GetUser(row.Key)?.DisplayName ?? row.Key.ToString();
+            if (nonAdminReactionReceivedTopPosts.TryGetValue(row.Key, out var topPost)) {
+                var link = BuildMessageLink(guild.Id, unchecked((ulong)topPost.ChannelId), unchecked((ulong)topPost.MessageId));
+                reactionReceivedLines.Add($"{ToRankBadge(i + 1)} **{display}**  `{row.Value}件` ([投稿]({link}) `{topPost.ReactionCount}件`)");
+                continue;
+            }
+
+            reactionReceivedLines.Add($"{ToRankBadge(i + 1)} **{display}**  `{row.Value}件`");
+        }
+
+        if (reactionReceivedLines.Count == 0) {
+            reactionReceivedLines.Add("😴 データなし");
+        }
+
+        builder.AddField("🎙️ VC滞在 TOP", JoinLinesWithinLimit(vcLines));
+        builder.AddField("💬 発言数 TOP", JoinLinesWithinLimit(messageLines));
+        builder.AddField("👏 リアクション付与 TOP", JoinLinesWithinLimit(reactionGivenLines));
+        builder.AddField("🎯 リアクション獲得数TOP5", JoinLinesWithinLimit(reactionReceivedLines));
         builder.WithFooter("Raid DC Activity");
         return builder.Build();
     }
@@ -227,21 +255,6 @@ public sealed class VoiceStatsService {
         return BuildThemedTitle(rawTitle);
     }
 
-    private static string ResolveReactionRankingTitle(string rawTitle, DateTimeOffset fromJst, DateTimeOffset toJst)
-    {
-        if (rawTitle.Contains("今日", StringComparison.Ordinal))
-        {
-            return $"{toJst.ToString("yyyy/MM/dd", CultureInfo.InvariantCulture)}のリアクション獲得ランキング";
-        }
-
-        if (rawTitle.Contains("週", StringComparison.Ordinal))
-        {
-            return $"{fromJst.ToString("yyyy/MM/dd", CultureInfo.InvariantCulture)}-{toJst.ToString("yyyy/MM/dd", CultureInfo.InvariantCulture)}のリアクション獲得ランキング";
-        }
-
-        return rawTitle;
-    }
-
     private static Color ResolveRankingColor(string title)
     {
         if (title.Contains("今日", StringComparison.Ordinal))
@@ -270,22 +283,21 @@ public sealed class VoiceStatsService {
         return $"{span.Minutes:00}:{span.Seconds:00}";
     }
 
-    private static string BuildReactionPostLine(ulong guildId, ReactionPostSummary row, int rank)
-    {
-        var channelId = unchecked((ulong)row.ChannelId);
-        var messageId = unchecked((ulong)row.MessageId);
-        var link = BuildMessageLink(guildId, channelId, messageId);
-        var author = row.AuthorId.HasValue ? $"<@{unchecked((ulong)row.AuthorId.Value)}>" : "(不明)";
-        var deleted = row.DeletedAt.HasValue ? " / 削除済み" : string.Empty;
-        return $"{ToRankBadge(rank)} [投稿]({link}) <#{channelId}> | 👍 `{row.ReactionCount}` (👥{row.ReactorCount}) | 投稿者: {author}{deleted}";
-    }
+    private static string BuildMessageLink(ulong guildId, ulong channelId, ulong messageId)
+        => $"https://discord.com/channels/{guildId}/{channelId}/{messageId}";
 
-    private static string JoinWithinLimit(IEnumerable<string> lines, int maxLength)
+    private static string JoinLinesWithinLimit(IReadOnlyList<string> lines, int maxLength = 1024)
     {
+        if (lines.Count == 0)
+        {
+            return "😴 データなし";
+        }
+
         var buffer = new List<string>();
         var total = 0;
-        foreach (var line in lines)
+        for (var i = 0; i < lines.Count; i++)
         {
+            var line = lines[i];
             if (string.IsNullOrWhiteSpace(line))
             {
                 continue;
@@ -294,6 +306,17 @@ public sealed class VoiceStatsService {
             var extra = (buffer.Count == 0 ? 0 : 1) + line.Length;
             if (total + extra > maxLength)
             {
+                var remaining = lines.Count - i;
+                if (remaining > 0)
+                {
+                    var moreLine = $"…ほか{remaining}件";
+                    var moreExtra = (buffer.Count == 0 ? 0 : 1) + moreLine.Length;
+                    if (total + moreExtra <= maxLength)
+                    {
+                        buffer.Add(moreLine);
+                    }
+                }
+
                 break;
             }
 
@@ -301,11 +324,19 @@ public sealed class VoiceStatsService {
             total += extra;
         }
 
-        return buffer.Count == 0 ? "😴 データなし" : string.Join('\n', buffer);
-    }
+        if (buffer.Count == 0)
+        {
+            var first = lines.FirstOrDefault(static x => !string.IsNullOrWhiteSpace(x)) ?? "😴 データなし";
+            if (first.Length <= maxLength)
+            {
+                return first;
+            }
 
-    private static string BuildMessageLink(ulong guildId, ulong channelId, ulong messageId)
-        => $"https://discord.com/channels/{guildId}/{channelId}/{messageId}";
+            return $"{first[..Math.Max(1, maxLength - 1)]}…";
+        }
+
+        return string.Join('\n', buffer);
+    }
 
     private static SocketGuildChannel? ResolveBaseGuildChannel(SocketGuild guild, ulong channelId) {
         var channel = guild.GetChannel(channelId);

@@ -9,12 +9,16 @@ public static class LodestonePanel
     public const string PanelMessage = PanelTitle;
     public const string IssueCustomId = "lodestone_link_issue";
     public const string VerifyCustomId = "lodestone_verify_button";
+    public const string EditProfileCustomId = "member_profile_edit_start";
+    public const string ChangeDataCenterWorldCustomId = "member_profile_change_dc_world_start";
 
     public static MessageComponent BuildComponents()
     {
         return new ComponentBuilder()
             .WithButton("連携コードを発行", IssueCustomId, ButtonStyle.Primary, row: 0)
             .WithButton("連携確認", VerifyCustomId, ButtonStyle.Success, row: 0)
+            .WithButton("プロフィール編集", EditProfileCustomId, ButtonStyle.Secondary, row: 1)
+            .WithButton("DC/サーバー変更", ChangeDataCenterWorldCustomId, ButtonStyle.Secondary, row: 1)
             .Build();
     }
 

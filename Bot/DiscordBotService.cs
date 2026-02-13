@@ -34,9 +34,7 @@ public sealed class DiscordBotService : IHostedService
     private readonly ConcurrentDictionary<ulong, byte> _tempVoiceChannelIds = new();
     private readonly ConcurrentDictionary<ulong, CancellationTokenSource> _tempVoiceDeleteTokens = new();
     private readonly ConcurrentDictionary<ulong, int> _dailyActivityRankingPosted = new();
-    private readonly ConcurrentDictionary<ulong, int> _dailyReactionRankingPosted = new();
     private readonly ConcurrentDictionary<ulong, int> _weeklyVoiceRankingPosted = new();
-    private readonly ConcurrentDictionary<ulong, int> _weeklyReactionRankingPosted = new();
     private readonly ConcurrentDictionary<ulong, int> _inactiveAutoKickProcessedDay = new();
     private readonly ConcurrentDictionary<string, DateTimeOffset> _failureAlerts = new();
     private readonly SemaphoreSlim _tempVoiceLock = new(1, 1);
@@ -96,8 +94,6 @@ public sealed class DiscordBotService : IHostedService
         await _db.EnsureGuildStatsPanelTableAsync();
         await _db.EnsureGuildDailyActivityPanelTableAsync();
         await _db.EnsureGuildWeeklyActivityPanelTableAsync();
-        await _db.EnsureGuildDailyReactionPostPanelTableAsync();
-        await _db.EnsureGuildWeeklyReactionPostPanelTableAsync();
         await _db.EnsureGuildSettingsColumnsAsync();
         await _db.EnsureRecruitTemplatesTableAsync();
         await _db.EnsureMessageLogPayloadColumnsAsync();
@@ -207,6 +203,22 @@ public sealed class DiscordBotService : IHostedService
     private async Task OnInteractionCreatedAsync(SocketInteraction interaction)
     {
         var context = new SocketInteractionContext(_client, interaction);
+        if (interaction is SocketSlashCommand)
+        {
+            if (context.Guild is null || context.User is not SocketGuildUser guildUser)
+            {
+                await interaction.RespondAsync("このコマンドはサーバー内でのみ使えます。", ephemeral: true);
+                return;
+            }
+
+            if (!IsBotAdmin(guildUser))
+            {
+                var roleName = string.IsNullOrWhiteSpace(_options.AdminRoleName) ? "RaidDC Admin" : _options.AdminRoleName;
+                await interaction.RespondAsync($"{roleName} ロールが必要です。", ephemeral: true);
+                return;
+            }
+        }
+
         var result = await _interactions.ExecuteCommandAsync(context, _services);
         await LogCommandExecutionAsync(context, result);
         if (!result.IsSuccess)
@@ -507,13 +519,11 @@ public sealed class DiscordBotService : IHostedService
             if (_options.DailyActivityRankingEnabled)
             {
                 await TryPostDailyActivityRankingAsync(nowUtc);
-                await TryPostDailyReactionRankingAsync(nowUtc);
             }
 
             if (_options.VoiceWeeklyRankingEnabled)
             {
                 await TryPostWeeklyVoiceRankingAsync(nowUtc);
-                await TryPostWeeklyReactionRankingAsync(nowUtc);
             }
         }
         catch (Exception ex)
@@ -950,7 +960,7 @@ public sealed class DiscordBotService : IHostedService
 
     private async Task TryPostDailyActivityRankingAsync(DateTimeOffset nowUtc)
     {
-        var topCount = Math.Clamp(_options.DailyActivityRankingTopCount, 1, 20);
+        var topCount = Math.Clamp(_options.DailyActivityRankingTopCount, 1, 10);
         var intervalMinutes = Math.Clamp(_options.DailyActivityRankingUpdateIntervalMinutes, 5, 180);
         var nowJst = nowUtc.ToOffset(JapanTimeOffset);
         var slotKey = (int)(nowJst.ToUnixTimeSeconds() / (intervalMinutes * 60L));
@@ -996,58 +1006,10 @@ public sealed class DiscordBotService : IHostedService
         }
     }
 
-    private async Task TryPostDailyReactionRankingAsync(DateTimeOffset nowUtc)
-    {
-        var topCount = Math.Clamp(_options.DailyActivityRankingTopCount, 1, 20);
-        var intervalMinutes = Math.Clamp(_options.DailyActivityRankingUpdateIntervalMinutes, 5, 180);
-        var nowJst = nowUtc.ToOffset(JapanTimeOffset);
-        var slotKey = (int)(nowJst.ToUnixTimeSeconds() / (intervalMinutes * 60L));
-        var dayStartJst = new DateTimeOffset(nowJst.Year, nowJst.Month, nowJst.Day, 0, 0, 0, JapanTimeOffset);
-        var fromUtc = dayStartJst.ToUniversalTime();
-
-        foreach (var guild in _client.Guilds)
-        {
-            if (_dailyReactionRankingPosted.TryGetValue(guild.Id, out var postedSlot) && postedSlot == slotKey)
-            {
-                continue;
-            }
-
-            var panel = await _db.GetGuildDailyReactionPostPanelAsync(guild.Id);
-            if (panel is null || panel.ChannelId == 0)
-            {
-                continue;
-            }
-
-            var channel = guild.GetTextChannel(ToUlong(panel.ChannelId));
-            if (channel is null)
-            {
-                continue;
-            }
-
-            try
-            {
-                var embed = await _voiceStats.BuildReactionPostRankingEmbedAsync(guild, fromUtc, nowUtc, topCount, "今日のリアクション獲得ランキング");
-                var message = await UpsertDailyActivityRankingMessageAsync(guild, channel, panel.MessageId == 0 ? 0 : ToUlong(panel.MessageId), nowJst, embed);
-                await _db.UpsertGuildDailyReactionPostPanelAsync(guild.Id, channel.Id, message.Id);
-                _dailyReactionRankingPosted[guild.Id] = slotKey;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Failed to post daily reaction ranking. GuildId={GuildId}", guild.Id);
-                await NotifyFailureAsync(
-                    guild,
-                    "daily-reaction-ranking-update",
-                    "障害通知: 今日リアクション獲得ランキング更新失敗",
-                    $"チャンネル: <#{channel.Id}>",
-                    ex);
-            }
-        }
-    }
-
     private async Task TryPostWeeklyVoiceRankingAsync(DateTimeOffset nowUtc)
     {
         var rangeDays = Math.Clamp(_options.VoiceWeeklyRankingRangeDays, 1, 30);
-        var topCount = Math.Clamp(_options.VoiceWeeklyRankingTopCount, 1, 20);
+        var topCount = Math.Clamp(_options.VoiceWeeklyRankingTopCount, 1, 10);
         var targetHour = Math.Clamp(_options.VoiceWeeklyRankingPostHourJst, 0, 23);
         var targetDay = Math.Clamp(_options.VoiceWeeklyRankingPostDayOfWeekJst, 0, 6);
 
@@ -1112,80 +1074,6 @@ public sealed class DiscordBotService : IHostedService
                     guild,
                     "weekly-ranking-update",
                     "障害通知: 週間ランキング更新失敗",
-                    $"チャンネル: <#{channel.Id}>",
-                    ex);
-            }
-        }
-    }
-
-    private async Task TryPostWeeklyReactionRankingAsync(DateTimeOffset nowUtc)
-    {
-        var rangeDays = Math.Clamp(_options.VoiceWeeklyRankingRangeDays, 1, 30);
-        var topCount = Math.Clamp(_options.VoiceWeeklyRankingTopCount, 1, 20);
-        var targetHour = Math.Clamp(_options.VoiceWeeklyRankingPostHourJst, 0, 23);
-        var targetDay = Math.Clamp(_options.VoiceWeeklyRankingPostDayOfWeekJst, 0, 6);
-
-        var nowJst = nowUtc.ToOffset(JapanTimeOffset);
-        if ((int)nowJst.DayOfWeek != targetDay || nowJst.Hour != targetHour)
-        {
-            return;
-        }
-
-        var week = ISOWeek.GetWeekOfYear(nowJst.DateTime);
-        var year = ISOWeek.GetYear(nowJst.DateTime);
-        var weekKey = (year * 100) + week;
-
-        foreach (var guild in _client.Guilds)
-        {
-            if (_weeklyReactionRankingPosted.TryGetValue(guild.Id, out var postedWeek) && postedWeek == weekKey)
-            {
-                continue;
-            }
-
-            var panel = await _db.GetGuildWeeklyReactionPostPanelAsync(guild.Id);
-            IMessageChannel? channel = null;
-            if (panel is not null && panel.ChannelId != 0)
-            {
-                channel = guild.GetTextChannel(ToUlong(panel.ChannelId));
-            }
-
-            channel ??= await ResolveActivityRankingChannelAsync(guild);
-            if (channel is null)
-            {
-                continue;
-            }
-
-            try
-            {
-                var periodEndJst = new DateTimeOffset(nowJst.Year, nowJst.Month, nowJst.Day, 0, 0, 0, JapanTimeOffset);
-                var periodStartJst = periodEndJst.AddDays(-rangeDays);
-                if (guild.CreatedAt.ToOffset(JapanTimeOffset) > periodStartJst)
-                {
-                    _logger.LogInformation(
-                        "Skip weekly reaction ranking because full range has not elapsed yet. GuildId={GuildId}, PeriodStartJst={PeriodStartJst}, GuildCreatedAt={GuildCreatedAt}",
-                        guild.Id,
-                        periodStartJst,
-                        guild.CreatedAt);
-                    continue;
-                }
-
-                var embed = await _voiceStats.BuildReactionPostRankingEmbedAsync(
-                    guild,
-                    periodStartJst.ToUniversalTime(),
-                    periodEndJst.ToUniversalTime(),
-                    topCount,
-                    "週間リアクション獲得ランキング");
-                var message = await channel.SendMessageAsync(embed: embed, flags: MessageFlags.SuppressNotification);
-                await _db.UpsertGuildWeeklyReactionPostPanelAsync(guild.Id, channel.Id, message.Id);
-                _weeklyReactionRankingPosted[guild.Id] = weekKey;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Failed to post weekly reaction ranking. GuildId={GuildId}", guild.Id);
-                await NotifyFailureAsync(
-                    guild,
-                    "weekly-reaction-ranking-update",
-                    "障害通知: 週間リアクション獲得ランキング更新失敗",
                     $"チャンネル: <#{channel.Id}>",
                     ex);
             }
@@ -3114,6 +3002,18 @@ public sealed class DiscordBotService : IHostedService
 
     private static ulong ToUlong(long value) => unchecked((ulong)value);
     private static long ToDbId(ulong value) => unchecked((long)value);
+    private bool IsBotAdmin(SocketGuildUser guildUser)
+    {
+        if (guildUser.GuildPermissions.Administrator)
+        {
+            return true;
+        }
+
+        var roleName = string.IsNullOrWhiteSpace(_options.AdminRoleName) ? "RaidDC Admin" : _options.AdminRoleName;
+        return guildUser.Roles.Any(role =>
+            string.Equals(role.Name, roleName, StringComparison.OrdinalIgnoreCase));
+    }
+
     private static IRole? ResolveRole(SocketGuild guild, long roleId, string? roleName)
     {
         if (roleId != 0)

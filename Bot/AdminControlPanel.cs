@@ -10,6 +10,7 @@ public static class AdminControlPanel
     public const string HealthCheckCustomId = "admin_health_check";
     public const string ToggleRegistrationApprovalCustomId = "admin_toggle_registration_approval";
     public const string ToggleInactiveAutoKickCustomId = "admin_toggle_inactive_auto_kick";
+    public const string ResyncPanelsCustomId = "settings_panels_resync";
 
     public static MessageComponent BuildComponents(bool registrationApprovalRequired, bool inactiveAutoKickEnabled)
     {
@@ -24,6 +25,7 @@ public static class AdminControlPanel
             .WithButton("ヘルスチェック", HealthCheckCustomId, ButtonStyle.Secondary, row: 0)
             .WithButton(statusLabel, ToggleRegistrationApprovalCustomId, statusStyle, row: 1)
             .WithButton(autoKickLabel, ToggleInactiveAutoKickCustomId, autoKickStyle, row: 1)
+            .WithButton("パネル再同期", ResyncPanelsCustomId, ButtonStyle.Secondary, row: 1)
             .Build();
     }
 }

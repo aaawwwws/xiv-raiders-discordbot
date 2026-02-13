@@ -929,17 +929,104 @@ GROUP BY channel_id, author_id;";
         DateTimeOffset toUtcExclusive)
     {
         const string sql = @"
-SELECT channel_id AS ChannelId,
-       user_id AS UserId,
+SELECT r.channel_id AS ChannelId,
+       r.user_id AS UserId,
        COUNT(1)::INT AS ReactionCount
-FROM public.user_reaction_logs
-WHERE guild_id = @GuildId
-  AND reacted_at >= @FromUtcInclusive
-  AND reacted_at < @ToUtcExclusive
-GROUP BY channel_id, user_id;";
+FROM public.user_reaction_logs r
+JOIN public.message_logs m
+  ON m.guild_id = r.guild_id
+ AND m.message_id = r.message_id
+WHERE r.guild_id = @GuildId
+  AND r.reacted_at >= @FromUtcInclusive
+  AND r.reacted_at < @ToUtcExclusive
+  AND m.author_id <> 0
+  AND m.author_id <> r.user_id
+GROUP BY r.channel_id, r.user_id;";
 
         await using var conn = CreateConnection();
         var rows = await conn.QueryAsync<ReactionCountByChannel>(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            FromUtcInclusive = fromUtcInclusive,
+            ToUtcExclusive = toUtcExclusive
+        });
+        return rows.ToList();
+    }
+
+    public async Task<IReadOnlyList<ReactionCountByChannel>> ListReactionReceivedCountsByChannelAsync(
+        ulong guildId,
+        DateTimeOffset fromUtcInclusive,
+        DateTimeOffset toUtcExclusive)
+    {
+        const string sql = @"
+SELECT r.channel_id AS ChannelId,
+       m.author_id AS UserId,
+       COUNT(1)::INT AS ReactionCount
+FROM public.user_reaction_logs r
+JOIN public.message_logs m
+  ON m.guild_id = r.guild_id
+ AND m.message_id = r.message_id
+WHERE r.guild_id = @GuildId
+  AND r.reacted_at >= @FromUtcInclusive
+  AND r.reacted_at < @ToUtcExclusive
+  AND m.author_id <> r.user_id
+  AND m.author_id <> 0
+GROUP BY r.channel_id, m.author_id;";
+
+        await using var conn = CreateConnection();
+        var rows = await conn.QueryAsync<ReactionCountByChannel>(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            FromUtcInclusive = fromUtcInclusive,
+            ToUtcExclusive = toUtcExclusive
+        });
+        return rows.ToList();
+    }
+
+    public async Task<IReadOnlyList<ReactionReceivedTopPost>> ListTopReactionReceivedPostsByUserAsync(
+        ulong guildId,
+        DateTimeOffset fromUtcInclusive,
+        DateTimeOffset toUtcExclusive)
+    {
+        const string sql = @"
+WITH per_post AS (
+    SELECT m.author_id AS UserId,
+           MIN(r.channel_id) AS ChannelId,
+           r.message_id AS MessageId,
+           COUNT(1)::INT AS ReactionCount,
+           MAX(r.reacted_at) AS LastReactedAt
+    FROM public.user_reaction_logs r
+    JOIN public.message_logs m
+      ON m.guild_id = r.guild_id
+     AND m.message_id = r.message_id
+    WHERE r.guild_id = @GuildId
+      AND r.reacted_at >= @FromUtcInclusive
+      AND r.reacted_at < @ToUtcExclusive
+      AND m.deleted_at IS NULL
+      AND m.author_id <> 0
+      AND m.author_id <> r.user_id
+    GROUP BY m.author_id, r.message_id
+),
+ranked AS (
+    SELECT UserId,
+           ChannelId,
+           MessageId,
+           ReactionCount,
+           ROW_NUMBER() OVER (
+               PARTITION BY UserId
+               ORDER BY ReactionCount DESC, LastReactedAt DESC, MessageId DESC
+           ) AS rn
+    FROM per_post
+)
+SELECT UserId,
+       ChannelId,
+       MessageId,
+       ReactionCount
+FROM ranked
+WHERE rn = 1;";
+
+        await using var conn = CreateConnection();
+        var rows = await conn.QueryAsync<ReactionReceivedTopPost>(sql, new
         {
             GuildId = ToDbId(guildId),
             FromUtcInclusive = fromUtcInclusive,

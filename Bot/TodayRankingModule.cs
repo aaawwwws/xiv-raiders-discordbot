@@ -27,7 +27,7 @@ public sealed class TodayRankingModule : InteractionModuleBase<SocketInteraction
 
     [RequireBotAdmin]
     [SlashCommand("today", "本日のランキングを0時起点で作成/更新し、自動更新を有効化します")]
-    public async Task SetupTodayRankingAsync([Summary("top", "表示件数(1-20)")] int top = 10)
+    public async Task SetupTodayRankingAsync([Summary("top", "表示件数(1-10)")] int top = 10)
     {
         if (Context.Guild is null)
         {
@@ -46,7 +46,7 @@ public sealed class TodayRankingModule : InteractionModuleBase<SocketInteraction
         var nowUtc = DateTimeOffset.UtcNow;
         var nowJst = nowUtc.ToOffset(JapanTimeOffset);
         var fromUtc = new DateTimeOffset(nowJst.Year, nowJst.Month, nowJst.Day, 0, 0, 0, JapanTimeOffset).ToUniversalTime();
-        var topCount = Math.Clamp(top, 1, 20);
+        var topCount = Math.Clamp(top, 1, 10);
         var embed = await _voiceStats.BuildActivityRankingEmbedAsync(Context.Guild, fromUtc, nowUtc, topCount, "今日のアクティビティランキング");
 
         var panel = await _db.GetGuildDailyActivityPanelAsync(Context.Guild.Id);
