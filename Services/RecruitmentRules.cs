@@ -22,6 +22,7 @@ public static class RecruitmentRules {
         new JobOption("賢", "賢者"),
         new JobOption("学", "学者")
     };
+    private static readonly IReadOnlyList<JobOption> LightPartyH1HealerJobs = H1HealerJobs.Concat(H2HealerJobs).ToArray();
 
     private static readonly IReadOnlyList<JobOption> MeleeJobs = new[]
     {
@@ -80,12 +81,20 @@ public static class RecruitmentRules {
     {
         jobs = Array.Empty<JobOption>();
         if (recruitPositions is not null &&
-            IsLightParty(recruitPositions) &&
-            (string.Equals(position, "D1", StringComparison.OrdinalIgnoreCase) ||
-             string.Equals(position, "D2", StringComparison.OrdinalIgnoreCase)))
+            IsLightParty(recruitPositions))
         {
-            jobs = LightPartyDpsJobs;
-            return true;
+            if (string.Equals(position, "H1", StringComparison.OrdinalIgnoreCase))
+            {
+                jobs = LightPartyH1HealerJobs;
+                return true;
+            }
+
+            if (string.Equals(position, "D1", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(position, "D2", StringComparison.OrdinalIgnoreCase))
+            {
+                jobs = LightPartyDpsJobs;
+                return true;
+            }
         }
 
         return TryGetJobs(position, out jobs);
