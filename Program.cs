@@ -59,6 +59,7 @@ builder.Services.AddSingleton<RecruitCommentEditContextTracker>();
 builder.Services.AddSingleton<RecruitCreateDraftContextTracker>();
 builder.Services.AddSingleton<RecruitPostEditContextTracker>();
 builder.Services.AddSingleton<MemberRegistrationDraftContextTracker>();
+builder.Services.AddSingleton<LotteryCreateDraftContextTracker>();
 
 var discordOptions = builder.Configuration.GetSection("Discord").Get<DiscordOptions>() ?? new DiscordOptions();
 

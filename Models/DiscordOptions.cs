@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 
 namespace RaidDcBot.Models;
 
@@ -33,7 +34,9 @@ public sealed class DiscordOptions
     public int TempVoiceAutoDeleteDelaySeconds { get; init; } = 10;
     public bool RecruitFeatureEnabled { get; init; } = false;
     public string RecruitPostChannelName { get; init; } = string.Empty;
+    public string LotteryPostChannelName { get; init; } = "抽選";
     public bool RecruitAutoCloseEnabled { get; init; } = true;
+    public bool RecruitDisallowDuplicateJobs { get; init; } = true;
     public int RecruitReminderMinutesBefore { get; init; } = 30;
     public int RecruitScheduleCheckIntervalSeconds { get; init; } = 60;
     public string ActivityRankingChannelName { get; init; } = "ランキング";
@@ -57,7 +60,8 @@ public sealed class DiscordOptions
     public int ActivityRoleSyncIntervalMinutes { get; init; } = 30;
     public bool InactiveAutoKickEnabled { get; init; } = true;
     public int InactiveAutoKickDays { get; init; } = 30;
-    public string[] InactiveAutoKickExemptRoleNames { get; init; } = ["管理者", "オフィサー", "宣伝係"];
+    public string[] ManagementRoleNames { get; init; } = ["管理者", "オフィサー", "宣伝係"];
+    public string[] InactiveAutoKickExemptRoleNames { get; init; } = Array.Empty<string>();
     public bool ApplyChannelPermissionOverwritesOnStartup { get; init; }
     public bool ControlChannelMemberCanSend { get; init; }
     public string TempVoiceLobbyName { get; init; } = "VC作成";
@@ -65,4 +69,27 @@ public sealed class DiscordOptions
     public string TempVoiceChannelPrefix { get; init; } = "VC-";
     public int TempVoiceUserLimit { get; init; }
     public string ControlChannelName { get; init; } = "bot-control";
+
+    public HashSet<string> BuildManagementRoleNameSet()
+    {
+        var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var source = ManagementRoleNames is { Length: > 0 }
+            ? ManagementRoleNames
+            : InactiveAutoKickExemptRoleNames;
+
+        foreach (var roleName in source ?? Array.Empty<string>())
+        {
+            if (!string.IsNullOrWhiteSpace(roleName))
+            {
+                names.Add(roleName.Trim());
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(AdminRoleName))
+        {
+            names.Add(AdminRoleName.Trim());
+        }
+
+        return names;
+    }
 }

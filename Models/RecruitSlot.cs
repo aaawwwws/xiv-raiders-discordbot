@@ -6,6 +6,8 @@ public sealed class RecruitSlot
     public int PostId { get; set; }
     public string Position { get; set; } = string.Empty;
     public string? RequiredJob { get; set; }
+    public string? FlexSpec { get; set; }
+    public string? FlexJobsSpec { get; set; }
     public string? Job { get; set; }
     public long? UserId { get; set; }
     public string? UserName { get; set; }

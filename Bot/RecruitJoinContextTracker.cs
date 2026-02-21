@@ -1,8 +1,16 @@
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 
 namespace RaidDcBot.Bot;
 
-public sealed record RecruitJoinContext(ulong MessageId, string Position, string Job, DateTimeOffset CreatedAt);
+public sealed record RecruitJoinContext(
+    ulong MessageId,
+    string Position,
+    string Job,
+    DateTimeOffset CreatedAt,
+    IReadOnlyList<string>? CandidatePositions = null,
+    string? RequestedLabel = null,
+    IReadOnlyList<string>? CandidateJobs = null);
 
 public sealed class RecruitJoinContextTracker
 {

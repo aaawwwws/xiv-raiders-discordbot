@@ -133,8 +133,8 @@ public sealed class VoiceStatsService {
             .Take(reactionReceivedTopLimit)
             .ToList();
         var totalMessages = Math.Max(0, nonAdminMessageCounts.Values.Sum());
-        var totalReactionGiven = Math.Max(0, nonAdminReactionGivenCounts.Values.Sum());
-        var totalReactionReceived = Math.Max(0, nonAdminReactionReceivedCounts.Values.Sum());
+        var reactorUserCount = nonAdminReactionGivenCounts.Count;
+        var reactedUserCount = nonAdminReactionReceivedCounts.Count;
 
         var fromJst = fromUtc.ToOffset(TimeSpan.FromHours(9));
         var toJst = toUtc.ToOffset(TimeSpan.FromHours(9));
@@ -152,8 +152,8 @@ public sealed class VoiceStatsService {
                 $"👥 **アクティブ人数**: `{activeUsers.Count}人`\n" +
                 $"🎙️ **VC合計**: `{FormatDuration(totalVcSeconds)}`\n" +
                 $"💬 **発言合計**: `{totalMessages}件`\n" +
-                $"👏 **付与リアクション合計**: `{totalReactionGiven}件`\n" +
-                $"🎯 **被リアクション合計**: `{totalReactionReceived}件`");
+                $"👏 **リアクションした人数**: `{reactorUserCount}人`\n" +
+                $"🎯 **リアクションされた人数**: `{reactedUserCount}人`");
 
         var vcLines = new List<string>();
         for (var i = 0; i < vcTop.Count; i++) {
@@ -209,7 +209,7 @@ public sealed class VoiceStatsService {
         builder.AddField("🎙️ VC滞在 TOP", JoinLinesWithinLimit(vcLines));
         builder.AddField("💬 発言数 TOP", JoinLinesWithinLimit(messageLines));
         builder.AddField("👏 リアクション付与 TOP", JoinLinesWithinLimit(reactionGivenLines));
-        builder.AddField("🎯 リアクション獲得数TOP5", JoinLinesWithinLimit(reactionReceivedLines));
+        builder.AddField("🎯 リアクション獲得数 TOP", JoinLinesWithinLimit(reactionReceivedLines));
         builder.WithFooter("Raid DC Activity");
         return builder.Build();
     }

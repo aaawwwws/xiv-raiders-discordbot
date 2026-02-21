@@ -178,7 +178,7 @@ public sealed class SettingsPanelModule : InteractionModuleBase<SocketInteractio
                 Context.Guild,
                 await _db.GetGuildRecruitPanelAsync(Context.Guild.Id),
                 fallbackChannel,
-                null,
+                RecruitmentPanel.PanelMessage,
                 RecruitmentPanel.BuildPanelComponents()))
         {
             updated++;

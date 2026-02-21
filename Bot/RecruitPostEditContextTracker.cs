@@ -2,7 +2,16 @@ using System.Collections.Concurrent;
 
 namespace RaidDcBot.Bot;
 
-public sealed record RecruitPostEditContext(ulong MessageId, DateTimeOffset CreatedAt);
+public sealed record RecruitPostEditContext(
+    ulong GuildId,
+    ulong ChannelId,
+    ulong MessageId,
+    string? Title,
+    string? DataCenter,
+    string? Schedule,
+    DateTimeOffset? ScheduleAt,
+    string? Note,
+    DateTimeOffset CreatedAt);
 
 public sealed class RecruitPostEditContextTracker
 {
@@ -10,6 +19,9 @@ public sealed class RecruitPostEditContextTracker
 
     public void Set(ulong userId, RecruitPostEditContext context)
         => _contexts[userId] = context;
+
+    public bool TryGet(ulong userId, out RecruitPostEditContext context)
+        => _contexts.TryGetValue(userId, out context!);
 
     public bool TryRemove(ulong userId, out RecruitPostEditContext context)
         => _contexts.TryRemove(userId, out context!);

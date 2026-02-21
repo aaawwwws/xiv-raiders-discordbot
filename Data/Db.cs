@@ -2,6 +2,7 @@ using Dapper;
 using Microsoft.Extensions.Options;
 using Npgsql;
 using RaidDcBot.Models;
+using RaidDcBot.Services;
 
 namespace RaidDcBot.Data;
 
@@ -28,6 +29,73 @@ public sealed class Db
         const string sql = @"
 ALTER TABLE IF EXISTS recruit_slots
 ADD COLUMN IF NOT EXISTS required_job TEXT NULL;";
+
+        await using var conn = CreateConnection();
+        await conn.ExecuteAsync(sql);
+    }
+
+    public async Task ApplyRecruitDuplicateJobDiffSqlAsync()
+    {
+        const string sql = @"
+ALTER TABLE IF EXISTS recruit_posts
+ADD COLUMN IF NOT EXISTS disallow_duplicate_jobs BOOLEAN NOT NULL DEFAULT TRUE;
+
+DROP INDEX IF EXISTS ux_recruit_slots_job;";
+
+        await using var conn = CreateConnection();
+        await conn.ExecuteAsync(sql);
+    }
+
+    public async Task EnsureRecruitHostFlexSpecColumnAsync()
+    {
+        const string sql = @"
+ALTER TABLE IF EXISTS recruit_posts
+ADD COLUMN IF NOT EXISTS host_flex_spec TEXT NULL;";
+
+        await using var conn = CreateConnection();
+        await conn.ExecuteAsync(sql);
+    }
+
+    public async Task EnsureRecruitHostFlexJobsSpecColumnAsync()
+    {
+        const string sql = @"
+ALTER TABLE IF EXISTS recruit_posts
+ADD COLUMN IF NOT EXISTS host_flex_jobs_spec TEXT NULL;";
+
+        await using var conn = CreateConnection();
+        await conn.ExecuteAsync(sql);
+    }
+
+    public async Task EnsureRecruitSlotFlexSpecColumnAsync()
+    {
+        const string sql = @"
+ALTER TABLE IF EXISTS recruit_slots
+ADD COLUMN IF NOT EXISTS flex_spec TEXT NULL;";
+
+        await using var conn = CreateConnection();
+        await conn.ExecuteAsync(sql);
+    }
+
+    public async Task EnsureRecruitSlotFlexJobsSpecColumnAsync()
+    {
+        const string sql = @"
+ALTER TABLE IF EXISTS recruit_slots
+ADD COLUMN IF NOT EXISTS flex_jobs_spec TEXT NULL;";
+
+        await using var conn = CreateConnection();
+        await conn.ExecuteAsync(sql);
+    }
+
+    public async Task BackfillRecruitSlotFlexJobsSpecAsync()
+    {
+        const string sql = @"
+UPDATE recruit_slots
+SET flex_jobs_spec = UPPER(TRIM(job)),
+    updated_at = NOW()
+WHERE flex_spec IS NOT NULL
+  AND flex_jobs_spec IS NULL
+  AND job IS NOT NULL
+  AND TRIM(job) <> '';";
 
         await using var conn = CreateConnection();
         await conn.ExecuteAsync(sql);
@@ -250,6 +318,143 @@ ON public.user_reaction_logs (guild_id, reacted_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_user_reaction_logs_user
 ON public.user_reaction_logs (user_id);";
+
+        await using var conn = CreateConnection();
+        await conn.ExecuteAsync(sql);
+    }
+
+    public async Task EnsureInquiryTicketsTableAsync()
+    {
+        const string sql = @"
+CREATE TABLE IF NOT EXISTS public.inquiry_tickets (
+    id SERIAL PRIMARY KEY,
+    guild_id BIGINT NOT NULL,
+    channel_id BIGINT NOT NULL UNIQUE,
+    requester_user_id BIGINT NOT NULL,
+    requester_name TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    status TEXT NOT NULL,
+    assigned_admin_user_id BIGINT NULL,
+    assigned_admin_name TEXT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_activity_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    closed_at TIMESTAMPTZ NULL,
+    last_reminder_at TIMESTAMPTZ NULL,
+    transcript_text TEXT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_inquiry_tickets_guild_status
+ON public.inquiry_tickets (guild_id, status, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_inquiry_tickets_last_activity
+ON public.inquiry_tickets (last_activity_at ASC)
+WHERE status <> 'CLOSED';
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_inquiry_tickets_open_requester
+ON public.inquiry_tickets (guild_id, requester_user_id)
+WHERE status <> 'CLOSED';";
+
+        await using var conn = CreateConnection();
+        await conn.ExecuteAsync(sql);
+    }
+
+    public async Task EnsureLotteryTablesAsync()
+    {
+        const string sql = @"
+CREATE TABLE IF NOT EXISTS public.lotteries (
+    id SERIAL PRIMARY KEY,
+    guild_id BIGINT NOT NULL,
+    channel_id BIGINT NOT NULL,
+    message_id BIGINT NULL UNIQUE,
+    participant_role_id BIGINT NULL,
+    participant_role_delete_at TIMESTAMPTZ NULL,
+    title TEXT NOT NULL,
+    description TEXT NULL,
+    prize_list TEXT NULL,
+    allow_duplicate_winners BOOLEAN NOT NULL DEFAULT FALSE,
+    winner_count INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    close_at TIMESTAMPTZ NOT NULL,
+    created_by_user_id BIGINT NOT NULL,
+    created_by_name TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    drawn_at TIMESTAMPTZ NULL,
+    canceled_at TIMESTAMPTZ NULL
+);
+
+ALTER TABLE IF EXISTS public.lotteries
+ADD COLUMN IF NOT EXISTS prize_list TEXT NULL;
+
+ALTER TABLE IF EXISTS public.lotteries
+ADD COLUMN IF NOT EXISTS allow_duplicate_winners BOOLEAN NOT NULL DEFAULT FALSE;
+
+ALTER TABLE IF EXISTS public.lotteries
+ADD COLUMN IF NOT EXISTS participant_role_id BIGINT NULL;
+
+ALTER TABLE IF EXISTS public.lotteries
+ADD COLUMN IF NOT EXISTS participant_role_delete_at TIMESTAMPTZ NULL;
+
+CREATE INDEX IF NOT EXISTS idx_lotteries_guild_status
+ON public.lotteries (guild_id, status, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_lotteries_close_at
+ON public.lotteries (status, close_at ASC);
+
+CREATE TABLE IF NOT EXISTS public.lottery_entries (
+    id SERIAL PRIMARY KEY,
+    lottery_id INTEGER NOT NULL REFERENCES public.lotteries(id) ON DELETE CASCADE,
+    user_id BIGINT NOT NULL,
+    user_name TEXT NOT NULL,
+    joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT ux_lottery_entries UNIQUE (lottery_id, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_lottery_entries_lottery
+ON public.lottery_entries (lottery_id, joined_at ASC);
+
+CREATE TABLE IF NOT EXISTS public.lottery_winners (
+    id SERIAL PRIMARY KEY,
+    lottery_id INTEGER NOT NULL REFERENCES public.lotteries(id) ON DELETE CASCADE,
+    user_id BIGINT NOT NULL,
+    user_name TEXT NOT NULL,
+    winner_order INTEGER NOT NULL,
+    drawn_by_user_id BIGINT NOT NULL,
+    drawn_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+ALTER TABLE IF EXISTS public.lottery_winners
+DROP CONSTRAINT IF EXISTS ux_lottery_winners;
+
+CREATE INDEX IF NOT EXISTS idx_lottery_winners_lottery
+ON public.lottery_winners (lottery_id, winner_order ASC);
+
+CREATE TABLE IF NOT EXISTS public.lottery_claim_channels (
+    id SERIAL PRIMARY KEY,
+    lottery_id INTEGER NOT NULL REFERENCES public.lotteries(id) ON DELETE CASCADE,
+    user_id BIGINT NOT NULL,
+    channel_id BIGINT NOT NULL,
+    control_message_id BIGINT NULL,
+    is_closed BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    closed_at TIMESTAMPTZ NULL,
+    CONSTRAINT ux_lottery_claim_channels UNIQUE (lottery_id, user_id)
+);
+
+ALTER TABLE IF EXISTS public.lottery_claim_channels
+ADD COLUMN IF NOT EXISTS control_message_id BIGINT NULL;
+
+ALTER TABLE IF EXISTS public.lottery_claim_channels
+ADD COLUMN IF NOT EXISTS is_closed BOOLEAN NOT NULL DEFAULT FALSE;
+
+ALTER TABLE IF EXISTS public.lottery_claim_channels
+ADD COLUMN IF NOT EXISTS closed_at TIMESTAMPTZ NULL;
+
+CREATE INDEX IF NOT EXISTS idx_lottery_claim_channels_channel
+ON public.lottery_claim_channels (channel_id);";
 
         await using var conn = CreateConnection();
         await conn.ExecuteAsync(sql);
@@ -820,6 +1025,51 @@ WHERE reacted_at < NOW() - (@Days * INTERVAL '1 day');";
         return await conn.ExecuteAsync(sql, new { Days = retentionDays });
     }
 
+    public async Task<IReadOnlyList<RecruitPost>> ListRecruitPostsPastRetentionAsync(DateTimeOffset cutoffUtc)
+    {
+        const string sql = @"
+SELECT id AS Id,
+       guild_id AS GuildId,
+       channel_id AS ChannelId,
+       message_id AS MessageId,
+       thread_channel_id AS ThreadChannelId,
+       thread_message_id AS ThreadMessageId,
+       status AS Status,
+       closed_at AS ClosedAt,
+       creator_user_id AS CreatorUserId,
+       title AS Title,
+       data_center AS DataCenter,
+       schedule_text AS ScheduleText,
+       schedule_at AS ScheduleAt,
+       reminder_sent_at AS ReminderSentAt,
+       note AS Note,
+       disallow_duplicate_jobs AS DisallowDuplicateJobs,
+       host_flex_spec AS HostFlexSpec,
+       host_flex_jobs_spec AS HostFlexJobsSpec,
+       created_at AS CreatedAt,
+       updated_at AS UpdatedAt
+FROM recruit_posts
+WHERE status IN (2, 3)
+  AND COALESCE(closed_at, updated_at) <= @CutoffUtc
+ORDER BY COALESCE(closed_at, updated_at) ASC
+LIMIT 200;";
+
+        await using var conn = CreateConnection();
+        var rows = await conn.QueryAsync<RecruitPost>(sql, new { CutoffUtc = cutoffUtc });
+        return rows.ToList();
+    }
+
+    public async Task<bool> DeleteRecruitPostAsync(int postId)
+    {
+        const string sql = @"
+DELETE FROM recruit_posts
+WHERE id = @PostId;";
+
+        await using var conn = CreateConnection();
+        var affected = await conn.ExecuteAsync(sql, new { PostId = postId });
+        return affected > 0;
+    }
+
     public async Task<IReadOnlyList<VoiceDurationSummary>> ListVoiceDurationSummaryAsync(
         ulong guildId,
         DateTimeOffset fromUtcInclusive,
@@ -1314,12 +1564,17 @@ WHERE lodestone_id = @LodestoneId;";
         string? scheduleText,
         DateTimeOffset? scheduleAt,
         string? note,
+        bool disallowDuplicateJobs,
+        string? hostFlexSpec,
+        string? hostFlexJobsSpec,
         IReadOnlyList<string> positions,
-        IReadOnlyDictionary<string, string>? requiredJobs = null)
+        IReadOnlyDictionary<string, string>? requiredJobs = null,
+        IReadOnlyDictionary<string, string>? preFilledSlots = null,
+        RecruitPostStatus status = RecruitPostStatus.Open)
     {
         const string insertPostSql = @"
-INSERT INTO recruit_posts (guild_id, channel_id, message_id, creator_user_id, title, data_center, schedule_text, schedule_at, note)
-VALUES (@GuildId, @ChannelId, @MessageId, @CreatorUserId, @Title, @DataCenter, @ScheduleText, @ScheduleAt, @Note)
+INSERT INTO recruit_posts (guild_id, channel_id, message_id, creator_user_id, title, data_center, schedule_text, schedule_at, note, disallow_duplicate_jobs, host_flex_spec, host_flex_jobs_spec, status)
+VALUES (@GuildId, @ChannelId, @MessageId, @CreatorUserId, @Title, @DataCenter, @ScheduleText, @ScheduleAt, @Note, @DisallowDuplicateJobs, @HostFlexSpec, @HostFlexJobsSpec, @Status)
 RETURNING id AS Id,
           guild_id AS GuildId,
           channel_id AS ChannelId,
@@ -1335,12 +1590,15 @@ RETURNING id AS Id,
           schedule_at AS ScheduleAt,
           reminder_sent_at AS ReminderSentAt,
           note AS Note,
+          disallow_duplicate_jobs AS DisallowDuplicateJobs,
+          host_flex_spec AS HostFlexSpec,
+          host_flex_jobs_spec AS HostFlexJobsSpec,
           created_at AS CreatedAt,
           updated_at AS UpdatedAt;";
 
         const string insertSlotSql = @"
-INSERT INTO recruit_slots (post_id, position, required_job)
-VALUES (@PostId, @Position, @RequiredJob);";
+INSERT INTO recruit_slots (post_id, position, required_job, job, is_closed)
+VALUES (@PostId, @Position, @RequiredJob, @Job, @IsClosed);";
 
         await using var conn = CreateConnection();
         await conn.OpenAsync();
@@ -1356,7 +1614,11 @@ VALUES (@PostId, @Position, @RequiredJob);";
             DataCenter = NullIfBlank(dataCenter),
             ScheduleText = NullIfBlank(scheduleText),
             ScheduleAt = scheduleAt,
-            Note = NullIfBlank(note)
+            Note = NullIfBlank(note),
+            DisallowDuplicateJobs = disallowDuplicateJobs,
+            HostFlexSpec = NormalizeFlexSpec(hostFlexSpec),
+            HostFlexJobsSpec = NormalizeFlexJobsSpec(hostFlexJobsSpec),
+            Status = (short)status
         }, transaction: tx);
 
         foreach (var position in positions)
@@ -1367,11 +1629,23 @@ VALUES (@PostId, @Position, @RequiredJob);";
                 requiredJob = selected;
             }
 
+            string? preFilledJob = null;
+            var isClosed = false;
+            if (preFilledSlots is not null &&
+                preFilledSlots.TryGetValue(position, out var selectedPrefilled) &&
+                !string.IsNullOrWhiteSpace(selectedPrefilled))
+            {
+                preFilledJob = selectedPrefilled;
+                isClosed = true;
+            }
+
             await conn.ExecuteAsync(insertSlotSql, new
             {
                 PostId = post.Id,
                 Position = position,
-                RequiredJob = NullIfBlank(requiredJob)
+                RequiredJob = NullIfBlank(requiredJob),
+                Job = NullIfBlank(preFilledJob),
+                IsClosed = isClosed
             }, transaction: tx);
         }
 
@@ -1507,6 +1781,9 @@ SELECT id AS Id,
        schedule_at AS ScheduleAt,
        reminder_sent_at AS ReminderSentAt,
        note AS Note,
+       disallow_duplicate_jobs AS DisallowDuplicateJobs,
+       host_flex_spec AS HostFlexSpec,
+       host_flex_jobs_spec AS HostFlexJobsSpec,
        created_at AS CreatedAt,
        updated_at AS UpdatedAt
 FROM recruit_posts
@@ -1601,6 +1878,8 @@ SELECT id AS Id,
        post_id AS PostId,
        position AS Position,
        required_job AS RequiredJob,
+       flex_spec AS FlexSpec,
+       flex_jobs_spec AS FlexJobsSpec,
        job AS Job,
        user_id AS UserId,
        user_name AS UserName,
@@ -1625,6 +1904,8 @@ SELECT id AS Id,
        post_id AS PostId,
        position AS Position,
        required_job AS RequiredJob,
+       flex_spec AS FlexSpec,
+       flex_jobs_spec AS FlexJobsSpec,
        job AS Job,
        user_id AS UserId,
        user_name AS UserName,
@@ -1646,10 +1927,22 @@ LIMIT 1;";
         });
     }
 
-    public async Task<RecruitAssignStatus> AssignRecruitSlotAsync(int postId, string position, ulong userId, string userName, string job, string comment)
+    public async Task<RecruitAssignStatus> AssignRecruitSlotAsync(
+        int postId,
+        string position,
+        ulong userId,
+        string userName,
+        string job,
+        string comment,
+        bool disallowDuplicateJobs = true,
+        string? flexSpec = null,
+        string? flexJobsSpec = null)
     {
         const string selectPostSql = @"
-SELECT status
+SELECT status AS Status,
+       creator_user_id AS CreatorUserId,
+       host_flex_spec AS HostFlexSpec,
+       host_flex_jobs_spec AS HostFlexJobsSpec
 FROM recruit_posts
 WHERE id = @PostId
 FOR UPDATE;";
@@ -1659,6 +1952,8 @@ SELECT id AS Id,
        post_id AS PostId,
        position AS Position,
        required_job AS RequiredJob,
+       flex_spec AS FlexSpec,
+       flex_jobs_spec AS FlexJobsSpec,
        job AS Job,
        user_id AS UserId,
        user_name AS UserName,
@@ -1675,6 +1970,8 @@ FOR UPDATE;";
 UPDATE recruit_slots
 SET user_id = NULL,
     user_name = NULL,
+    flex_spec = NULL,
+    flex_jobs_spec = NULL,
     job = NULL,
     comment = NULL,
     is_closed = FALSE,
@@ -1687,6 +1984,8 @@ WHERE id = @Id;";
 UPDATE recruit_slots
 SET user_id = @UserId,
     user_name = @UserName,
+    flex_spec = @FlexSpec,
+    flex_jobs_spec = @FlexJobsSpec,
     job = @Job,
     comment = @Comment,
     is_closed = FALSE,
@@ -1694,12 +1993,33 @@ SET user_id = @UserId,
     updated_at = NOW()
 WHERE id = @Id;";
 
+        const string closeFlexSlotSql = @"
+UPDATE recruit_slots
+SET user_id = NULL,
+    user_name = NULL,
+    flex_spec = @FlexSpec,
+    flex_jobs_spec = @FlexJobsSpec,
+    job = @Job,
+    comment = NULL,
+    is_closed = TRUE,
+    thread_message_id = NULL,
+    joined_at = NOW(),
+    updated_at = NOW()
+WHERE id = @Id;";
+
+        const string clearHostFlexSql = @"
+UPDATE recruit_posts
+SET host_flex_spec = NULL,
+    host_flex_jobs_spec = NULL,
+    updated_at = NOW()
+WHERE id = @PostId;";
+
         await using var conn = CreateConnection();
         await conn.OpenAsync();
         await using var tx = await conn.BeginTransactionAsync();
 
-        var statusValue = await conn.ExecuteScalarAsync<short?>(selectPostSql, new { PostId = postId }, transaction: tx);
-        if (!statusValue.HasValue)
+        var postInfo = await conn.QuerySingleOrDefaultAsync<RecruitPostLockInfo>(selectPostSql, new { PostId = postId }, transaction: tx);
+        if (postInfo is null)
         {
             await tx.RollbackAsync();
             return RecruitAssignStatus.PostNotFound;
@@ -1712,7 +2032,7 @@ WHERE id = @Id;";
             return RecruitAssignStatus.PostNotFound;
         }
 
-        var status = (RecruitPostStatus)statusValue.Value;
+        var status = (RecruitPostStatus)postInfo.Status;
         var userDbId = ToDbId(userId);
         if (status != RecruitPostStatus.Open)
         {
@@ -1731,16 +2051,10 @@ WHERE id = @Id;";
             return RecruitAssignStatus.PositionNotFound;
         }
 
-        if (target.IsClosed && (!target.UserId.HasValue || target.UserId.Value != userDbId))
+        if (target.IsClosed && target.UserId.HasValue && target.UserId.Value != userDbId)
         {
             await tx.RollbackAsync();
             return RecruitAssignStatus.PositionClosed;
-        }
-
-        if (target.UserId.HasValue && target.UserId.Value != userDbId)
-        {
-            await tx.RollbackAsync();
-            return RecruitAssignStatus.PositionTaken;
         }
 
         if (!string.IsNullOrWhiteSpace(target.RequiredJob) &&
@@ -1750,26 +2064,530 @@ WHERE id = @Id;";
             return RecruitAssignStatus.JobRestricted;
         }
 
-        var jobTaken = slots.Any(slot =>
-            !string.IsNullOrWhiteSpace(slot.Job) &&
-            string.Equals(slot.Job, job, StringComparison.OrdinalIgnoreCase) &&
-            slot.UserId.HasValue &&
-            slot.UserId.Value != userDbId);
+        var previousSlots = slots
+            .Where(slot =>
+                slot.UserId.HasValue &&
+                slot.UserId.Value == userDbId &&
+                !string.Equals(slot.Position, position, StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        var normalizedFlexSpec = NormalizeFlexSpec(flexSpec);
+        var normalizedFlexJobsSpec = NormalizeFlexJobsSpec(flexJobsSpec);
+        if (string.IsNullOrWhiteSpace(normalizedFlexSpec))
+        {
+            normalizedFlexJobsSpec = null;
+        }
+        var normalizedComment = NullIfBlank(comment);
+        var recruitPositions = slots
+            .Select(slot => slot.Position)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
 
-        if (jobTaken)
+        if (!IsJobAllowedForPosition(target.Position, job, recruitPositions))
         {
             await tx.RollbackAsync();
-            return RecruitAssignStatus.JobTaken;
+            return RecruitAssignStatus.JobRestricted;
         }
 
-        var previous = slots.FirstOrDefault(slot =>
-            slot.UserId.HasValue &&
-            slot.UserId.Value == userDbId &&
-            !string.Equals(slot.Position, position, StringComparison.OrdinalIgnoreCase));
+        if (target.IsClosed && !target.UserId.HasValue)
+        {
+            var reopened = await TryReopenClosedFlexTargetForJoinAsync(
+                conn,
+                tx,
+                slots,
+                postInfo,
+                target,
+                recruitPositions,
+                disallowDuplicateJobs,
+                userDbId,
+                clearSlotSql,
+                updateSlotSql,
+                closeFlexSlotSql);
+            if (!reopened)
+            {
+                await tx.RollbackAsync();
+                return RecruitAssignStatus.PositionClosed;
+            }
+        }
 
-        if (previous is not null)
+        // First, attempt a full-party rebalance for every join.
+        // This avoids position-specific heuristics and handles generic FLEX patterns.
+        var rebalancedFirst = await TryRebalanceFlexibleAssignmentsAsync(
+            conn,
+            tx,
+            slots,
+            postInfo,
+            recruitPositions,
+            userDbId,
+            userName,
+            target.Position,
+            job,
+            normalizedComment,
+            normalizedFlexSpec,
+            normalizedFlexJobsSpec,
+            disallowDuplicateJobs,
+            clearSlotSql,
+            updateSlotSql);
+        if (rebalancedFirst)
+        {
+            await NormalizeParticipantFlexSlotsAsync(conn, tx, slots, recruitPositions, postInfo.CreatorUserId, disallowDuplicateJobs);
+
+            if (ShouldFixHostFlexToCurrentPosition(postInfo, slots, recruitPositions))
+            {
+                await conn.ExecuteAsync(clearHostFlexSql, new { PostId = postId }, transaction: tx);
+                postInfo.HostFlexSpec = null;
+                postInfo.HostFlexJobsSpec = null;
+            }
+
+            await conn.ExecuteAsync("UPDATE recruit_posts SET updated_at = NOW() WHERE id = @PostId;", new { PostId = postId }, transaction: tx);
+            await tx.CommitAsync();
+            return RecruitAssignStatus.Success;
+        }
+
+        if (disallowDuplicateJobs)
+        {
+            if (HasReservedClosedJobConflict(slots, job, target.Position))
+            {
+                await tx.RollbackAsync();
+                return RecruitAssignStatus.JobTaken;
+            }
+
+            var duplicateSlots = slots
+                .Where(slot =>
+                    !string.IsNullOrWhiteSpace(slot.Job) &&
+                    string.Equals(slot.Job, job, StringComparison.OrdinalIgnoreCase) &&
+                    slot.UserId.HasValue &&
+                    slot.UserId.Value != userDbId)
+                .ToArray();
+
+            if (duplicateSlots.Length > 0)
+            {
+                var resolvedByMovingFlexibleHost = false;
+                if (duplicateSlots.All(slot => slot.UserId!.Value == postInfo.CreatorUserId))
+                {
+                    var hostCurrentSlot = duplicateSlots[0];
+                    var hostFlexPositions = ParseFlexPositions(postInfo.HostFlexSpec);
+                    var hostFlexJobs = ParseFlexJobsSpec(postInfo.HostFlexJobsSpec);
+                    if (hostFlexJobs.Count == 0 && !string.IsNullOrWhiteSpace(hostCurrentSlot.Job))
+                    {
+                        hostFlexJobs = new[] { hostCurrentSlot.Job.Trim().ToUpperInvariant() };
+                    }
+
+                    if (hostFlexPositions.Count >= 2 &&
+                        hostFlexPositions.Contains(hostCurrentSlot.Position, StringComparer.OrdinalIgnoreCase))
+                    {
+                        RecruitSlot? hostDestinationSlot = null;
+                        string? hostDestinationJob = null;
+                        foreach (var candidatePosition in hostFlexPositions)
+                        {
+                            if (string.Equals(candidatePosition, target.Position, StringComparison.OrdinalIgnoreCase))
+                            {
+                                continue;
+                            }
+
+                            var candidateSlot = slots.FirstOrDefault(slot =>
+                                string.Equals(slot.Position, candidatePosition, StringComparison.OrdinalIgnoreCase));
+                            if (candidateSlot is null || candidateSlot.IsClosed)
+                            {
+                                continue;
+                            }
+
+                            if (candidateSlot.UserId.HasValue &&
+                                candidateSlot.UserId.Value != postInfo.CreatorUserId)
+                            {
+                                continue;
+                            }
+
+                            foreach (var candidateJob in hostFlexJobs)
+                            {
+                                if (string.Equals(candidateJob, job, StringComparison.OrdinalIgnoreCase))
+                                {
+                                    continue;
+                                }
+
+                                if (!IsJobAllowedForPosition(candidatePosition, candidateJob, recruitPositions))
+                                {
+                                    continue;
+                                }
+
+                                if (!string.IsNullOrWhiteSpace(candidateSlot.RequiredJob) &&
+                                    !string.Equals(candidateSlot.RequiredJob, candidateJob, StringComparison.OrdinalIgnoreCase))
+                                {
+                                    continue;
+                                }
+
+                                var duplicateWithOthers = slots.Any(slot =>
+                                    !string.IsNullOrWhiteSpace(slot.Job) &&
+                                    string.Equals(slot.Job, candidateJob, StringComparison.OrdinalIgnoreCase) &&
+                                    slot.UserId.HasValue &&
+                                    slot.UserId.Value != postInfo.CreatorUserId &&
+                                    slot.UserId.Value != userDbId &&
+                                    !string.Equals(slot.Position, hostCurrentSlot.Position, StringComparison.OrdinalIgnoreCase) &&
+                                    !string.Equals(slot.Position, candidatePosition, StringComparison.OrdinalIgnoreCase));
+                                if (duplicateWithOthers)
+                                {
+                                    continue;
+                                }
+
+                                hostDestinationSlot = candidateSlot;
+                                hostDestinationJob = candidateJob;
+                                break;
+                            }
+
+                            if (hostDestinationSlot is not null && !string.IsNullOrWhiteSpace(hostDestinationJob))
+                            {
+                                break;
+                            }
+                        }
+
+                        if (hostDestinationSlot is not null && !string.IsNullOrWhiteSpace(hostDestinationJob))
+                        {
+                            var hostName = string.IsNullOrWhiteSpace(hostCurrentSlot.UserName)
+                                ? "主催"
+                                : hostCurrentSlot.UserName!;
+                            var hostComment = NullIfBlank(hostCurrentSlot.Comment);
+
+                            var extraHostSlots = slots
+                                .Where(slot =>
+                                    slot.UserId.HasValue &&
+                                    slot.UserId.Value == postInfo.CreatorUserId &&
+                                    !string.Equals(slot.Position, hostCurrentSlot.Position, StringComparison.OrdinalIgnoreCase) &&
+                                    !string.Equals(slot.Position, hostDestinationSlot.Position, StringComparison.OrdinalIgnoreCase))
+                                .ToArray();
+                            foreach (var extra in extraHostSlots)
+                            {
+                                await conn.ExecuteAsync(clearSlotSql, new { Id = extra.Id }, transaction: tx);
+                                extra.UserId = null;
+                                extra.UserName = null;
+                                extra.FlexSpec = null;
+                                extra.FlexJobsSpec = null;
+                                extra.Job = null;
+                                extra.Comment = null;
+                                extra.IsClosed = false;
+                            }
+
+                            if (!string.Equals(hostDestinationSlot.Position, hostCurrentSlot.Position, StringComparison.OrdinalIgnoreCase))
+                            {
+                                await conn.ExecuteAsync(clearSlotSql, new { Id = hostCurrentSlot.Id }, transaction: tx);
+                                hostCurrentSlot.UserId = null;
+                                hostCurrentSlot.UserName = null;
+                                hostCurrentSlot.FlexSpec = null;
+                                hostCurrentSlot.FlexJobsSpec = null;
+                                hostCurrentSlot.Job = null;
+                                hostCurrentSlot.Comment = null;
+                                hostCurrentSlot.IsClosed = false;
+                            }
+
+                            await conn.ExecuteAsync(updateSlotSql, new
+                            {
+                                Id = hostDestinationSlot.Id,
+                                UserId = postInfo.CreatorUserId,
+                                UserName = hostName,
+                                FlexSpec = (string?)null,
+                                FlexJobsSpec = (string?)null,
+                                Job = hostDestinationJob,
+                                Comment = hostComment
+                            }, transaction: tx);
+                            hostDestinationSlot.UserId = postInfo.CreatorUserId;
+                            hostDestinationSlot.UserName = hostName;
+                            hostDestinationSlot.FlexSpec = null;
+                            hostDestinationSlot.FlexJobsSpec = null;
+                            hostDestinationSlot.Job = hostDestinationJob;
+                            hostDestinationSlot.Comment = hostComment;
+                            hostDestinationSlot.IsClosed = false;
+
+                            resolvedByMovingFlexibleHost = true;
+                        }
+                    }
+                }
+
+                if (!resolvedByMovingFlexibleHost)
+                {
+                    var rebalanced = await TryRebalanceFlexibleAssignmentsAsync(
+                        conn,
+                        tx,
+                        slots,
+                        postInfo,
+                        recruitPositions,
+                        userDbId,
+                        userName,
+                        target.Position,
+                        job,
+                        normalizedComment,
+                        normalizedFlexSpec,
+                        normalizedFlexJobsSpec,
+                        disallowDuplicateJobs,
+                        clearSlotSql,
+                        updateSlotSql);
+                    if (rebalanced)
+                    {
+                        await NormalizeParticipantFlexSlotsAsync(conn, tx, slots, recruitPositions, postInfo.CreatorUserId, disallowDuplicateJobs);
+
+                        if (ShouldFixHostFlexToCurrentPosition(postInfo, slots, recruitPositions))
+                        {
+                            await conn.ExecuteAsync(clearHostFlexSql, new { PostId = postId }, transaction: tx);
+                            postInfo.HostFlexSpec = null;
+                            postInfo.HostFlexJobsSpec = null;
+                        }
+
+                        await conn.ExecuteAsync("UPDATE recruit_posts SET updated_at = NOW() WHERE id = @PostId;", new { PostId = postId }, transaction: tx);
+                        await tx.CommitAsync();
+                        return RecruitAssignStatus.Success;
+                    }
+
+                    await tx.RollbackAsync();
+                    return RecruitAssignStatus.JobTaken;
+                }
+            }
+        }
+
+        if (target.UserId.HasValue && target.UserId.Value != userDbId)
+        {
+            var occupyingUserId = target.UserId.Value;
+            IReadOnlyList<string> occupyingFlexPositions = Array.Empty<string>();
+            if (occupyingUserId == postInfo.CreatorUserId)
+            {
+                var hostFlexPositions = ParseFlexPositions(postInfo.HostFlexSpec);
+                var occupiedByFlexibleHost = userDbId != postInfo.CreatorUserId &&
+                                             hostFlexPositions.Contains(target.Position, StringComparer.OrdinalIgnoreCase);
+                if (occupiedByFlexibleHost)
+                {
+                    occupyingFlexPositions = hostFlexPositions;
+                }
+            }
+            else
+            {
+                var slotFlexPositions = ParseFlexPositions(target.FlexSpec);
+                if (slotFlexPositions.Contains(target.Position, StringComparer.OrdinalIgnoreCase))
+                {
+                    occupyingFlexPositions = slotFlexPositions;
+                }
+            }
+
+            if (occupyingFlexPositions.Count >= 2)
+            {
+                var occupyingJob = target.Job?.Trim().ToUpperInvariant();
+                IReadOnlyList<string> occupyingCandidateJobs;
+                if (occupyingUserId == postInfo.CreatorUserId)
+                {
+                    var hostFlexJobs = ParseFlexJobsSpec(postInfo.HostFlexJobsSpec);
+                    occupyingCandidateJobs = hostFlexJobs.Count > 0
+                        ? hostFlexJobs
+                        : string.IsNullOrWhiteSpace(occupyingJob)
+                            ? Array.Empty<string>()
+                            : new[] { occupyingJob };
+                }
+                else
+                {
+                    var participantFlexJobs = ParseFlexJobsSpec(target.FlexJobsSpec);
+                    if (participantFlexJobs.Count > 0)
+                    {
+                        occupyingCandidateJobs = participantFlexJobs;
+                    }
+                    else
+                    {
+                        occupyingCandidateJobs = string.IsNullOrWhiteSpace(occupyingJob)
+                            ? Array.Empty<string>()
+                            : new[] { occupyingJob };
+                    }
+                }
+
+                var occupyingUserName = string.IsNullOrWhiteSpace(target.UserName)
+                    ? occupyingUserId == postInfo.CreatorUserId ? "主催" : "参加者"
+                    : target.UserName!;
+                RecruitSlot? alternate = null;
+                string? alternateJob = null;
+                foreach (var candidateAlternate in slots.Where(slot =>
+                             !string.Equals(slot.Position, target.Position, StringComparison.OrdinalIgnoreCase) &&
+                             occupyingFlexPositions.Contains(slot.Position, StringComparer.OrdinalIgnoreCase) &&
+                             !slot.IsClosed &&
+                             (!slot.UserId.HasValue ||
+                              slot.UserId.Value == occupyingUserId ||
+                              slot.UserId.Value == userDbId)))
+                {
+                    foreach (var candidateJob in occupyingCandidateJobs)
+                    {
+                        if (string.IsNullOrWhiteSpace(candidateJob))
+                        {
+                            continue;
+                        }
+
+                        if (!IsJobAllowedForPosition(candidateAlternate.Position, candidateJob, recruitPositions))
+                        {
+                            continue;
+                        }
+
+                        if (!string.IsNullOrWhiteSpace(candidateAlternate.RequiredJob) &&
+                            !string.Equals(candidateAlternate.RequiredJob, candidateJob, StringComparison.OrdinalIgnoreCase))
+                        {
+                            continue;
+                        }
+
+                        if (disallowDuplicateJobs)
+                        {
+                            var duplicateWithOccupiedUsers = slots.Any(slot =>
+                                !string.IsNullOrWhiteSpace(slot.Job) &&
+                                string.Equals(slot.Job, candidateJob, StringComparison.OrdinalIgnoreCase) &&
+                                slot.UserId.HasValue &&
+                                slot.UserId.Value != occupyingUserId &&
+                                slot.UserId.Value != userDbId &&
+                                !string.Equals(slot.Position, target.Position, StringComparison.OrdinalIgnoreCase) &&
+                                !string.Equals(slot.Position, candidateAlternate.Position, StringComparison.OrdinalIgnoreCase));
+                            var duplicateWithJoiningUser = userDbId != occupyingUserId &&
+                                                           string.Equals(candidateJob, job, StringComparison.OrdinalIgnoreCase);
+                            if (duplicateWithOccupiedUsers || duplicateWithJoiningUser)
+                            {
+                                continue;
+                            }
+                        }
+
+                        alternate = candidateAlternate;
+                        alternateJob = candidateJob;
+                        break;
+                    }
+
+                    if (alternate is not null && !string.IsNullOrWhiteSpace(alternateJob))
+                    {
+                        break;
+                    }
+                }
+
+                if (alternate is not null && !string.IsNullOrWhiteSpace(alternateJob))
+                {
+                    var previousTargetFlexSpec = target.FlexSpec;
+                    var previousTargetFlexJobsSpec = target.FlexJobsSpec;
+                    var previousTargetComment = NullIfBlank(target.Comment);
+                    foreach (var previous in previousSlots)
+                    {
+                        await conn.ExecuteAsync(clearSlotSql, new { Id = previous.Id }, transaction: tx);
+                        previous.UserId = null;
+                        previous.UserName = null;
+                        previous.FlexSpec = null;
+                        previous.FlexJobsSpec = null;
+                        previous.Job = null;
+                        previous.Comment = null;
+                        previous.IsClosed = false;
+                    }
+
+                    var occupyingDuplicateSlots = slots
+                        .Where(slot =>
+                            slot.UserId.HasValue &&
+                            slot.UserId.Value == occupyingUserId &&
+                            !string.Equals(slot.Position, target.Position, StringComparison.OrdinalIgnoreCase) &&
+                            !string.Equals(slot.Position, alternate.Position, StringComparison.OrdinalIgnoreCase))
+                        .ToArray();
+                    foreach (var duplicate in occupyingDuplicateSlots)
+                    {
+                        await conn.ExecuteAsync(clearSlotSql, new { Id = duplicate.Id }, transaction: tx);
+                        duplicate.UserId = null;
+                        duplicate.UserName = null;
+                        duplicate.FlexSpec = null;
+                        duplicate.FlexJobsSpec = null;
+                        duplicate.Job = null;
+                        duplicate.Comment = null;
+                        duplicate.IsClosed = false;
+                    }
+
+                    await conn.ExecuteAsync(updateSlotSql, new
+                    {
+                        Id = target.Id,
+                        UserId = userDbId,
+                        UserName = userName,
+                        FlexSpec = normalizedFlexSpec,
+                        FlexJobsSpec = normalizedFlexJobsSpec,
+                        Job = job,
+                        Comment = normalizedComment
+                    }, transaction: tx);
+                    target.UserId = userDbId;
+                    target.UserName = userName;
+                    target.FlexSpec = normalizedFlexSpec;
+                    target.FlexJobsSpec = normalizedFlexJobsSpec;
+                    target.Job = job;
+                    target.Comment = normalizedComment;
+                    target.IsClosed = false;
+
+                    var occupyingFlexSpec = occupyingUserId == postInfo.CreatorUserId
+                        ? null
+                        : NormalizeFlexSpec(previousTargetFlexSpec);
+                    var occupyingFlexJobsSpec = occupyingUserId == postInfo.CreatorUserId
+                        ? null
+                        : NormalizeFlexJobsSpec(previousTargetFlexJobsSpec);
+                    await conn.ExecuteAsync(updateSlotSql, new
+                    {
+                        Id = alternate.Id,
+                        UserId = occupyingUserId,
+                        UserName = occupyingUserName,
+                        FlexSpec = occupyingFlexSpec,
+                        FlexJobsSpec = occupyingFlexJobsSpec,
+                        Job = alternateJob,
+                        Comment = previousTargetComment
+                    }, transaction: tx);
+                    alternate.UserId = occupyingUserId;
+                    alternate.UserName = occupyingUserName;
+                    alternate.FlexSpec = occupyingFlexSpec;
+                    alternate.FlexJobsSpec = occupyingFlexJobsSpec;
+                    alternate.Job = alternateJob;
+                    alternate.Comment = previousTargetComment;
+                    alternate.IsClosed = false;
+
+                    if (ShouldFixHostFlexToCurrentPosition(postInfo, slots, recruitPositions))
+                    {
+                        await conn.ExecuteAsync(clearHostFlexSql, new { PostId = postId }, transaction: tx);
+                        postInfo.HostFlexSpec = null;
+                        postInfo.HostFlexJobsSpec = null;
+                    }
+
+                    await conn.ExecuteAsync("UPDATE recruit_posts SET updated_at = NOW() WHERE id = @PostId;", new { PostId = postId }, transaction: tx);
+                    await tx.CommitAsync();
+                    return RecruitAssignStatus.Success;
+                }
+            }
+
+            var rebalancedWhenTaken = await TryRebalanceFlexibleAssignmentsAsync(
+                conn,
+                tx,
+                slots,
+                postInfo,
+                recruitPositions,
+                userDbId,
+                userName,
+                target.Position,
+                job,
+                normalizedComment,
+                normalizedFlexSpec,
+                normalizedFlexJobsSpec,
+                disallowDuplicateJobs,
+                clearSlotSql,
+                updateSlotSql);
+            if (rebalancedWhenTaken)
+            {
+                await NormalizeParticipantFlexSlotsAsync(conn, tx, slots, recruitPositions, postInfo.CreatorUserId, disallowDuplicateJobs);
+
+                if (ShouldFixHostFlexToCurrentPosition(postInfo, slots, recruitPositions))
+                {
+                    await conn.ExecuteAsync(clearHostFlexSql, new { PostId = postId }, transaction: tx);
+                    postInfo.HostFlexSpec = null;
+                    postInfo.HostFlexJobsSpec = null;
+                }
+
+                await conn.ExecuteAsync("UPDATE recruit_posts SET updated_at = NOW() WHERE id = @PostId;", new { PostId = postId }, transaction: tx);
+                await tx.CommitAsync();
+                return RecruitAssignStatus.Success;
+            }
+
+            await tx.RollbackAsync();
+            return RecruitAssignStatus.PositionTaken;
+        }
+
+        foreach (var previous in previousSlots)
         {
             await conn.ExecuteAsync(clearSlotSql, new { Id = previous.Id }, transaction: tx);
+            previous.UserId = null;
+            previous.UserName = null;
+            previous.FlexSpec = null;
+            previous.FlexJobsSpec = null;
+            previous.Job = null;
+            previous.Comment = null;
+            previous.IsClosed = false;
         }
 
         await conn.ExecuteAsync(updateSlotSql, new
@@ -1777,14 +2595,66 @@ WHERE id = @Id;";
             Id = target.Id,
             UserId = userDbId,
             UserName = userName,
+            FlexSpec = normalizedFlexSpec,
+            FlexJobsSpec = normalizedFlexJobsSpec,
             Job = job,
-            Comment = NullIfBlank(comment)
+            Comment = normalizedComment
         }, transaction: tx);
+        target.UserId = userDbId;
+        target.UserName = userName;
+        target.FlexSpec = normalizedFlexSpec;
+        target.FlexJobsSpec = normalizedFlexJobsSpec;
+        target.Job = job;
+        target.Comment = normalizedComment;
+        target.IsClosed = false;
+
+        await NormalizeParticipantFlexSlotsAsync(conn, tx, slots, recruitPositions, postInfo.CreatorUserId, disallowDuplicateJobs);
+
+        if (ShouldFixHostFlexToCurrentPosition(postInfo, slots, recruitPositions))
+        {
+            await conn.ExecuteAsync(clearHostFlexSql, new { PostId = postId }, transaction: tx);
+            postInfo.HostFlexSpec = null;
+            postInfo.HostFlexJobsSpec = null;
+        }
 
         await conn.ExecuteAsync("UPDATE recruit_posts SET updated_at = NOW() WHERE id = @PostId;", new { PostId = postId }, transaction: tx);
 
         await tx.CommitAsync();
         return RecruitAssignStatus.Success;
+    }
+
+    public async Task<bool> MarkRecruitSlotClosedFlexAsync(
+        int postId,
+        string position,
+        string job,
+        string flexSpec,
+        string? flexJobsSpec = null)
+    {
+        const string sql = @"
+UPDATE recruit_slots
+SET user_id = NULL,
+    user_name = NULL,
+    flex_spec = @FlexSpec,
+    flex_jobs_spec = @FlexJobsSpec,
+    job = @Job,
+    comment = NULL,
+    is_closed = TRUE,
+    thread_message_id = NULL,
+    joined_at = NOW(),
+    updated_at = NOW()
+WHERE post_id = @PostId
+  AND position = @Position;";
+
+        await using var conn = CreateConnection();
+        var affected = await conn.ExecuteAsync(sql, new
+        {
+            PostId = postId,
+            Position = position,
+            FlexSpec = NormalizeFlexSpec(flexSpec),
+            FlexJobsSpec = NormalizeFlexJobsSpec(flexJobsSpec),
+            Job = NullIfBlank(job)
+        });
+        return affected > 0;
     }
 
     public async Task<bool> ClearRecruitSlotAsync(int postId, ulong userId)
@@ -1793,6 +2663,8 @@ WHERE id = @Id;";
 UPDATE recruit_slots
 SET user_id = NULL,
     user_name = NULL,
+    flex_spec = NULL,
+    flex_jobs_spec = NULL,
     job = NULL,
     comment = NULL,
     is_closed = FALSE,
@@ -1862,10 +2734,13 @@ WHERE post_id = @PostId
         return rows > 0;
     }
 
-    public async Task<RecruitIngameFillStatus> MarkRecruitSlotIngameFilledAsync(int postId, string position, string job)
+    public async Task<RecruitIngameFillStatus> MarkRecruitSlotIngameFilledAsync(int postId, string position, string job, bool disallowDuplicateJobs = true)
     {
         const string selectPostSql = @"
-SELECT status
+SELECT status AS Status,
+       creator_user_id AS CreatorUserId,
+       host_flex_spec AS HostFlexSpec,
+       host_flex_jobs_spec AS HostFlexJobsSpec
 FROM recruit_posts
 WHERE id = @PostId
 FOR UPDATE;";
@@ -1875,16 +2750,66 @@ SELECT id AS Id,
        post_id AS PostId,
        position AS Position,
        required_job AS RequiredJob,
+       flex_spec AS FlexSpec,
+       flex_jobs_spec AS FlexJobsSpec,
        job AS Job,
        user_id AS UserId,
+       user_name AS UserName,
+       comment AS Comment,
+       thread_message_id AS ThreadMessageId,
+       joined_at AS JoinedAt,
+       updated_at AS UpdatedAt,
        is_closed AS IsClosed
 FROM recruit_slots
 WHERE post_id = @PostId
 FOR UPDATE;";
 
+        const string clearSlotSql = @"
+UPDATE recruit_slots
+SET user_id = NULL,
+    user_name = NULL,
+    flex_spec = NULL,
+    flex_jobs_spec = NULL,
+    job = NULL,
+    comment = NULL,
+    is_closed = FALSE,
+    thread_message_id = NULL,
+    joined_at = NULL,
+    updated_at = NOW()
+WHERE id = @Id;";
+
+        const string updateSlotSql = @"
+UPDATE recruit_slots
+SET user_id = @UserId,
+    user_name = @UserName,
+    flex_spec = @FlexSpec,
+    flex_jobs_spec = @FlexJobsSpec,
+    job = @Job,
+    comment = @Comment,
+    is_closed = FALSE,
+    joined_at = NOW(),
+    updated_at = NOW()
+WHERE id = @Id;";
+
+        const string closeFlexSlotSql = @"
+UPDATE recruit_slots
+SET user_id = NULL,
+    user_name = NULL,
+    flex_spec = @FlexSpec,
+    flex_jobs_spec = @FlexJobsSpec,
+    job = @Job,
+    comment = NULL,
+    is_closed = TRUE,
+    thread_message_id = NULL,
+    joined_at = NOW(),
+    updated_at = NOW()
+WHERE id = @Id;";
+
         const string closeSlotSql = @"
 UPDATE recruit_slots
 SET is_closed = TRUE,
+    flex_spec = NULL,
+    flex_jobs_spec = NULL,
     job = @Job,
     comment = NULL,
     updated_at = NOW()
@@ -1894,14 +2819,14 @@ WHERE id = @Id;";
         await conn.OpenAsync();
         await using var tx = await conn.BeginTransactionAsync();
 
-        var statusValue = await conn.ExecuteScalarAsync<short?>(selectPostSql, new { PostId = postId }, transaction: tx);
-        if (!statusValue.HasValue)
+        var postInfo = await conn.QuerySingleOrDefaultAsync<RecruitPostLockInfo>(selectPostSql, new { PostId = postId }, transaction: tx);
+        if (postInfo is null)
         {
             await tx.RollbackAsync();
             return RecruitIngameFillStatus.PostNotFound;
         }
 
-        var status = (RecruitPostStatus)statusValue.Value;
+        var status = (RecruitPostStatus)postInfo.Status;
         if (status is RecruitPostStatus.Closed or RecruitPostStatus.Canceled)
         {
             await tx.RollbackAsync();
@@ -1922,12 +2847,6 @@ WHERE id = @Id;";
             return RecruitIngameFillStatus.PositionOccupied;
         }
 
-        if (target.IsClosed)
-        {
-            await tx.RollbackAsync();
-            return RecruitIngameFillStatus.PositionAlreadyClosed;
-        }
-
         if (!string.IsNullOrWhiteSpace(target.RequiredJob) &&
             !string.Equals(target.RequiredJob, job, StringComparison.OrdinalIgnoreCase))
         {
@@ -1935,16 +2854,45 @@ WHERE id = @Id;";
             return RecruitIngameFillStatus.JobRestricted;
         }
 
-        var jobTaken = slots.Any(slot =>
-            !string.IsNullOrWhiteSpace(slot.Job) &&
-            string.Equals(slot.Job, job, StringComparison.OrdinalIgnoreCase) &&
-            slot.Id != target.Id &&
-            (slot.UserId.HasValue || slot.IsClosed));
+        var recruitPositions = slots
+            .Select(slot => slot.Position)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
 
-        if (jobTaken)
+        if (target.IsClosed)
         {
-            await tx.RollbackAsync();
-            return RecruitIngameFillStatus.JobTaken;
+            var reopened = await TryReopenClosedFlexTargetForJoinAsync(
+                conn,
+                tx,
+                slots,
+                postInfo,
+                target,
+                recruitPositions,
+                disallowDuplicateJobs,
+                long.MinValue,
+                clearSlotSql,
+                updateSlotSql,
+                closeFlexSlotSql);
+            if (!reopened)
+            {
+                await tx.RollbackAsync();
+                return RecruitIngameFillStatus.PositionAlreadyClosed;
+            }
+        }
+
+        if (disallowDuplicateJobs)
+        {
+            var jobTaken = slots.Any(slot =>
+                !string.IsNullOrWhiteSpace(slot.Job) &&
+                string.Equals(slot.Job, job, StringComparison.OrdinalIgnoreCase) &&
+                slot.Id != target.Id &&
+                (slot.UserId.HasValue || slot.IsClosed));
+
+            if (jobTaken)
+            {
+                await tx.RollbackAsync();
+                return RecruitIngameFillStatus.JobTaken;
+            }
         }
 
         await conn.ExecuteAsync(closeSlotSql, new { Id = target.Id, Job = job }, transaction: tx);
@@ -1976,6 +2924,8 @@ FOR UPDATE;";
         const string openSlotSql = @"
 UPDATE recruit_slots
 SET is_closed = FALSE,
+    flex_spec = NULL,
+    flex_jobs_spec = NULL,
     job = NULL,
     comment = NULL,
     updated_at = NOW()
@@ -2070,6 +3020,33 @@ WHERE id = @PostId;";
         return rows > 0;
     }
 
+    public async Task<bool> UpdateRecruitPostCreatorAsync(int postId, ulong creatorUserId, string? hostFlexSpec = null, string? hostFlexJobsSpec = null)
+    {
+        const string sql = @"
+UPDATE recruit_posts
+SET creator_user_id = @CreatorUserId,
+    host_flex_spec = @HostFlexSpec,
+    host_flex_jobs_spec = @HostFlexJobsSpec,
+    updated_at = NOW()
+WHERE id = @PostId;";
+
+        var normalizedHostFlexSpec = NormalizeFlexSpec(hostFlexSpec);
+        var normalizedHostFlexJobsSpec = string.IsNullOrWhiteSpace(normalizedHostFlexSpec)
+            ? null
+            : NormalizeFlexJobsSpec(hostFlexJobsSpec);
+
+        await using var conn = CreateConnection();
+        var rows = await conn.ExecuteAsync(sql, new
+        {
+            PostId = postId,
+            CreatorUserId = ToDbId(creatorUserId),
+            HostFlexSpec = normalizedHostFlexSpec,
+            HostFlexJobsSpec = normalizedHostFlexJobsSpec
+        });
+
+        return rows > 0;
+    }
+
     public async Task<IReadOnlyList<RecruitPost>> ListDueRecruitPostsForReminderAsync(DateTimeOffset fromUtcExclusive, DateTimeOffset toUtcInclusive)
     {
         const string sql = @"
@@ -2088,6 +3065,9 @@ SELECT id AS Id,
        schedule_at AS ScheduleAt,
        reminder_sent_at AS ReminderSentAt,
        note AS Note,
+       disallow_duplicate_jobs AS DisallowDuplicateJobs,
+       host_flex_spec AS HostFlexSpec,
+       host_flex_jobs_spec AS HostFlexJobsSpec,
        created_at AS CreatedAt,
        updated_at AS UpdatedAt
 FROM recruit_posts
@@ -2125,10 +3105,13 @@ SELECT id AS Id,
        schedule_at AS ScheduleAt,
        reminder_sent_at AS ReminderSentAt,
        note AS Note,
+       disallow_duplicate_jobs AS DisallowDuplicateJobs,
+       host_flex_spec AS HostFlexSpec,
+       host_flex_jobs_spec AS HostFlexJobsSpec,
        created_at AS CreatedAt,
        updated_at AS UpdatedAt
 FROM recruit_posts
-WHERE status IN (0, 1)
+WHERE status = 1
   AND schedule_at IS NOT NULL
   AND schedule_at <= @NowUtc
 ORDER BY schedule_at ASC;";
@@ -2903,6 +3886,1892 @@ WHERE guild_id = @GuildId
         });
     }
 
+    public async Task<InquiryTicket> CreateInquiryTicketAsync(
+        ulong guildId,
+        ulong channelId,
+        ulong requesterUserId,
+        string requesterName,
+        string subject,
+        string status,
+        DateTimeOffset createdAt)
+    {
+        const string sql = @"
+INSERT INTO public.inquiry_tickets (
+    guild_id,
+    channel_id,
+    requester_user_id,
+    requester_name,
+    subject,
+    status,
+    created_at,
+    updated_at,
+    last_activity_at,
+    closed_at
+)
+VALUES (
+    @GuildId,
+    @ChannelId,
+    @RequesterUserId,
+    @RequesterName,
+    @Subject,
+    @Status,
+    @CreatedAt,
+    @CreatedAt,
+    @CreatedAt,
+    CASE WHEN @Status = 'CLOSED' THEN @CreatedAt ELSE NULL END
+)
+RETURNING id AS Id,
+          guild_id AS GuildId,
+          channel_id AS ChannelId,
+          requester_user_id AS RequesterUserId,
+          requester_name AS RequesterName,
+          subject AS Subject,
+          status AS Status,
+          assigned_admin_user_id AS AssignedAdminUserId,
+          assigned_admin_name AS AssignedAdminName,
+          created_at AS CreatedAt,
+          updated_at AS UpdatedAt,
+          last_activity_at AS LastActivityAt,
+          closed_at AS ClosedAt,
+          last_reminder_at AS LastReminderAt,
+          transcript_text AS TranscriptText;";
+
+        await using var conn = CreateConnection();
+        return await conn.QuerySingleAsync<InquiryTicket>(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            ChannelId = ToDbId(channelId),
+            RequesterUserId = ToDbId(requesterUserId),
+            RequesterName = string.IsNullOrWhiteSpace(requesterName) ? requesterUserId.ToString() : requesterName.Trim(),
+            Subject = string.IsNullOrWhiteSpace(subject) ? "未指定" : subject.Trim(),
+            Status = InquiryTicketStatus.Normalize(status),
+            CreatedAt = createdAt
+        });
+    }
+
+    public async Task<InquiryTicket?> GetInquiryTicketByChannelAsync(ulong channelId)
+    {
+        const string sql = @"
+SELECT id AS Id,
+       guild_id AS GuildId,
+       channel_id AS ChannelId,
+       requester_user_id AS RequesterUserId,
+       requester_name AS RequesterName,
+       subject AS Subject,
+       status AS Status,
+       assigned_admin_user_id AS AssignedAdminUserId,
+       assigned_admin_name AS AssignedAdminName,
+       created_at AS CreatedAt,
+       updated_at AS UpdatedAt,
+       last_activity_at AS LastActivityAt,
+       closed_at AS ClosedAt,
+       last_reminder_at AS LastReminderAt,
+       transcript_text AS TranscriptText
+FROM public.inquiry_tickets
+WHERE channel_id = @ChannelId
+LIMIT 1;";
+
+        await using var conn = CreateConnection();
+        return await conn.QuerySingleOrDefaultAsync<InquiryTicket>(sql, new { ChannelId = ToDbId(channelId) });
+    }
+
+    public async Task<InquiryTicket?> GetInquiryTicketByIdAsync(int ticketId)
+    {
+        const string sql = @"
+SELECT id AS Id,
+       guild_id AS GuildId,
+       channel_id AS ChannelId,
+       requester_user_id AS RequesterUserId,
+       requester_name AS RequesterName,
+       subject AS Subject,
+       status AS Status,
+       assigned_admin_user_id AS AssignedAdminUserId,
+       assigned_admin_name AS AssignedAdminName,
+       created_at AS CreatedAt,
+       updated_at AS UpdatedAt,
+       last_activity_at AS LastActivityAt,
+       closed_at AS ClosedAt,
+       last_reminder_at AS LastReminderAt,
+       transcript_text AS TranscriptText
+FROM public.inquiry_tickets
+WHERE id = @TicketId
+LIMIT 1;";
+
+        await using var conn = CreateConnection();
+        return await conn.QuerySingleOrDefaultAsync<InquiryTicket>(sql, new { TicketId = ticketId });
+    }
+
+    public async Task<InquiryTicket?> GetOpenInquiryTicketByRequesterAsync(ulong guildId, ulong requesterUserId)
+    {
+        const string sql = @"
+SELECT id AS Id,
+       guild_id AS GuildId,
+       channel_id AS ChannelId,
+       requester_user_id AS RequesterUserId,
+       requester_name AS RequesterName,
+       subject AS Subject,
+       status AS Status,
+       assigned_admin_user_id AS AssignedAdminUserId,
+       assigned_admin_name AS AssignedAdminName,
+       created_at AS CreatedAt,
+       updated_at AS UpdatedAt,
+       last_activity_at AS LastActivityAt,
+       closed_at AS ClosedAt,
+       last_reminder_at AS LastReminderAt,
+       transcript_text AS TranscriptText
+FROM public.inquiry_tickets
+WHERE guild_id = @GuildId
+  AND requester_user_id = @RequesterUserId
+  AND status <> 'CLOSED'
+ORDER BY created_at DESC
+LIMIT 1;";
+
+        await using var conn = CreateConnection();
+        return await conn.QuerySingleOrDefaultAsync<InquiryTicket>(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            RequesterUserId = ToDbId(requesterUserId)
+        });
+    }
+
+    public async Task<IReadOnlyList<InquiryTicket>> ListInquiryTicketsAsync(ulong guildId, bool includeClosed, int maxRows = 50)
+    {
+        const string sql = @"
+SELECT id AS Id,
+       guild_id AS GuildId,
+       channel_id AS ChannelId,
+       requester_user_id AS RequesterUserId,
+       requester_name AS RequesterName,
+       subject AS Subject,
+       status AS Status,
+       assigned_admin_user_id AS AssignedAdminUserId,
+       assigned_admin_name AS AssignedAdminName,
+       created_at AS CreatedAt,
+       updated_at AS UpdatedAt,
+       last_activity_at AS LastActivityAt,
+       closed_at AS ClosedAt,
+       last_reminder_at AS LastReminderAt,
+       transcript_text AS TranscriptText
+FROM public.inquiry_tickets
+WHERE guild_id = @GuildId
+  AND (@IncludeClosed OR status <> 'CLOSED')
+ORDER BY updated_at DESC, id DESC
+LIMIT @MaxRows;";
+
+        await using var conn = CreateConnection();
+        var rows = await conn.QueryAsync<InquiryTicket>(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            IncludeClosed = includeClosed,
+            MaxRows = Math.Clamp(maxRows, 1, 200)
+        });
+        return rows.ToList();
+    }
+
+    public async Task<bool> UpdateInquiryTicketStatusAsync(int ticketId, string status, DateTimeOffset nowUtc)
+    {
+        const string sql = @"
+UPDATE public.inquiry_tickets
+SET status = @Status,
+    updated_at = @NowUtc,
+    last_activity_at = @NowUtc,
+    last_reminder_at = NULL,
+    closed_at = CASE
+        WHEN @Status = 'CLOSED' THEN COALESCE(closed_at, @NowUtc)
+        ELSE NULL
+    END
+WHERE id = @TicketId;";
+
+        await using var conn = CreateConnection();
+        var affected = await conn.ExecuteAsync(sql, new
+        {
+            TicketId = ticketId,
+            Status = InquiryTicketStatus.Normalize(status),
+            NowUtc = nowUtc
+        });
+        return affected > 0;
+    }
+
+    public async Task<bool> UpdateInquiryTicketAssignmentAsync(
+        int ticketId,
+        ulong? assignedAdminUserId,
+        string? assignedAdminName,
+        DateTimeOffset nowUtc)
+    {
+        const string sql = @"
+UPDATE public.inquiry_tickets
+SET assigned_admin_user_id = @AssignedAdminUserId,
+    assigned_admin_name = @AssignedAdminName,
+    updated_at = @NowUtc,
+    last_activity_at = @NowUtc,
+    last_reminder_at = NULL
+WHERE id = @TicketId;";
+
+        await using var conn = CreateConnection();
+        var affected = await conn.ExecuteAsync(sql, new
+        {
+            TicketId = ticketId,
+            AssignedAdminUserId = assignedAdminUserId.HasValue ? (long?)ToDbId(assignedAdminUserId.Value) : null,
+            AssignedAdminName = NullIfBlank(assignedAdminName),
+            NowUtc = nowUtc
+        });
+        return affected > 0;
+    }
+
+    public async Task<bool> TouchInquiryTicketActivityAsync(ulong channelId, DateTimeOffset activityAt)
+    {
+        const string sql = @"
+UPDATE public.inquiry_tickets
+SET last_activity_at = GREATEST(last_activity_at, @ActivityAt),
+    updated_at = NOW(),
+    last_reminder_at = NULL
+WHERE channel_id = @ChannelId
+  AND status <> 'CLOSED';";
+
+        await using var conn = CreateConnection();
+        var affected = await conn.ExecuteAsync(sql, new
+        {
+            ChannelId = ToDbId(channelId),
+            ActivityAt = activityAt
+        });
+        return affected > 0;
+    }
+
+    public async Task<IReadOnlyList<InquiryTicket>> ListDueInquiryReminderTicketsAsync(DateTimeOffset cutoffUtc, int maxRows = 100)
+    {
+        const string sql = @"
+SELECT id AS Id,
+       guild_id AS GuildId,
+       channel_id AS ChannelId,
+       requester_user_id AS RequesterUserId,
+       requester_name AS RequesterName,
+       subject AS Subject,
+       status AS Status,
+       assigned_admin_user_id AS AssignedAdminUserId,
+       assigned_admin_name AS AssignedAdminName,
+       created_at AS CreatedAt,
+       updated_at AS UpdatedAt,
+       last_activity_at AS LastActivityAt,
+       closed_at AS ClosedAt,
+       last_reminder_at AS LastReminderAt,
+       transcript_text AS TranscriptText
+FROM public.inquiry_tickets
+WHERE status <> 'CLOSED'
+  AND last_activity_at <= @CutoffUtc
+  AND (last_reminder_at IS NULL OR last_reminder_at < last_activity_at)
+ORDER BY last_activity_at ASC, id ASC
+LIMIT @MaxRows;";
+
+        await using var conn = CreateConnection();
+        var rows = await conn.QueryAsync<InquiryTicket>(sql, new
+        {
+            CutoffUtc = cutoffUtc,
+            MaxRows = Math.Clamp(maxRows, 1, 300)
+        });
+        return rows.ToList();
+    }
+
+    public async Task<bool> MarkInquiryReminderSentAsync(int ticketId, DateTimeOffset reminderAt)
+    {
+        const string sql = @"
+UPDATE public.inquiry_tickets
+SET last_reminder_at = @ReminderAt,
+    updated_at = NOW()
+WHERE id = @TicketId;";
+
+        await using var conn = CreateConnection();
+        var affected = await conn.ExecuteAsync(sql, new
+        {
+            TicketId = ticketId,
+            ReminderAt = reminderAt
+        });
+        return affected > 0;
+    }
+
+    public async Task<bool> SaveInquiryTranscriptAsync(int ticketId, string transcriptText, DateTimeOffset nowUtc)
+    {
+        const string sql = @"
+UPDATE public.inquiry_tickets
+SET transcript_text = @TranscriptText,
+    updated_at = @NowUtc
+WHERE id = @TicketId;";
+
+        await using var conn = CreateConnection();
+        var affected = await conn.ExecuteAsync(sql, new
+        {
+            TicketId = ticketId,
+            TranscriptText = NullIfBlank(transcriptText),
+            NowUtc = nowUtc
+        });
+        return affected > 0;
+    }
+
+    public async Task<Lottery> CreateLotteryAsync(
+        ulong guildId,
+        ulong channelId,
+        string title,
+        string? description,
+        string? prizeList,
+        bool allowDuplicateWinners,
+        int winnerCount,
+        DateTimeOffset closeAt,
+        ulong createdByUserId,
+        string createdByName,
+        DateTimeOffset createdAt)
+    {
+        const string sql = @"
+INSERT INTO public.lotteries (
+    guild_id,
+    channel_id,
+    title,
+    description,
+    prize_list,
+    allow_duplicate_winners,
+    winner_count,
+    status,
+    close_at,
+    created_by_user_id,
+    created_by_name,
+    created_at,
+    updated_at
+)
+VALUES (
+    @GuildId,
+    @ChannelId,
+    @Title,
+    @Description,
+    @PrizeList,
+    @AllowDuplicateWinners,
+    @WinnerCount,
+    @Status,
+    @CloseAt,
+    @CreatedByUserId,
+    @CreatedByName,
+    @CreatedAt,
+    @CreatedAt
+)
+RETURNING id AS Id,
+          guild_id AS GuildId,
+          channel_id AS ChannelId,
+          message_id AS MessageId,
+          participant_role_id AS ParticipantRoleId,
+          participant_role_delete_at AS ParticipantRoleDeleteAt,
+          title AS Title,
+          description AS Description,
+          prize_list AS PrizeList,
+          allow_duplicate_winners AS AllowDuplicateWinners,
+          winner_count AS WinnerCount,
+          status AS Status,
+          close_at AS CloseAt,
+          created_by_user_id AS CreatedByUserId,
+          created_by_name AS CreatedByName,
+          created_at AS CreatedAt,
+          updated_at AS UpdatedAt,
+          drawn_at AS DrawnAt,
+          canceled_at AS CanceledAt;";
+
+        await using var conn = CreateConnection();
+        return await conn.QuerySingleAsync<Lottery>(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            ChannelId = ToDbId(channelId),
+            Title = string.IsNullOrWhiteSpace(title) ? "抽選" : title.Trim(),
+            Description = NullIfBlank(description),
+            PrizeList = NullIfBlank(prizeList),
+            AllowDuplicateWinners = allowDuplicateWinners,
+            WinnerCount = Math.Clamp(winnerCount, 1, 99),
+            Status = LotteryStatus.Open,
+            CloseAt = closeAt,
+            CreatedByUserId = ToDbId(createdByUserId),
+            CreatedByName = string.IsNullOrWhiteSpace(createdByName) ? createdByUserId.ToString() : createdByName.Trim(),
+            CreatedAt = createdAt
+        });
+    }
+
+    public async Task<bool> UpdateLotteryMessageIdAsync(int lotteryId, ulong messageId)
+    {
+        const string sql = @"
+UPDATE public.lotteries
+SET message_id = @MessageId,
+    updated_at = NOW()
+WHERE id = @LotteryId;";
+
+        await using var conn = CreateConnection();
+        var affected = await conn.ExecuteAsync(sql, new
+        {
+            LotteryId = lotteryId,
+            MessageId = ToDbId(messageId)
+        });
+        return affected > 0;
+    }
+
+    public async Task<bool> UpdateLotteryParticipantRoleIdAsync(int lotteryId, ulong? participantRoleId)
+    {
+        const string sql = @"
+UPDATE public.lotteries
+SET participant_role_id = @ParticipantRoleId,
+    participant_role_delete_at = NULL,
+    updated_at = NOW()
+WHERE id = @LotteryId;";
+
+        await using var conn = CreateConnection();
+        var affected = await conn.ExecuteAsync(sql, new
+        {
+            LotteryId = lotteryId,
+            ParticipantRoleId = participantRoleId.HasValue ? (long?)ToDbId(participantRoleId.Value) : null
+        });
+        return affected > 0;
+    }
+
+    public async Task<bool> UpdateLotteryParticipantRoleDeleteAtAsync(int lotteryId, DateTimeOffset? deleteAtUtc)
+    {
+        const string sql = @"
+UPDATE public.lotteries
+SET participant_role_delete_at = @DeleteAtUtc,
+    updated_at = NOW()
+WHERE id = @LotteryId;";
+
+        await using var conn = CreateConnection();
+        var affected = await conn.ExecuteAsync(sql, new
+        {
+            LotteryId = lotteryId,
+            DeleteAtUtc = deleteAtUtc
+        });
+        return affected > 0;
+    }
+
+    public async Task<Lottery?> GetLotteryByIdAsync(int lotteryId)
+    {
+        const string sql = @"
+SELECT id AS Id,
+       guild_id AS GuildId,
+       channel_id AS ChannelId,
+       message_id AS MessageId,
+       participant_role_id AS ParticipantRoleId,
+       participant_role_delete_at AS ParticipantRoleDeleteAt,
+       title AS Title,
+       description AS Description,
+       prize_list AS PrizeList,
+       allow_duplicate_winners AS AllowDuplicateWinners,
+       winner_count AS WinnerCount,
+       status AS Status,
+       close_at AS CloseAt,
+       created_by_user_id AS CreatedByUserId,
+       created_by_name AS CreatedByName,
+       created_at AS CreatedAt,
+       updated_at AS UpdatedAt,
+       drawn_at AS DrawnAt,
+       canceled_at AS CanceledAt
+FROM public.lotteries
+WHERE id = @LotteryId
+LIMIT 1;";
+
+        await using var conn = CreateConnection();
+        return await conn.QuerySingleOrDefaultAsync<Lottery>(sql, new { LotteryId = lotteryId });
+    }
+
+    public async Task<Lottery?> GetLotteryByMessageIdAsync(ulong messageId)
+    {
+        const string sql = @"
+SELECT id AS Id,
+       guild_id AS GuildId,
+       channel_id AS ChannelId,
+       message_id AS MessageId,
+       participant_role_id AS ParticipantRoleId,
+       participant_role_delete_at AS ParticipantRoleDeleteAt,
+       title AS Title,
+       description AS Description,
+       prize_list AS PrizeList,
+       allow_duplicate_winners AS AllowDuplicateWinners,
+       winner_count AS WinnerCount,
+       status AS Status,
+       close_at AS CloseAt,
+       created_by_user_id AS CreatedByUserId,
+       created_by_name AS CreatedByName,
+       created_at AS CreatedAt,
+       updated_at AS UpdatedAt,
+       drawn_at AS DrawnAt,
+       canceled_at AS CanceledAt
+FROM public.lotteries
+WHERE message_id = @MessageId
+LIMIT 1;";
+
+        await using var conn = CreateConnection();
+        return await conn.QuerySingleOrDefaultAsync<Lottery>(sql, new
+        {
+            MessageId = ToDbId(messageId)
+        });
+    }
+
+    public async Task<IReadOnlyList<Lottery>> ListRecentLotteriesAsync(ulong guildId, int maxRows = 10)
+    {
+        const string sql = @"
+SELECT id AS Id,
+       guild_id AS GuildId,
+       channel_id AS ChannelId,
+       message_id AS MessageId,
+       participant_role_id AS ParticipantRoleId,
+       participant_role_delete_at AS ParticipantRoleDeleteAt,
+       title AS Title,
+       description AS Description,
+       prize_list AS PrizeList,
+       allow_duplicate_winners AS AllowDuplicateWinners,
+       winner_count AS WinnerCount,
+       status AS Status,
+       close_at AS CloseAt,
+       created_by_user_id AS CreatedByUserId,
+       created_by_name AS CreatedByName,
+       created_at AS CreatedAt,
+       updated_at AS UpdatedAt,
+       drawn_at AS DrawnAt,
+       canceled_at AS CanceledAt
+FROM public.lotteries
+WHERE guild_id = @GuildId
+ORDER BY updated_at DESC, id DESC
+LIMIT @MaxRows;";
+
+        await using var conn = CreateConnection();
+        var rows = await conn.QueryAsync<Lottery>(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            MaxRows = Math.Clamp(maxRows, 1, 50)
+        });
+        return rows.ToList();
+    }
+
+    public async Task<IReadOnlyList<Lottery>> ListDueLotteriesForAutoCloseAsync(DateTimeOffset nowUtc, int maxRows = 200)
+    {
+        const string sql = @"
+SELECT id AS Id,
+       guild_id AS GuildId,
+       channel_id AS ChannelId,
+       message_id AS MessageId,
+       participant_role_id AS ParticipantRoleId,
+       participant_role_delete_at AS ParticipantRoleDeleteAt,
+       title AS Title,
+       description AS Description,
+       prize_list AS PrizeList,
+       allow_duplicate_winners AS AllowDuplicateWinners,
+       winner_count AS WinnerCount,
+       status AS Status,
+       close_at AS CloseAt,
+       created_by_user_id AS CreatedByUserId,
+       created_by_name AS CreatedByName,
+       created_at AS CreatedAt,
+       updated_at AS UpdatedAt,
+       drawn_at AS DrawnAt,
+       canceled_at AS CanceledAt
+FROM public.lotteries
+WHERE close_at <= @NowUtc
+  AND (
+      status = @OpenStatus
+      OR (
+          status = @ClosedStatus
+          AND drawn_at IS NULL
+          AND EXISTS (
+              SELECT 1
+              FROM public.lottery_entries e
+              WHERE e.lottery_id = public.lotteries.id
+          )
+      )
+  )
+ORDER BY close_at ASC, id ASC
+LIMIT @MaxRows;";
+
+        await using var conn = CreateConnection();
+        var rows = await conn.QueryAsync<Lottery>(sql, new
+        {
+            OpenStatus = LotteryStatus.Open,
+            ClosedStatus = LotteryStatus.Closed,
+            NowUtc = nowUtc,
+            MaxRows = Math.Clamp(maxRows, 1, 1000)
+        });
+        return rows.ToList();
+    }
+
+    public async Task<IReadOnlyList<Lottery>> ListDueLotteryParticipantRoleDeletesAsync(DateTimeOffset nowUtc, int maxRows = 200)
+    {
+        const string sql = @"
+SELECT id AS Id,
+       guild_id AS GuildId,
+       channel_id AS ChannelId,
+       message_id AS MessageId,
+       participant_role_id AS ParticipantRoleId,
+       participant_role_delete_at AS ParticipantRoleDeleteAt,
+       title AS Title,
+       description AS Description,
+       prize_list AS PrizeList,
+       allow_duplicate_winners AS AllowDuplicateWinners,
+       winner_count AS WinnerCount,
+       status AS Status,
+       close_at AS CloseAt,
+       created_by_user_id AS CreatedByUserId,
+       created_by_name AS CreatedByName,
+       created_at AS CreatedAt,
+       updated_at AS UpdatedAt,
+       drawn_at AS DrawnAt,
+       canceled_at AS CanceledAt
+FROM public.lotteries
+WHERE participant_role_id IS NOT NULL
+  AND participant_role_delete_at IS NOT NULL
+  AND participant_role_delete_at <= @NowUtc
+ORDER BY participant_role_delete_at ASC, id ASC
+LIMIT @MaxRows;";
+
+        await using var conn = CreateConnection();
+        var rows = await conn.QueryAsync<Lottery>(sql, new
+        {
+            NowUtc = nowUtc,
+            MaxRows = Math.Clamp(maxRows, 1, 1000)
+        });
+        return rows.ToList();
+    }
+
+    public async Task<LotteryClaimChannel?> GetLotteryClaimChannelAsync(int lotteryId, ulong userId)
+    {
+        const string sql = @"
+SELECT id AS Id,
+       lottery_id AS LotteryId,
+       user_id AS UserId,
+       channel_id AS ChannelId,
+       control_message_id AS ControlMessageId,
+       is_closed AS IsClosed,
+       created_at AS CreatedAt,
+       updated_at AS UpdatedAt,
+       closed_at AS ClosedAt
+FROM public.lottery_claim_channels
+WHERE lottery_id = @LotteryId
+  AND user_id = @UserId
+LIMIT 1;";
+
+        await using var conn = CreateConnection();
+        return await conn.QuerySingleOrDefaultAsync<LotteryClaimChannel>(sql, new
+        {
+            LotteryId = lotteryId,
+            UserId = ToDbId(userId)
+        });
+    }
+
+    public async Task<LotteryClaimChannel?> GetLotteryClaimChannelByChannelIdAsync(ulong channelId)
+    {
+        const string sql = @"
+SELECT id AS Id,
+       lottery_id AS LotteryId,
+       user_id AS UserId,
+       channel_id AS ChannelId,
+       control_message_id AS ControlMessageId,
+       is_closed AS IsClosed,
+       created_at AS CreatedAt,
+       updated_at AS UpdatedAt,
+       closed_at AS ClosedAt
+FROM public.lottery_claim_channels
+WHERE channel_id = @ChannelId
+LIMIT 1;";
+
+        await using var conn = CreateConnection();
+        return await conn.QuerySingleOrDefaultAsync<LotteryClaimChannel>(sql, new
+        {
+            ChannelId = ToDbId(channelId)
+        });
+    }
+
+    public async Task UpsertLotteryClaimChannelIdAsync(int lotteryId, ulong userId, ulong channelId, DateTimeOffset nowUtc)
+    {
+        const string sql = @"
+INSERT INTO public.lottery_claim_channels (
+    lottery_id,
+    user_id,
+    channel_id,
+    control_message_id,
+    is_closed,
+    created_at,
+    updated_at,
+    closed_at
+)
+VALUES (
+    @LotteryId,
+    @UserId,
+    @ChannelId,
+    NULL,
+    FALSE,
+    @NowUtc,
+    @NowUtc,
+    NULL
+)
+ON CONFLICT (lottery_id, user_id) DO UPDATE
+SET channel_id = EXCLUDED.channel_id,
+    control_message_id = NULL,
+    is_closed = FALSE,
+    closed_at = NULL,
+    updated_at = EXCLUDED.updated_at;";
+
+        await using var conn = CreateConnection();
+        await conn.ExecuteAsync(sql, new
+        {
+            LotteryId = lotteryId,
+            UserId = ToDbId(userId),
+            ChannelId = ToDbId(channelId),
+            NowUtc = nowUtc
+        });
+    }
+
+    public async Task<bool> UpdateLotteryClaimChannelControlMessageIdAsync(int claimChannelId, ulong? messageId)
+    {
+        const string sql = @"
+UPDATE public.lottery_claim_channels
+SET control_message_id = @ControlMessageId,
+    updated_at = NOW()
+WHERE id = @ClaimChannelId;";
+
+        await using var conn = CreateConnection();
+        var affected = await conn.ExecuteAsync(sql, new
+        {
+            ClaimChannelId = claimChannelId,
+            ControlMessageId = messageId.HasValue ? (long?)ToDbId(messageId.Value) : null
+        });
+        return affected > 0;
+    }
+
+    public async Task<bool> UpdateLotteryClaimChannelClosedStateAsync(int claimChannelId, bool isClosed, DateTimeOffset nowUtc)
+    {
+        const string sql = @"
+UPDATE public.lottery_claim_channels
+SET is_closed = @IsClosed,
+    closed_at = CASE WHEN @IsClosed THEN @NowUtc ELSE NULL END,
+    updated_at = @NowUtc
+WHERE id = @ClaimChannelId;";
+
+        await using var conn = CreateConnection();
+        var affected = await conn.ExecuteAsync(sql, new
+        {
+            ClaimChannelId = claimChannelId,
+            IsClosed = isClosed,
+            NowUtc = nowUtc
+        });
+        return affected > 0;
+    }
+
+    public async Task<bool> DeleteLotteryClaimChannelAsync(int claimChannelId)
+    {
+        const string sql = @"
+DELETE FROM public.lottery_claim_channels
+WHERE id = @ClaimChannelId;";
+
+        await using var conn = CreateConnection();
+        var affected = await conn.ExecuteAsync(sql, new { ClaimChannelId = claimChannelId });
+        return affected > 0;
+    }
+
+    public async Task<bool> AddLotteryEntryAsync(int lotteryId, ulong userId, string userName, DateTimeOffset joinedAt)
+    {
+        const string sql = @"
+INSERT INTO public.lottery_entries (
+    lottery_id,
+    user_id,
+    user_name,
+    joined_at,
+    updated_at
+)
+VALUES (
+    @LotteryId,
+    @UserId,
+    @UserName,
+    @JoinedAt,
+    @JoinedAt
+)
+ON CONFLICT (lottery_id, user_id) DO NOTHING;";
+
+        await using var conn = CreateConnection();
+        var affected = await conn.ExecuteAsync(sql, new
+        {
+            LotteryId = lotteryId,
+            UserId = ToDbId(userId),
+            UserName = string.IsNullOrWhiteSpace(userName) ? userId.ToString() : userName.Trim(),
+            JoinedAt = joinedAt
+        });
+        return affected > 0;
+    }
+
+    public async Task<bool> RemoveLotteryEntryAsync(int lotteryId, ulong userId)
+    {
+        const string sql = @"
+DELETE FROM public.lottery_entries
+WHERE lottery_id = @LotteryId
+  AND user_id = @UserId;";
+
+        await using var conn = CreateConnection();
+        var affected = await conn.ExecuteAsync(sql, new
+        {
+            LotteryId = lotteryId,
+            UserId = ToDbId(userId)
+        });
+        return affected > 0;
+    }
+
+    public async Task<IReadOnlyList<LotteryEntry>> ListLotteryEntriesAsync(int lotteryId)
+    {
+        const string sql = @"
+SELECT id AS Id,
+       lottery_id AS LotteryId,
+       user_id AS UserId,
+       user_name AS UserName,
+       joined_at AS JoinedAt,
+       updated_at AS UpdatedAt
+FROM public.lottery_entries
+WHERE lottery_id = @LotteryId
+ORDER BY joined_at ASC, id ASC;";
+
+        await using var conn = CreateConnection();
+        var rows = await conn.QueryAsync<LotteryEntry>(sql, new { LotteryId = lotteryId });
+        return rows.ToList();
+    }
+
+    public async Task<IReadOnlyList<LotteryWinner>> ListLotteryWinnersAsync(int lotteryId)
+    {
+        const string sql = @"
+SELECT id AS Id,
+       lottery_id AS LotteryId,
+       user_id AS UserId,
+       user_name AS UserName,
+       winner_order AS WinnerOrder,
+       drawn_by_user_id AS DrawnByUserId,
+       drawn_at AS DrawnAt
+FROM public.lottery_winners
+WHERE lottery_id = @LotteryId
+ORDER BY winner_order ASC, id ASC;";
+
+        await using var conn = CreateConnection();
+        var rows = await conn.QueryAsync<LotteryWinner>(sql, new { LotteryId = lotteryId });
+        return rows.ToList();
+    }
+
+    public async Task<int> CountLotteryWinsForGuildUserAsync(ulong guildId, ulong userId)
+    {
+        const string sql = @"
+SELECT COUNT(1)
+FROM public.lottery_winners w
+INNER JOIN public.lotteries l
+    ON l.id = w.lottery_id
+WHERE l.guild_id = @GuildId
+  AND w.user_id = @UserId;";
+
+        await using var conn = CreateConnection();
+        return await conn.ExecuteScalarAsync<int>(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            UserId = ToDbId(userId)
+        });
+    }
+
+    public async Task ReplaceLotteryWinnersAsync(
+        int lotteryId,
+        IReadOnlyList<LotteryEntry> winners,
+        ulong drawnByUserId,
+        DateTimeOffset drawnAt)
+    {
+        const string clearSql = @"
+DELETE FROM public.lottery_winners
+WHERE lottery_id = @LotteryId;";
+
+        const string insertSql = @"
+INSERT INTO public.lottery_winners (
+    lottery_id,
+    user_id,
+    user_name,
+    winner_order,
+    drawn_by_user_id,
+    drawn_at
+)
+VALUES (
+    @LotteryId,
+    @UserId,
+    @UserName,
+    @WinnerOrder,
+    @DrawnByUserId,
+    @DrawnAt
+);";
+
+        await using var conn = CreateConnection();
+        await conn.OpenAsync();
+        await using var tx = await conn.BeginTransactionAsync();
+        await conn.ExecuteAsync(clearSql, new { LotteryId = lotteryId }, tx);
+
+        var order = 1;
+        foreach (var winner in winners)
+        {
+            await conn.ExecuteAsync(insertSql, new
+            {
+                LotteryId = lotteryId,
+                UserId = winner.UserId,
+                UserName = winner.UserName,
+                WinnerOrder = order++,
+                DrawnByUserId = ToDbId(drawnByUserId),
+                DrawnAt = drawnAt
+            }, tx);
+        }
+
+        await tx.CommitAsync();
+    }
+
+    public async Task<bool> UpdateLotteryStatusAsync(int lotteryId, string status, DateTimeOffset nowUtc)
+    {
+        const string sql = @"
+UPDATE public.lotteries
+SET status = @Status,
+    updated_at = @NowUtc,
+    drawn_at = CASE
+        WHEN @Status = 'DRAWN' THEN @NowUtc
+        ELSE drawn_at
+    END,
+    canceled_at = CASE
+        WHEN @Status = 'CANCELED' THEN @NowUtc
+        ELSE canceled_at
+    END
+WHERE id = @LotteryId;";
+
+        await using var conn = CreateConnection();
+        var affected = await conn.ExecuteAsync(sql, new
+        {
+            LotteryId = lotteryId,
+            Status = LotteryStatus.Normalize(status),
+            NowUtc = nowUtc
+        });
+        return affected > 0;
+    }
+
+    public async Task<bool> TryCloseLotteryIfExpiredAsync(int lotteryId, DateTimeOffset nowUtc)
+    {
+        const string sql = @"
+UPDATE public.lotteries
+SET status = @ClosedStatus,
+    updated_at = @NowUtc
+WHERE id = @LotteryId
+  AND status = @OpenStatus
+  AND close_at <= @NowUtc;";
+
+        await using var conn = CreateConnection();
+        var affected = await conn.ExecuteAsync(sql, new
+        {
+            LotteryId = lotteryId,
+            ClosedStatus = LotteryStatus.Closed,
+            OpenStatus = LotteryStatus.Open,
+            NowUtc = nowUtc
+        });
+        return affected > 0;
+    }
+
+    private static async Task<bool> TryReopenClosedFlexTargetForJoinAsync(
+        NpgsqlConnection conn,
+        System.Data.Common.DbTransaction tx,
+        IReadOnlyList<RecruitSlot> slots,
+        RecruitPostLockInfo postInfo,
+        RecruitSlot closedTarget,
+        IReadOnlyCollection<string> recruitPositions,
+        bool disallowDuplicateJobs,
+        long joiningUserId,
+        string clearSlotSql,
+        string updateSlotSql,
+        string closeFlexSlotSql,
+        ISet<string>? visitingClosedPositions = null)
+    {
+        if (!closedTarget.IsClosed || closedTarget.UserId.HasValue || string.IsNullOrWhiteSpace(closedTarget.FlexSpec))
+        {
+            return false;
+        }
+
+        var normalizedClosedPosition = closedTarget.Position?.Trim().ToUpperInvariant();
+        if (string.IsNullOrWhiteSpace(normalizedClosedPosition))
+        {
+            return false;
+        }
+
+        visitingClosedPositions ??= new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (!visitingClosedPositions.Add(normalizedClosedPosition))
+        {
+            return false;
+        }
+
+        try
+        {
+
+            var flexPositions = ParseFlexPositions(closedTarget.FlexSpec)
+                .Select(position => position.Trim().ToUpperInvariant())
+                .Where(position => !string.IsNullOrWhiteSpace(position))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            if (flexPositions.Length < 2 ||
+                !flexPositions.Contains(closedTarget.Position, StringComparer.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            var flexJobs = ParseFlexJobsSpec(closedTarget.FlexJobsSpec);
+            var currentJob = closedTarget.Job?.Trim().ToUpperInvariant();
+            if (flexJobs.Count == 0 && !string.IsNullOrWhiteSpace(currentJob))
+            {
+                flexJobs = new[] { currentJob };
+            }
+            else if (!string.IsNullOrWhiteSpace(currentJob) &&
+                     !flexJobs.Contains(currentJob, StringComparer.OrdinalIgnoreCase))
+            {
+                flexJobs = flexJobs
+                    .Append(currentJob)
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToArray();
+            }
+            if (flexJobs.Count == 0)
+            {
+                return false;
+            }
+
+            HashSet<string> BuildBlockedJobs()
+                => disallowDuplicateJobs
+                    ? slots
+                        .Where(slot =>
+                            !string.IsNullOrWhiteSpace(slot.Job) &&
+                            !string.Equals(slot.Position, closedTarget.Position, StringComparison.OrdinalIgnoreCase) &&
+                            ((slot.UserId.HasValue && slot.UserId.Value != joiningUserId) ||
+                             (slot.IsClosed && !slot.UserId.HasValue && ShouldReserveClosedSlotJobForDuplicateCheck(slot))))
+                        .Select(slot => slot.Job!.Trim().ToUpperInvariant())
+                        .ToHashSet(StringComparer.OrdinalIgnoreCase)
+                    : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var candidatePosition in flexPositions)
+            {
+                if (string.Equals(candidatePosition, closedTarget.Position, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                var candidateSlot = slots.FirstOrDefault(slot =>
+                    string.Equals(slot.Position, candidatePosition, StringComparison.OrdinalIgnoreCase));
+                if (candidateSlot is null)
+                {
+                    continue;
+                }
+
+                if (candidateSlot.IsClosed)
+                {
+                    var reopenedCandidate = await TryReopenClosedFlexTargetForJoinAsync(
+                        conn,
+                        tx,
+                        slots,
+                        postInfo,
+                        candidateSlot,
+                        recruitPositions,
+                        disallowDuplicateJobs,
+                        joiningUserId,
+                        clearSlotSql,
+                        updateSlotSql,
+                        closeFlexSlotSql,
+                        visitingClosedPositions);
+                    if (!reopenedCandidate)
+                    {
+                        continue;
+                    }
+                }
+
+                if (candidateSlot.UserId.HasValue)
+                {
+                    var relocated = await TryRelocateFlexibleOccupantForClosedFlexAsync(
+                        conn,
+                        tx,
+                        slots,
+                        postInfo,
+                        candidateSlot,
+                        recruitPositions,
+                        disallowDuplicateJobs,
+                        clearSlotSql,
+                        updateSlotSql);
+                    if (!relocated)
+                    {
+                        continue;
+                    }
+                }
+
+                if (candidateSlot.IsClosed || candidateSlot.UserId.HasValue)
+                {
+                    continue;
+                }
+
+                var blockedJobs = BuildBlockedJobs();
+                var candidateJob = flexJobs.FirstOrDefault(job =>
+                    IsJobAllowedForPosition(candidatePosition, job, recruitPositions) &&
+                    (string.IsNullOrWhiteSpace(candidateSlot.RequiredJob) ||
+                     string.Equals(candidateSlot.RequiredJob, job, StringComparison.OrdinalIgnoreCase)) &&
+                    (!disallowDuplicateJobs || !blockedJobs.Contains(job)));
+                if (string.IsNullOrWhiteSpace(candidateJob))
+                {
+                    continue;
+                }
+
+                var normalizedFlexSpec = NormalizeFlexSpec(closedTarget.FlexSpec);
+                var normalizedFlexJobsSpec = NormalizeFlexJobsSpec(closedTarget.FlexJobsSpec);
+                await conn.ExecuteAsync(clearSlotSql, new { Id = closedTarget.Id }, transaction: tx);
+                closedTarget.UserId = null;
+                closedTarget.UserName = null;
+                closedTarget.FlexSpec = null;
+                closedTarget.FlexJobsSpec = null;
+                closedTarget.Job = null;
+                closedTarget.Comment = null;
+                closedTarget.IsClosed = false;
+
+                await conn.ExecuteAsync(closeFlexSlotSql, new
+                {
+                    Id = candidateSlot.Id,
+                    FlexSpec = normalizedFlexSpec,
+                    FlexJobsSpec = normalizedFlexJobsSpec,
+                    Job = candidateJob
+                }, transaction: tx);
+                candidateSlot.UserId = null;
+                candidateSlot.UserName = null;
+                candidateSlot.FlexSpec = normalizedFlexSpec;
+                candidateSlot.FlexJobsSpec = normalizedFlexJobsSpec;
+                candidateSlot.Job = candidateJob;
+                candidateSlot.Comment = null;
+                candidateSlot.IsClosed = true;
+                return true;
+            }
+
+            return false;
+        }
+        finally
+        {
+            visitingClosedPositions.Remove(normalizedClosedPosition);
+        }
+    }
+
+    private static async Task<bool> TryRelocateFlexibleOccupantForClosedFlexAsync(
+        NpgsqlConnection conn,
+        System.Data.Common.DbTransaction tx,
+        IReadOnlyList<RecruitSlot> slots,
+        RecruitPostLockInfo postInfo,
+        RecruitSlot occupiedSlot,
+        IReadOnlyCollection<string> recruitPositions,
+        bool disallowDuplicateJobs,
+        string clearSlotSql,
+        string updateSlotSql)
+    {
+        if (!occupiedSlot.UserId.HasValue)
+        {
+            return true;
+        }
+
+        var occupyingUserId = occupiedSlot.UserId.Value;
+        var occupyingUserName = string.IsNullOrWhiteSpace(occupiedSlot.UserName)
+            ? occupyingUserId == postInfo.CreatorUserId ? "主催" : "参加者"
+            : occupiedSlot.UserName!;
+        var occupyingComment = NullIfBlank(occupiedSlot.Comment);
+
+        IReadOnlyList<string> occupyingFlexPositions;
+        IReadOnlyList<string> occupyingFlexJobs;
+        if (occupyingUserId == postInfo.CreatorUserId)
+        {
+            occupyingFlexPositions = ParseFlexPositions(postInfo.HostFlexSpec);
+            occupyingFlexJobs = ParseFlexJobsSpec(postInfo.HostFlexJobsSpec);
+        }
+        else
+        {
+            occupyingFlexPositions = ParseFlexPositions(occupiedSlot.FlexSpec);
+            occupyingFlexJobs = ParseFlexJobsSpec(occupiedSlot.FlexJobsSpec);
+        }
+
+        if (occupyingFlexPositions.Count < 2 ||
+            !occupyingFlexPositions.Contains(occupiedSlot.Position, StringComparer.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var currentOccupyingJob = occupiedSlot.Job?.Trim().ToUpperInvariant();
+        if (occupyingFlexJobs.Count == 0 && !string.IsNullOrWhiteSpace(currentOccupyingJob))
+        {
+            occupyingFlexJobs = new[] { currentOccupyingJob };
+        }
+        else if (!string.IsNullOrWhiteSpace(currentOccupyingJob) &&
+                 !occupyingFlexJobs.Contains(currentOccupyingJob, StringComparer.OrdinalIgnoreCase))
+        {
+            occupyingFlexJobs = occupyingFlexJobs
+                .Append(currentOccupyingJob)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+        }
+        if (occupyingFlexJobs.Count == 0)
+        {
+            return false;
+        }
+
+        var orderedOccupyingJobs = occupyingFlexJobs
+            .OrderBy(job => string.Equals(job, currentOccupyingJob, StringComparison.OrdinalIgnoreCase) ? 0 : 1)
+            .ThenBy(job => job, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        foreach (var alternate in slots.Where(slot =>
+                     !string.Equals(slot.Position, occupiedSlot.Position, StringComparison.OrdinalIgnoreCase) &&
+                     occupyingFlexPositions.Contains(slot.Position, StringComparer.OrdinalIgnoreCase) &&
+                     !slot.IsClosed &&
+                     (!slot.UserId.HasValue || slot.UserId.Value == occupyingUserId)))
+        {
+            foreach (var candidateJob in orderedOccupyingJobs)
+            {
+                if (!IsJobAllowedForPosition(alternate.Position, candidateJob, recruitPositions))
+                {
+                    continue;
+                }
+
+                if (!string.IsNullOrWhiteSpace(alternate.RequiredJob) &&
+                    !string.Equals(alternate.RequiredJob, candidateJob, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                if (disallowDuplicateJobs)
+                {
+                    var duplicateWithOthers = slots.Any(slot =>
+                        !string.IsNullOrWhiteSpace(slot.Job) &&
+                        string.Equals(slot.Job, candidateJob, StringComparison.OrdinalIgnoreCase) &&
+                        !string.Equals(slot.Position, occupiedSlot.Position, StringComparison.OrdinalIgnoreCase) &&
+                        !string.Equals(slot.Position, alternate.Position, StringComparison.OrdinalIgnoreCase) &&
+                        ((slot.UserId.HasValue && slot.UserId.Value != occupyingUserId) ||
+                         (slot.IsClosed && !slot.UserId.HasValue && ShouldReserveClosedSlotJobForDuplicateCheck(slot))));
+                    if (duplicateWithOthers)
+                    {
+                        continue;
+                    }
+                }
+
+                var storedFlexSpec = occupyingUserId == postInfo.CreatorUserId ? null : NormalizeFlexSpec(occupiedSlot.FlexSpec);
+                var storedFlexJobsSpec = occupyingUserId == postInfo.CreatorUserId ? null : NormalizeFlexJobsSpec(occupiedSlot.FlexJobsSpec);
+                if (string.IsNullOrWhiteSpace(storedFlexSpec))
+                {
+                    storedFlexJobsSpec = null;
+                }
+
+                await conn.ExecuteAsync(clearSlotSql, new { Id = occupiedSlot.Id }, transaction: tx);
+                occupiedSlot.UserId = null;
+                occupiedSlot.UserName = null;
+                occupiedSlot.FlexSpec = null;
+                occupiedSlot.FlexJobsSpec = null;
+                occupiedSlot.Job = null;
+                occupiedSlot.Comment = null;
+                occupiedSlot.IsClosed = false;
+
+                await conn.ExecuteAsync(updateSlotSql, new
+                {
+                    Id = alternate.Id,
+                    UserId = occupyingUserId,
+                    UserName = occupyingUserName,
+                    FlexSpec = storedFlexSpec,
+                    FlexJobsSpec = storedFlexJobsSpec,
+                    Job = candidateJob,
+                    Comment = occupyingComment
+                }, transaction: tx);
+                alternate.UserId = occupyingUserId;
+                alternate.UserName = occupyingUserName;
+                alternate.FlexSpec = storedFlexSpec;
+                alternate.FlexJobsSpec = storedFlexJobsSpec;
+                alternate.Job = candidateJob;
+                alternate.Comment = occupyingComment;
+                alternate.IsClosed = false;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static IReadOnlyList<string> ParseFlexPositions(string? flexSpec)
+    {
+        if (string.IsNullOrWhiteSpace(flexSpec))
+        {
+            return Array.Empty<string>();
+        }
+
+        var normalized = flexSpec.Trim();
+        if (normalized.StartsWith("FLEX:", StringComparison.OrdinalIgnoreCase))
+        {
+            normalized = normalized[5..].Trim();
+        }
+        else if (normalized.StartsWith("FLEX(", StringComparison.OrdinalIgnoreCase) &&
+                 normalized.EndsWith(")", StringComparison.Ordinal))
+        {
+            normalized = normalized[5..^1].Trim();
+        }
+        else if (string.Equals(normalized, "FLEX", StringComparison.OrdinalIgnoreCase))
+        {
+            normalized = "ANY";
+        }
+
+        if (string.IsNullOrWhiteSpace(normalized))
+        {
+            return Array.Empty<string>();
+        }
+
+        return normalized
+            .Split(new[] { ',', '/', '|', '，', '／', '｜', '、' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(position => position.Trim().ToUpperInvariant())
+            .Where(position => !string.IsNullOrWhiteSpace(position))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
+    private static string? NormalizeFlexSpec(string? flexSpec)
+    {
+        var positions = ParseFlexPositions(flexSpec);
+        if (positions.Count == 0)
+        {
+            return null;
+        }
+
+        return string.Join(',', positions);
+    }
+
+    private static IReadOnlyList<string> ParseFlexJobsSpec(string? jobsSpec)
+    {
+        if (string.IsNullOrWhiteSpace(jobsSpec))
+        {
+            return Array.Empty<string>();
+        }
+
+        return jobsSpec
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(job => job.Trim().ToUpperInvariant())
+            .Where(job => !string.IsNullOrWhiteSpace(job))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
+    private static string? NormalizeFlexJobsSpec(string? jobsSpec)
+    {
+        var jobs = ParseFlexJobsSpec(jobsSpec);
+        if (jobs.Count == 0)
+        {
+            return null;
+        }
+
+        return string.Join(',', jobs.OrderBy(job => job, StringComparer.OrdinalIgnoreCase));
+    }
+
+    private static bool ShouldReserveFlexibleJobForDuplicateCheck(string? flexSpec, IReadOnlyList<string> candidateJobs)
+    {
+        if (candidateJobs.Count <= 1)
+        {
+            return true;
+        }
+
+        var positions = ParseFlexPositions(flexSpec);
+        return positions.Count < 2;
+    }
+
+    private static bool ShouldReserveClosedSlotJobForDuplicateCheck(RecruitSlot slot)
+    {
+        if (string.IsNullOrWhiteSpace(slot.Job))
+        {
+            return false;
+        }
+
+        var candidateJobs = ParseFlexJobsSpec(slot.FlexJobsSpec);
+        if (candidateJobs.Count == 0)
+        {
+            candidateJobs = new[] { slot.Job.Trim().ToUpperInvariant() };
+        }
+
+        return ShouldReserveFlexibleJobForDuplicateCheck(slot.FlexSpec, candidateJobs);
+    }
+
+    private static bool HasReservedClosedJobConflict(
+        IReadOnlyCollection<RecruitSlot> slots,
+        string job,
+        string targetPosition)
+    {
+        if (string.IsNullOrWhiteSpace(job))
+        {
+            return false;
+        }
+
+        var normalizedJob = job.Trim().ToUpperInvariant();
+        return slots.Any(slot =>
+            slot.IsClosed &&
+            !slot.UserId.HasValue &&
+            !string.IsNullOrWhiteSpace(slot.Job) &&
+            string.Equals(slot.Job.Trim(), normalizedJob, StringComparison.OrdinalIgnoreCase) &&
+            !string.Equals(slot.Position, targetPosition, StringComparison.OrdinalIgnoreCase) &&
+            ShouldReserveClosedSlotJobForDuplicateCheck(slot));
+    }
+
+    private static bool IsJobAllowedForPosition(string position, string job, IReadOnlyCollection<string> recruitPositions)
+    {
+        if (!RecruitmentRules.TryGetJobsForRecruit(position, recruitPositions, out var jobs))
+        {
+            return false;
+        }
+
+        return jobs.Any(option => string.Equals(option.Code, job, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static bool ShouldFixHostFlexToCurrentPosition(
+        RecruitPostLockInfo postInfo,
+        IReadOnlyCollection<RecruitSlot> slots,
+        IReadOnlyCollection<string> recruitPositions)
+    {
+        var hostFlexPositions = ParseFlexPositions(postInfo.HostFlexSpec);
+        if (hostFlexPositions.Count < 2)
+        {
+            return true;
+        }
+
+        var hostSlot = slots.FirstOrDefault(slot =>
+            slot.UserId.HasValue &&
+            slot.UserId.Value == postInfo.CreatorUserId &&
+            hostFlexPositions.Contains(slot.Position, StringComparer.OrdinalIgnoreCase));
+        if (hostSlot is null)
+        {
+            return false;
+        }
+
+        if (!hostFlexPositions.Contains(hostSlot.Position, StringComparer.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        var hostJobs = ParseFlexJobsSpec(postInfo.HostFlexJobsSpec);
+        if (hostJobs.Count == 0 && !string.IsNullOrWhiteSpace(hostSlot.Job))
+        {
+            hostJobs = new[] { hostSlot.Job.Trim().ToUpperInvariant() };
+        }
+        if (hostJobs.Count == 0)
+        {
+            return true;
+        }
+
+        // Keep host FLEX unless the setting itself is invalid.
+        // Availability can temporarily drop to one due to other joins/closures.
+        return false;
+    }
+
+    private static async Task NormalizeParticipantFlexSlotsAsync(
+        NpgsqlConnection conn,
+        System.Data.Common.DbTransaction tx,
+        IReadOnlyList<RecruitSlot> slots,
+        IReadOnlyCollection<string> recruitPositions,
+        long creatorUserId,
+        bool disallowDuplicateJobs)
+    {
+        const string clearParticipantFlexSql = @"
+UPDATE recruit_slots
+SET flex_spec = NULL,
+    flex_jobs_spec = NULL,
+    updated_at = NOW()
+WHERE id = @Id;";
+
+        foreach (var slot in slots)
+        {
+            if (!slot.UserId.HasValue ||
+                slot.UserId.Value == creatorUserId ||
+                string.IsNullOrWhiteSpace(slot.FlexSpec))
+            {
+                continue;
+            }
+
+            if (!ShouldFixParticipantFlexToCurrentPosition(slot, slots, recruitPositions, disallowDuplicateJobs))
+            {
+                continue;
+            }
+
+            await conn.ExecuteAsync(clearParticipantFlexSql, new { Id = slot.Id }, transaction: tx);
+            slot.FlexSpec = null;
+            slot.FlexJobsSpec = null;
+        }
+    }
+
+    private static bool ShouldFixParticipantFlexToCurrentPosition(
+        RecruitSlot participantSlot,
+        IReadOnlyCollection<RecruitSlot> _slots,
+        IReadOnlyCollection<string> _recruitPositions,
+        bool _disallowDuplicateJobs)
+    {
+        if (!participantSlot.UserId.HasValue)
+        {
+            return false;
+        }
+
+        var flexPositions = ParseFlexPositions(participantSlot.FlexSpec);
+        if (flexPositions.Count < 2)
+        {
+            return true;
+        }
+
+        if (!flexPositions.Contains(participantSlot.Position, StringComparer.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        var participantJobs = ParseFlexJobsSpec(participantSlot.FlexJobsSpec);
+        if (participantJobs.Count == 0 && !string.IsNullOrWhiteSpace(participantSlot.Job))
+        {
+            participantJobs = new[] { participantSlot.Job.Trim().ToUpperInvariant() };
+        }
+        if (participantJobs.Count == 0)
+        {
+            return true;
+        }
+
+        // Keep participant FLEX unless the setting itself is invalid.
+        // Availability can temporarily drop to one due to other joins/closures.
+        return false;
+    }
+
+    private static async Task<bool> TryRebalanceFlexibleAssignmentsAsync(
+        NpgsqlConnection conn,
+        System.Data.Common.DbTransaction tx,
+        IReadOnlyList<RecruitSlot> slots,
+        RecruitPostLockInfo postInfo,
+        IReadOnlyCollection<string> recruitPositions,
+        long incomingUserId,
+        string incomingUserName,
+        string incomingPosition,
+        string incomingJob,
+        string? incomingComment,
+        string? incomingFlexSpec,
+        string? incomingFlexJobsSpec,
+        bool disallowDuplicateJobs,
+        string clearSlotSql,
+        string updateSlotSql)
+    {
+        var normalizedIncomingPosition = incomingPosition.Trim().ToUpperInvariant();
+        var normalizedIncomingJob = incomingJob.Trim().ToUpperInvariant();
+        if (string.IsNullOrWhiteSpace(normalizedIncomingPosition) || string.IsNullOrWhiteSpace(normalizedIncomingJob))
+        {
+            return false;
+        }
+
+        var slotByPosition = slots
+            .GroupBy(slot => slot.Position, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(group => group.Key, group => group.First(), StringComparer.OrdinalIgnoreCase);
+        if (!slotByPosition.TryGetValue(normalizedIncomingPosition, out var incomingTarget) ||
+            incomingTarget.IsClosed)
+        {
+            return false;
+        }
+
+        var actorsByUser = new Dictionary<long, RebalanceActor>();
+        foreach (var slot in slots.Where(slot => slot.UserId.HasValue))
+        {
+            var actor = BuildRebalanceActorForExistingSlot(slot, postInfo, slotByPosition);
+            if (actor is null)
+            {
+                return false;
+            }
+
+            actorsByUser[actor.UserId] = actor;
+        }
+
+        var incomingIsHost = incomingUserId == postInfo.CreatorUserId;
+        var storedIncomingFlexSpec = incomingIsHost ? null : NormalizeFlexSpec(incomingFlexSpec);
+        var storedIncomingFlexJobsSpec = incomingIsHost ? null : NormalizeFlexJobsSpec(incomingFlexJobsSpec);
+        if (string.IsNullOrWhiteSpace(storedIncomingFlexSpec))
+        {
+            storedIncomingFlexJobsSpec = null;
+        }
+
+        var incomingRawPositions = ParseFlexPositions(incomingFlexSpec);
+        var incomingUseFlexPositions = incomingRawPositions.Count >= 2 &&
+                                       incomingRawPositions.Contains(normalizedIncomingPosition, StringComparer.OrdinalIgnoreCase);
+        var incomingAllowedPositions = (incomingUseFlexPositions
+                ? incomingRawPositions
+                : new[] { normalizedIncomingPosition })
+            .Where(position =>
+                slotByPosition.TryGetValue(position, out var candidate) &&
+                !candidate.IsClosed)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        if (incomingAllowedPositions.Length == 0)
+        {
+            incomingAllowedPositions = new[] { normalizedIncomingPosition };
+        }
+
+        var incomingRawJobs = ParseFlexJobsSpec(incomingFlexJobsSpec);
+        var incomingAllowedJobs = incomingRawJobs
+            .Where(job => !string.IsNullOrWhiteSpace(job))
+            .Select(job => job.Trim().ToUpperInvariant())
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        if (incomingAllowedJobs.Count == 0)
+        {
+            incomingAllowedJobs.Add(normalizedIncomingJob);
+        }
+        else if (!incomingAllowedJobs.Contains(normalizedIncomingJob, StringComparer.OrdinalIgnoreCase))
+        {
+            incomingAllowedJobs.Add(normalizedIncomingJob);
+        }
+
+        var incomingActor = new RebalanceActor(
+            UserId: incomingUserId,
+            UserName: incomingUserName,
+            Comment: incomingComment,
+            IsHost: incomingIsHost,
+            StoredFlexSpec: storedIncomingFlexSpec,
+            StoredFlexJobsSpec: storedIncomingFlexJobsSpec,
+            AllowedPositions: incomingAllowedPositions,
+            AllowedJobs: incomingAllowedJobs.ToArray(),
+            PreferredPosition: normalizedIncomingPosition,
+            PreferredJob: normalizedIncomingJob);
+        actorsByUser[incomingUserId] = incomingActor;
+
+        var actors = actorsByUser.Values.ToArray();
+        if (actors.Length == 0)
+        {
+            return false;
+        }
+
+        if (actors.Any(actor => actor.AllowedPositions.Count == 0 || actor.AllowedJobs.Count == 0))
+        {
+            return false;
+        }
+
+        var blockedJobs = disallowDuplicateJobs
+            ? slots
+                .Where(slot =>
+                    slot.IsClosed &&
+                    !slot.UserId.HasValue &&
+                    ShouldReserveClosedSlotJobForDuplicateCheck(slot) &&
+                    !string.IsNullOrWhiteSpace(slot.Job))
+                .Select(slot => slot.Job!.Trim().ToUpperInvariant())
+                .ToHashSet(StringComparer.OrdinalIgnoreCase)
+            : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        var orderedActors = actors
+            .OrderBy(actor => actor.UserId == incomingUserId ? 0 : 1)
+            .ThenBy(actor => actor.AllowedPositions.Count * Math.Max(actor.AllowedJobs.Count, 1))
+            .ThenBy(actor => actor.AllowedPositions.Count)
+            .ThenBy(actor => actor.UserId)
+            .ToArray();
+        var usedPositions = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var usedJobs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var assignments = new Dictionary<long, RebalanceAssignment>();
+
+        bool Search(int index)
+        {
+            if (index >= orderedActors.Length)
+            {
+                return true;
+            }
+
+            var actor = orderedActors[index];
+            var candidatePositions = actor.AllowedPositions
+                .OrderBy(position => string.Equals(position, actor.PreferredPosition, StringComparison.OrdinalIgnoreCase) ? 0 : 1)
+                .ThenBy(position => position, StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            foreach (var candidatePosition in candidatePositions)
+            {
+                if (usedPositions.Contains(candidatePosition))
+                {
+                    continue;
+                }
+
+                if (!slotByPosition.TryGetValue(candidatePosition, out var slot))
+                {
+                    continue;
+                }
+
+                if (slot.IsClosed && (!slot.UserId.HasValue || slot.UserId.Value != actor.UserId))
+                {
+                    continue;
+                }
+
+                var candidateJobs = actor.AllowedJobs
+                    .OrderBy(job => string.Equals(job, actor.PreferredJob, StringComparison.OrdinalIgnoreCase) ? 0 : 1)
+                    .ThenBy(job => job, StringComparer.OrdinalIgnoreCase)
+                    .ToArray();
+                foreach (var candidateJob in candidateJobs)
+                {
+                    if (string.IsNullOrWhiteSpace(candidateJob))
+                    {
+                        continue;
+                    }
+
+                    if (!IsJobAllowedForPosition(candidatePosition, candidateJob, recruitPositions))
+                    {
+                        continue;
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(slot.RequiredJob) &&
+                        !string.Equals(slot.RequiredJob, candidateJob, StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    if (disallowDuplicateJobs &&
+                        (blockedJobs.Contains(candidateJob) || usedJobs.Contains(candidateJob)))
+                    {
+                        continue;
+                    }
+
+                    usedPositions.Add(candidatePosition);
+                    if (disallowDuplicateJobs)
+                    {
+                        usedJobs.Add(candidateJob);
+                    }
+
+                    assignments[actor.UserId] = new RebalanceAssignment(candidatePosition, candidateJob);
+                    if (Search(index + 1))
+                    {
+                        return true;
+                    }
+
+                    assignments.Remove(actor.UserId);
+                    usedPositions.Remove(candidatePosition);
+                    if (disallowDuplicateJobs)
+                    {
+                        usedJobs.Remove(candidateJob);
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        if (!Search(0))
+        {
+            return false;
+        }
+
+        if (!assignments.TryGetValue(incomingUserId, out var incomingAssignment) ||
+            !string.Equals(incomingAssignment.Position, normalizedIncomingPosition, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var actorUserIds = actorsByUser.Keys.ToHashSet();
+        foreach (var occupied in slots.Where(slot => slot.UserId.HasValue && actorUserIds.Contains(slot.UserId.Value)).ToArray())
+        {
+            await conn.ExecuteAsync(clearSlotSql, new { Id = occupied.Id }, transaction: tx);
+            occupied.UserId = null;
+            occupied.UserName = null;
+            occupied.FlexSpec = null;
+            occupied.FlexJobsSpec = null;
+            occupied.Job = null;
+            occupied.Comment = null;
+            occupied.IsClosed = false;
+        }
+
+        foreach (var pair in assignments)
+        {
+            if (!actorsByUser.TryGetValue(pair.Key, out var actor))
+            {
+                continue;
+            }
+
+            var assigned = pair.Value;
+            if (!slotByPosition.TryGetValue(assigned.Position, out var destination))
+            {
+                return false;
+            }
+
+            await conn.ExecuteAsync(updateSlotSql, new
+            {
+                Id = destination.Id,
+                UserId = actor.UserId,
+                UserName = actor.UserName,
+                FlexSpec = actor.StoredFlexSpec,
+                FlexJobsSpec = actor.StoredFlexJobsSpec,
+                Job = assigned.Job,
+                Comment = actor.Comment
+            }, transaction: tx);
+
+            destination.UserId = actor.UserId;
+            destination.UserName = actor.UserName;
+            destination.FlexSpec = actor.StoredFlexSpec;
+            destination.FlexJobsSpec = actor.StoredFlexJobsSpec;
+            destination.Job = assigned.Job;
+            destination.Comment = actor.Comment;
+            destination.IsClosed = false;
+        }
+
+        return true;
+    }
+
+    private static RebalanceActor? BuildRebalanceActorForExistingSlot(
+        RecruitSlot slot,
+        RecruitPostLockInfo postInfo,
+        IReadOnlyDictionary<string, RecruitSlot> slotByPosition)
+    {
+        if (!slot.UserId.HasValue)
+        {
+            return null;
+        }
+
+        var userId = slot.UserId.Value;
+        var currentPosition = slot.Position.Trim().ToUpperInvariant();
+        var currentJob = slot.Job?.Trim().ToUpperInvariant();
+        if (string.IsNullOrWhiteSpace(currentPosition) || string.IsNullOrWhiteSpace(currentJob))
+        {
+            return null;
+        }
+
+        var isHost = userId == postInfo.CreatorUserId;
+        var rawPositions = isHost ? ParseFlexPositions(postInfo.HostFlexSpec) : ParseFlexPositions(slot.FlexSpec);
+        var useFlex = rawPositions.Count >= 2 && rawPositions.Contains(currentPosition, StringComparer.OrdinalIgnoreCase);
+        var allowedPositions = (useFlex ? rawPositions : new[] { currentPosition })
+            .Where(position =>
+                slotByPosition.TryGetValue(position, out var candidate) &&
+                !candidate.IsClosed)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        if (allowedPositions.Length == 0)
+        {
+            if (!slotByPosition.TryGetValue(currentPosition, out var currentSlot) || currentSlot.IsClosed)
+            {
+                return null;
+            }
+
+            allowedPositions = new[] { currentPosition };
+        }
+
+        var rawJobs = isHost ? ParseFlexJobsSpec(postInfo.HostFlexJobsSpec) : ParseFlexJobsSpec(slot.FlexJobsSpec);
+        var allowedJobs = (rawJobs.Count > 0 ? rawJobs : new[] { currentJob })
+            .Where(job => !string.IsNullOrWhiteSpace(job))
+            .Select(job => job.Trim().ToUpperInvariant())
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        if (allowedJobs.Length == 0)
+        {
+            return null;
+        }
+
+        var storedFlexSpec = isHost ? null : NormalizeFlexSpec(slot.FlexSpec);
+        var storedFlexJobsSpec = isHost ? null : NormalizeFlexJobsSpec(slot.FlexJobsSpec);
+        if (string.IsNullOrWhiteSpace(storedFlexSpec))
+        {
+            storedFlexJobsSpec = null;
+        }
+
+        return new RebalanceActor(
+            UserId: userId,
+            UserName: string.IsNullOrWhiteSpace(slot.UserName) ? (isHost ? "主催" : "参加者") : slot.UserName!,
+            Comment: NullIfBlank(slot.Comment),
+            IsHost: isHost,
+            StoredFlexSpec: storedFlexSpec,
+            StoredFlexJobsSpec: storedFlexJobsSpec,
+            AllowedPositions: allowedPositions,
+            AllowedJobs: allowedJobs,
+            PreferredPosition: currentPosition,
+            PreferredJob: currentJob);
+    }
+
+    private sealed record RebalanceActor(
+        long UserId,
+        string UserName,
+        string? Comment,
+        bool IsHost,
+        string? StoredFlexSpec,
+        string? StoredFlexJobsSpec,
+        IReadOnlyList<string> AllowedPositions,
+        IReadOnlyList<string> AllowedJobs,
+        string PreferredPosition,
+        string PreferredJob);
+
+    private sealed record RebalanceAssignment(string Position, string Job);
+
     private static ulong ToUlong(long id) => unchecked((ulong)id);
     private static long ToDbId(ulong id) => unchecked((long)id);
 
@@ -2911,6 +5780,14 @@ WHERE guild_id = @GuildId
         var trimmed = value?.Trim();
         return string.IsNullOrWhiteSpace(trimmed) ? null : trimmed;
     }
+}
+
+public sealed class RecruitPostLockInfo
+{
+    public short Status { get; set; }
+    public long CreatorUserId { get; set; }
+    public string? HostFlexSpec { get; set; }
+    public string? HostFlexJobsSpec { get; set; }
 }
 
 public sealed record RecruitPositionUpdateResult(bool Success, IReadOnlyList<string> BlockedPositions);

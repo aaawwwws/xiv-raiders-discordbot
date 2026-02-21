@@ -146,7 +146,7 @@ public sealed class StatsEmbedService
 
         var specs = BuildChartSpecs(registered);
         var desiredTitles = new HashSet<string>(specs.Select(spec => spec.EmbedTitle), StringComparer.Ordinal);
-        var existingMessages = await ListManagedStatsMessagesAsync(channel, guild.CurrentUser.Id, desiredTitles);
+        var existingMessages = await ListManagedStatsMessagesAsync(channel, guild.CurrentUser.Id, desiredTitles, panel);
         var existingByTitle = existingMessages
             .Where(message => message.Embeds.FirstOrDefault()?.Title is not null)
             .GroupBy(message => message.Embeds.First().Title!, StringComparer.Ordinal)
@@ -262,13 +262,85 @@ public sealed class StatsEmbedService
     private async Task<IReadOnlyList<IUserMessage>> ListManagedStatsMessagesAsync(
         IMessageChannel channel,
         ulong botUserId,
-        IReadOnlySet<string> desiredTitles)
+        IReadOnlySet<string> desiredTitles,
+        GuildStatsPanel? panel = null)
     {
         const int pageSize = 100;
         const int maxScanMessages = 2000;
 
-        var managed = new List<IUserMessage>();
+        var managedById = new Dictionary<ulong, IUserMessage>();
         var foundDesired = new HashSet<string>(StringComparer.Ordinal);
+        void TrackManagedMessage(IUserMessage message)
+        {
+            if (message.Author.Id != botUserId)
+            {
+                return;
+            }
+
+            var title = message.Embeds.FirstOrDefault()?.Title;
+            if (!IsManagedStatsTitle(title))
+            {
+                return;
+            }
+
+            managedById[message.Id] = message;
+            if (!string.IsNullOrWhiteSpace(title) && desiredTitles.Contains(title))
+            {
+                foundDesired.Add(title);
+            }
+        }
+
+        if (panel is not null)
+        {
+            var seedIds = new[] { panel.DataCenterMessageId, panel.WorldMessageId }
+                .Where(id => id > 0)
+                .Select(ToUlong)
+                .Distinct()
+                .ToArray();
+            foreach (var seedId in seedIds)
+            {
+                IUserMessage? seed = null;
+                try
+                {
+                    seed = await channel.GetMessageAsync(seedId) as IUserMessage;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "Failed to load stats seed message. MessageId={MessageId}", seedId);
+                }
+
+                if (seed is null)
+                {
+                    continue;
+                }
+
+                TrackManagedMessage(seed);
+
+                foreach (var direction in new[] { Direction.Before, Direction.After })
+                {
+                    try
+                    {
+                        var nearby = await channel.GetMessagesAsync(seed.Id, direction, 50).FlattenAsync();
+                        foreach (var nearbyMessage in nearby.OfType<IUserMessage>())
+                        {
+                            TrackManagedMessage(nearbyMessage);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogDebug(ex, "Failed to load nearby stats messages. MessageId={MessageId} Direction={Direction}", seed.Id, direction);
+                    }
+                }
+            }
+
+            if (desiredTitles.Count > 0 && foundDesired.Count >= desiredTitles.Count)
+            {
+                return managedById.Values
+                    .OrderByDescending(message => message.Id)
+                    .ToArray();
+            }
+        }
+
         ulong? beforeMessageId = null;
         var scanned = 0;
 
@@ -287,22 +359,7 @@ public sealed class StatsEmbedService
             scanned += pageMessages.Count;
             foreach (var message in pageMessages)
             {
-                if (message.Author.Id != botUserId)
-                {
-                    continue;
-                }
-
-                var title = message.Embeds.FirstOrDefault()?.Title;
-                if (!IsManagedStatsTitle(title))
-                {
-                    continue;
-                }
-
-                managed.Add(message);
-                if (!string.IsNullOrWhiteSpace(title) && desiredTitles.Contains(title))
-                {
-                    foundDesired.Add(title);
-                }
+                TrackManagedMessage(message);
             }
 
             if (desiredTitles.Count > 0 && foundDesired.Count >= desiredTitles.Count)
@@ -317,7 +374,9 @@ public sealed class StatsEmbedService
             }
         }
 
-        return managed;
+        return managedById.Values
+            .OrderByDescending(message => message.Id)
+            .ToArray();
     }
 
     private static bool IsManagedStatsTitle(string? title)

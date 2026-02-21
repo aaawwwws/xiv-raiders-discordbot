@@ -8,6 +8,7 @@ namespace RaidDcBot.Services;
 public sealed class LodestoneClient
 {
     private static readonly Regex LodestoneIdRegex = new(@"lodestone/character/(\d+)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex LodestoneCwlsIdRegex = new(@"lodestone/crossworld_linkshell/([0-9a-f]+)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private readonly HttpClient _httpClient;
     private readonly HashSet<string> _allowedHosts;
 
@@ -71,7 +72,44 @@ public sealed class LodestoneClient
         return $"https://{uri.Host}/lodestone/character/{lodestoneId}/";
     }
 
-    public async Task<string> FetchProfileHtmlAsync(string url, CancellationToken cancellationToken = default)
+    public bool TryNormalizeCwlsUrl(string url, out string normalizedUrl, out string error)
+    {
+        normalizedUrl = string.Empty;
+        error = string.Empty;
+
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri))
+        {
+            error = "URLの形式が正しくありません。";
+            return false;
+        }
+
+        if (!string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
+        {
+            error = "https:// のLodestone URLのみ対応しています。";
+            return false;
+        }
+
+        if (!IsAllowedHost(uri.Host))
+        {
+            error = "Lodestone公式ドメインのURLのみ対応しています。";
+            return false;
+        }
+
+        var match = LodestoneCwlsIdRegex.Match(uri.AbsoluteUri);
+        if (!match.Success)
+        {
+            error = "LodestoneのCWLSページURLを入力してください。";
+            return false;
+        }
+
+        normalizedUrl = $"https://{uri.Host}/lodestone/crossworld_linkshell/{match.Groups[1].Value}/";
+        return true;
+    }
+
+    public Task<string> FetchProfileHtmlAsync(string url, CancellationToken cancellationToken = default)
+        => FetchHtmlAsync(url, cancellationToken);
+
+    public async Task<string> FetchHtmlAsync(string url, CancellationToken cancellationToken = default)
     {
         using var request = new HttpRequestMessage(HttpMethod.Get, url);
         var response = await _httpClient.SendAsync(request, cancellationToken);
@@ -207,6 +245,41 @@ public sealed class LodestoneClient
         return true;
     }
 
+    public bool TryParseCwls(string html, string sourceUrl, out LodestoneCwlsProfile profile)
+    {
+        profile = default!;
+
+        var name = TryExtractCwlsName(html);
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            return false;
+        }
+
+        var dc = FindElementText(html, new[]
+        {
+            new ElementPattern("heading__cwls__dcname", "span")
+        });
+
+        var memberCount = TryExtractInteger(
+            html,
+            "<div\\s+class=\"parts__total\">\\s*(\\d+)\\s*人\\s*</div>");
+
+        var formedAt = TryExtractCwlsFormedAt(html);
+        var iconUrl = FindCwlsIconUrl(html);
+        var members = ParseCwlsMembers(html, sourceUrl);
+
+        profile = new LodestoneCwlsProfile(
+            name,
+            string.IsNullOrWhiteSpace(dc) ? null : dc,
+            memberCount,
+            formedAt,
+            sourceUrl,
+            iconUrl,
+            members);
+
+        return true;
+    }
+
     private static bool TryParseFromOgTitle(string html, out LodestoneProfile profile)
     {
         profile = default!;
@@ -261,6 +334,37 @@ public sealed class LodestoneClient
             || value.Contains("FINAL FANTASY", StringComparison.OrdinalIgnoreCase);
     }
 
+    private static string? TryExtractCwlsName(string html)
+    {
+        var ogTitle = FindMetaContent(html, "property", "og:title");
+        if (!string.IsNullOrWhiteSpace(ogTitle))
+        {
+            var parts = ogTitle.Split('|', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length > 0 && !string.IsNullOrWhiteSpace(parts[0]))
+            {
+                return parts[0];
+            }
+        }
+
+        var headingMatch = Regex.Match(
+            html,
+            "<h3[^>]*class=[\"'][^\"']*heading__linkshell__name[^\"']*[\"'][^>]*>(?<inner>.*?)</h3>",
+            RegexOptions.IgnoreCase | RegexOptions.Singleline);
+        if (!headingMatch.Success)
+        {
+            return null;
+        }
+
+        var inner = Regex.Replace(
+            headingMatch.Groups["inner"].Value,
+            "<span[^>]*class=[\"'][^\"']*heading__cwls__dcname[^\"']*[\"'][^>]*>.*?</span>",
+            string.Empty,
+            RegexOptions.IgnoreCase | RegexOptions.Singleline);
+
+        var normalized = NormalizeInnerText(inner);
+        return string.IsNullOrWhiteSpace(normalized) ? null : normalized;
+    }
+
     private static string? FindElementText(string html, IEnumerable<ElementPattern> patterns)
     {
         foreach (var pattern in patterns)
@@ -297,6 +401,182 @@ public sealed class LodestoneClient
         }
 
         return WebUtility.HtmlDecode(match.Groups[1].Value).Trim();
+    }
+
+    private static int? TryExtractInteger(string html, string pattern)
+    {
+        var match = Regex.Match(html, pattern, RegexOptions.IgnoreCase | RegexOptions.Singleline);
+        if (!match.Success || !int.TryParse(match.Groups[1].Value, out var value))
+        {
+            return null;
+        }
+
+        return value;
+    }
+
+    private static DateTimeOffset? TryExtractCwlsFormedAt(string html)
+    {
+        var formedMatch = Regex.Match(
+            html,
+            "heading__cwls__formed.*?ldst_strftime\\((\\d+),\\s*'YMD'\\)",
+            RegexOptions.IgnoreCase | RegexOptions.Singleline);
+        if (!formedMatch.Success || !long.TryParse(formedMatch.Groups[1].Value, out var epoch))
+        {
+            return null;
+        }
+
+        try
+        {
+            return DateTimeOffset.FromUnixTimeSeconds(epoch);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static string? FindCwlsIconUrl(string html)
+    {
+        var match = Regex.Match(
+            html,
+            "<div[^>]*class=[\"'][^\"']*heading__linkshell__icon[^\"']*[\"'][^>]*>\\s*<img[^>]*src=[\"']([^\"']+)[\"']",
+            RegexOptions.IgnoreCase | RegexOptions.Singleline);
+        if (!match.Success)
+        {
+            return FindMetaContent(html, "property", "og:image");
+        }
+
+        return WebUtility.HtmlDecode(match.Groups[1].Value).Trim();
+    }
+
+    private static IReadOnlyList<LodestoneCwlsMember> ParseCwlsMembers(string html, string sourceUrl)
+    {
+        var list = new List<LodestoneCwlsMember>();
+        Uri? sourceUri = null;
+        if (Uri.TryCreate(sourceUrl, UriKind.Absolute, out var parsed))
+        {
+            sourceUri = parsed;
+        }
+
+        var start = Regex.Match(
+            html,
+            "<div\\s+class=[\"'][^\"']*ls__member[^\"']*[\"'][^>]*>",
+            RegexOptions.IgnoreCase | RegexOptions.Singleline);
+        if (!start.Success)
+        {
+            return list;
+        }
+
+        var remaining = html[start.Index..];
+        var pager = Regex.Match(
+            remaining,
+            "<ul[^>]*class=[\"'][^\"']*btn__pager[^\"']*[\"'][^>]*>",
+            RegexOptions.IgnoreCase | RegexOptions.Singleline);
+        var side = Regex.Match(
+            remaining,
+            "<div[^>]*class=[\"'][^\"']*ldst__side[^\"']*[\"'][^>]*>",
+            RegexOptions.IgnoreCase | RegexOptions.Singleline);
+
+        var cutCandidates = new List<int>();
+        if (pager.Success)
+        {
+            cutCandidates.Add(pager.Index);
+        }
+
+        if (side.Success)
+        {
+            cutCandidates.Add(side.Index);
+        }
+
+        var section = cutCandidates.Count > 0
+            ? remaining[..cutCandidates.Min()]
+            : remaining;
+
+        var matches = Regex.Matches(
+            section,
+            "<a(?=[^>]*href=[\"'](?<char>/lodestone/character/\\d+/)[\"'])(?=[^>]*class=[\"'][^\"']*entry__link[^\"']*[\"'])[^>]*>.*?" +
+            "<p[^>]*class=[\"'][^\"']*entry__name[^\"']*[\"'][^>]*>(?<name>.*?)</p>.*?" +
+            "<p[^>]*class=[\"'][^\"']*entry__world[^\"']*[\"'][^>]*>(?<world>.*?)</p>.*?" +
+            "(?:<div[^>]*class=[\"'][^\"']*entry__chara_info__linkshell[^\"']*[\"'][^>]*>(?<rank>.*?)</div>)?",
+            RegexOptions.IgnoreCase | RegexOptions.Singleline);
+
+        foreach (Match match in matches)
+        {
+            var name = NormalizeInnerText(match.Groups["name"].Value);
+            var worldText = NormalizeInnerText(match.Groups["world"].Value);
+            if (string.IsNullOrWhiteSpace(name) || string.IsNullOrWhiteSpace(worldText))
+            {
+                continue;
+            }
+
+            var rankText = match.Groups["rank"].Success
+                ? NormalizeInnerText(match.Groups["rank"].Value)
+                : null;
+            var rank = string.IsNullOrWhiteSpace(rankText) ? null : rankText;
+            var characterPath = WebUtility.HtmlDecode(match.Groups["char"].Value).Trim();
+            if (TryParseWorldText(worldText, out var world, out var dataCenter))
+            {
+                list.Add(new LodestoneCwlsMember(
+                    name,
+                    world,
+                    dataCenter,
+                    string.IsNullOrWhiteSpace(rank) ? null : rank,
+                    ToAbsoluteUrl(sourceUri, characterPath)));
+            }
+            else
+            {
+                list.Add(new LodestoneCwlsMember(
+                    name,
+                    worldText,
+                    null,
+                    string.IsNullOrWhiteSpace(rank) ? null : rank,
+                    ToAbsoluteUrl(sourceUri, characterPath)));
+            }
+        }
+
+        return list;
+    }
+
+    private static string ToAbsoluteUrl(Uri? sourceUri, string pathOrUrl)
+    {
+        if (string.IsNullOrWhiteSpace(pathOrUrl))
+        {
+            return string.Empty;
+        }
+
+        if (Uri.TryCreate(pathOrUrl, UriKind.Absolute, out var absolute))
+        {
+            return absolute.ToString();
+        }
+
+        if (sourceUri is not null && Uri.TryCreate(sourceUri, pathOrUrl, out var combined))
+        {
+            return combined.ToString();
+        }
+
+        return pathOrUrl;
+    }
+
+    private static string? FindClassText(string html, string className)
+    {
+        var match = Regex.Match(
+            html,
+            $"<[^>]+class=[\"'][^\"']*{Regex.Escape(className)}[^\"']*[\"'][^>]*>(?<inner>.*?)</[^>]+>",
+            RegexOptions.IgnoreCase | RegexOptions.Singleline);
+        if (!match.Success)
+        {
+            return null;
+        }
+
+        var normalized = NormalizeInnerText(match.Groups["inner"].Value);
+        return string.IsNullOrWhiteSpace(normalized) ? null : normalized;
+    }
+
+    private static string NormalizeInnerText(string html)
+    {
+        var stripped = Regex.Replace(html, "<.*?>", string.Empty, RegexOptions.Singleline);
+        var decoded = WebUtility.HtmlDecode(stripped).Trim();
+        return Regex.Replace(decoded, "\\s+", " ");
     }
 
     private static string? FindPortraitImage(string html)

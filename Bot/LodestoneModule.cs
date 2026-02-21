@@ -3,6 +3,7 @@ using Discord.Interactions;
 using Discord.WebSocket;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using System.Text;
 using RaidDcBot.Data;
 using RaidDcBot.Models;
 using RaidDcBot.Services;
@@ -22,6 +23,7 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
     private const string MemberProfileEditModalCustomId = "member_profile_edit_modal";
     private const string MemberRegistrationApprovePrefix = "member_registration_review_approve";
     private const string MemberRegistrationRejectPrefix = "member_registration_review_reject";
+    private const string CwlsChannelName = "cwls";
     private static readonly TimeSpan MemberRegistrationDraftTimeout = TimeSpan.FromMinutes(15);
 
     private readonly Db _db;
@@ -76,6 +78,56 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
 
         await _db.UpsertGuildLodestonePanelAsync(Context.Guild.Id, channel.Id, lodestoneMessage.Id);
         await FollowupAsync("このチャンネルにLodestone連携パネルを設置しました。", ephemeral: true);
+    }
+
+    [RequireBotAdmin]
+    [SlashCommand("cwls", "CWLS情報を取得してcwlsチャンネルへ投稿します")]
+    public async Task PostCwlsAsync([Summary(description: "LodestoneのCWLSページURL")] string url)
+    {
+        if (Context.Guild is null)
+        {
+            await RespondAsync("このコマンドはサーバー内でのみ使えます。", ephemeral: true);
+            return;
+        }
+
+        await DeferAsync(ephemeral: true);
+
+        if (!_lodestone.TryNormalizeCwlsUrl(url, out var normalizedUrl, out var normalizeError))
+        {
+            await RespondEphemeralAsync(normalizeError, followup: true);
+            return;
+        }
+
+        string html;
+        try
+        {
+            html = await _lodestone.FetchHtmlAsync(normalizedUrl);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to fetch CWLS page.");
+            await RespondEphemeralAsync($"CWLSページの取得に失敗しました: {ex.Message}", followup: true);
+            return;
+        }
+
+        if (!_lodestone.TryParseCwls(html, normalizedUrl, out var cwls))
+        {
+            await RespondEphemeralAsync("CWLSページの解析に失敗しました。URLを確認してください。", followup: true);
+            return;
+        }
+
+        var channel = Context.Guild.TextChannels.FirstOrDefault(text =>
+            string.Equals(text.Name, CwlsChannelName, StringComparison.OrdinalIgnoreCase));
+        if (channel is null)
+        {
+            await RespondEphemeralAsync($"`{CwlsChannelName}` チャンネルが見つかりません。", followup: true);
+            return;
+        }
+
+        var embed = BuildCwlsEmbed(cwls);
+        await channel.SendMessageAsync(embed: embed, flags: MessageFlags.SuppressNotification);
+
+        await RespondEphemeralAsync($"`{channel.Name}` にCWLS情報を投稿しました。", followup: true);
     }
 
     [ComponentInteraction(LodestonePanel.IssueCustomId, ignoreGroupNames: true)]
@@ -932,6 +984,92 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
 
     private static MessageComponent BuildMemberRegistrationStartComponents()
         => MemberRegistrationPanel.BuildComponents();
+
+    private static Embed BuildCwlsEmbed(LodestoneCwlsProfile cwls)
+    {
+        var total = cwls.MemberCount ?? cwls.Members.Count;
+        var roleSummary = BuildCwlsRoleSummary(cwls.Members);
+        var memberLines = BuildCwlsMemberLines(cwls.Members, 30);
+
+        var builder = new EmbedBuilder()
+            .WithTitle($"CWLS: {cwls.Name}")
+            .WithUrl(cwls.Url)
+            .WithColor(Color.Blue)
+            .AddField("DC", string.IsNullOrWhiteSpace(cwls.DataCenter) ? "不明" : cwls.DataCenter, true)
+            .AddField("人数", $"{total}人", true)
+            .AddField("結成日", cwls.FormedAt.HasValue ? $"<t:{cwls.FormedAt.Value.ToUnixTimeSeconds()}:D>" : "不明", true)
+            .AddField("ランク内訳", roleSummary, false)
+            .AddField("メンバー", memberLines, false)
+            .WithFooter($"取得: {DateTimeOffset.Now:yyyy/MM/dd HH:mm:ss}");
+
+        if (!string.IsNullOrWhiteSpace(cwls.IconUrl))
+        {
+            builder.WithThumbnailUrl(cwls.IconUrl);
+        }
+
+        return builder.Build();
+    }
+
+    private static string BuildCwlsRoleSummary(IReadOnlyList<LodestoneCwlsMember> members)
+    {
+        var groups = members
+            .Where(member => !string.IsNullOrWhiteSpace(member.Rank))
+            .GroupBy(member => member.Rank!, StringComparer.Ordinal)
+            .OrderByDescending(group => group.Count())
+            .ThenBy(group => group.Key, StringComparer.Ordinal)
+            .Select(group => $"{group.Key}: {group.Count()}");
+
+        var summary = string.Join(" / ", groups);
+        return string.IsNullOrWhiteSpace(summary) ? "なし" : summary;
+    }
+
+    private static string BuildCwlsMemberLines(IReadOnlyList<LodestoneCwlsMember> members, int maxLines)
+    {
+        if (members.Count == 0)
+        {
+            return "メンバーを取得できませんでした。";
+        }
+
+        var builder = new StringBuilder();
+        var maxChars = 980;
+        var lines = Math.Min(maxLines, members.Count);
+        var appended = 0;
+
+        for (var i = 0; i < lines; i++)
+        {
+            var member = members[i];
+            var world = string.IsNullOrWhiteSpace(member.DataCenter)
+                ? member.World
+                : $"{member.World} [{member.DataCenter}]";
+            var rankSuffix = string.IsNullOrWhiteSpace(member.Rank) ? string.Empty : $" ({member.Rank})";
+            var line = $"・{member.Name} - {world}{rankSuffix}";
+            var needed = line.Length + (appended > 0 ? Environment.NewLine.Length : 0);
+            if (builder.Length + needed > maxChars)
+            {
+                break;
+            }
+
+            if (appended > 0)
+            {
+                builder.AppendLine();
+            }
+
+            builder.Append(line);
+            appended++;
+        }
+
+        if (members.Count > appended)
+        {
+            if (builder.Length > 0)
+            {
+                builder.AppendLine();
+            }
+
+            builder.Append($"... 他 {members.Count - appended} 名");
+        }
+
+        return builder.ToString();
+    }
 
     private static MessageComponent BuildMemberRegistrationSubmitComponents()
         => new ComponentBuilder()

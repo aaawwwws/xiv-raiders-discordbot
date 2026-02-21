@@ -17,6 +17,9 @@ public sealed class RecruitPost
     public DateTimeOffset? ScheduleAt { get; set; }
     public DateTimeOffset? ReminderSentAt { get; set; }
     public string? Note { get; set; }
+    public bool DisallowDuplicateJobs { get; set; } = true;
+    public string? HostFlexSpec { get; set; }
+    public string? HostFlexJobsSpec { get; set; }
     public DateTimeOffset CreatedAt { get; set; }
     public DateTimeOffset UpdatedAt { get; set; }
 }
