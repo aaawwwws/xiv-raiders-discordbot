@@ -43,8 +43,9 @@ public sealed class DiscordBotService : IHostedService
     private static readonly TimeSpan JapanTimeOffset = TimeSpan.FromHours(9);
     private static readonly TimeSpan FailureAlertCooldown = TimeSpan.FromMinutes(15);
     private static readonly TimeSpan LotteryParticipantRoleRetention = TimeSpan.FromHours(24);
+    private static readonly TimeSpan RecruitClosedArtifactRetention = TimeSpan.FromHours(24);
+    private static readonly TimeSpan RecruitCanceledArtifactRetention = TimeSpan.FromHours(24);
     private const string RecruitScheduleFormat = "yyyy/MM/dd HH:mm";
-    private const int RecruitArtifactRetentionDays = 7;
     private CancellationTokenSource? _cleanupCts;
     private Task? _cleanupTask;
     private CancellationTokenSource? _recruitScheduleCts;
@@ -417,7 +418,10 @@ public sealed class DiscordBotService : IHostedService
 
     private async Task CleanupLoopAsync(CancellationToken token)
     {
-        var interval = TimeSpan.FromHours(12);
+        var configuredMinutes = _options.CleanupIntervalMinutes <= 0
+            ? 10
+            : _options.CleanupIntervalMinutes;
+        var interval = TimeSpan.FromMinutes(Math.Clamp(configuredMinutes, 1, 720));
         while (!token.IsCancellationRequested)
         {
             await RunCleanupAsync();
@@ -1043,8 +1047,9 @@ public sealed class DiscordBotService : IHostedService
 
     private async Task CleanupRecruitArtifactsAsync(DateTimeOffset nowUtc)
     {
-        var cutoffUtc = nowUtc.AddDays(-RecruitArtifactRetentionDays);
-        var targets = await _db.ListRecruitPostsPastRetentionAsync(cutoffUtc);
+        var closedCutoffUtc = nowUtc.Subtract(RecruitClosedArtifactRetention);
+        var canceledCutoffUtc = nowUtc.Subtract(RecruitCanceledArtifactRetention);
+        var targets = await _db.ListRecruitPostsDueForArtifactCleanupAsync(closedCutoffUtc, canceledCutoffUtc);
         if (targets.Count == 0)
         {
             return;
@@ -1110,9 +1115,10 @@ public sealed class DiscordBotService : IHostedService
         if (deletedCount > 0)
         {
             _logger.LogInformation(
-                "Cleaned up {Count} recruit posts older than {Days} days after close/cancel.",
+                "Cleaned up {Count} recruit posts due for artifact cleanup. closed=start+{ClosedHours}h, canceled=cancel+{CanceledHours}h",
                 deletedCount,
-                RecruitArtifactRetentionDays);
+                RecruitClosedArtifactRetention.TotalHours,
+                RecruitCanceledArtifactRetention.TotalHours);
         }
     }
 

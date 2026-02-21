@@ -27,6 +27,7 @@ public sealed class DiscordOptions
     public int VoiceProfileMaxBioLength { get; init; } = 250;
     public bool LogIncludeMessageContent { get; init; } = true;
     public string[] LogIgnoreChannelNames { get; init; } = Array.Empty<string>();
+    public int CleanupIntervalMinutes { get; init; } = 10;
     public int MessageLogRetentionDays { get; init; } = 0;
     public bool AttachmentArchiveEnabled { get; init; } = true;
     public string AttachmentArchiveRootPath { get; init; } = "data/attachments";

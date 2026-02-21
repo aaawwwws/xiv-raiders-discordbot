@@ -1025,7 +1025,9 @@ WHERE reacted_at < NOW() - (@Days * INTERVAL '1 day');";
         return await conn.ExecuteAsync(sql, new { Days = retentionDays });
     }
 
-    public async Task<IReadOnlyList<RecruitPost>> ListRecruitPostsPastRetentionAsync(DateTimeOffset cutoffUtc)
+    public async Task<IReadOnlyList<RecruitPost>> ListRecruitPostsDueForArtifactCleanupAsync(
+        DateTimeOffset closedCutoffUtc,
+        DateTimeOffset canceledCutoffUtc)
     {
         const string sql = @"
 SELECT id AS Id,
@@ -1049,13 +1051,25 @@ SELECT id AS Id,
        created_at AS CreatedAt,
        updated_at AS UpdatedAt
 FROM recruit_posts
-WHERE status IN (2, 3)
-  AND COALESCE(closed_at, updated_at) <= @CutoffUtc
-ORDER BY COALESCE(closed_at, updated_at) ASC
+WHERE (
+        status = @ClosedStatus
+    AND COALESCE(schedule_at, closed_at, updated_at) <= @ClosedCutoffUtc
+)
+   OR (
+        status = @CanceledStatus
+    AND COALESCE(closed_at, updated_at) <= @CanceledCutoffUtc
+)
+ORDER BY COALESCE(schedule_at, closed_at, updated_at) ASC
 LIMIT 200;";
 
         await using var conn = CreateConnection();
-        var rows = await conn.QueryAsync<RecruitPost>(sql, new { CutoffUtc = cutoffUtc });
+        var rows = await conn.QueryAsync<RecruitPost>(sql, new
+        {
+            ClosedStatus = (int)RecruitPostStatus.Closed,
+            CanceledStatus = (int)RecruitPostStatus.Canceled,
+            ClosedCutoffUtc = closedCutoffUtc,
+            CanceledCutoffUtc = canceledCutoffUtc
+        });
         return rows.ToList();
     }
 

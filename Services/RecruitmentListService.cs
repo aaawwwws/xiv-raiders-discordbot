@@ -116,13 +116,8 @@ public sealed class RecruitmentListService
     public async Task<Embed> BuildListEmbedAsync(ulong guildId)
     {
         var posts = await _db.ListRecruitPostSummariesAsync(guildId);
-        var nowUtc = DateTimeOffset.UtcNow;
         var visible = posts
-            .Where(post =>
-                post.Status is RecruitPostStatus.Open or RecruitPostStatus.Full ||
-                (post.Status == RecruitPostStatus.Closed &&
-                 post.ScheduleAt.HasValue &&
-                 post.ScheduleAt.Value > nowUtc))
+            .Where(post => post.Status is RecruitPostStatus.Open or RecruitPostStatus.Full)
             .ToList();
 
         var builder = new EmbedBuilder()
