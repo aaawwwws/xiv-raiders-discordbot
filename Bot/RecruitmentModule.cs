@@ -8159,28 +8159,7 @@ public sealed class RecruitmentModule : InteractionModuleBase<SocketInteractionC
     {
         var creatorName = Context.User.GlobalName ?? Context.User.Username;
         var positions = draft.Positions;
-        var preFilledCount = draft.PreFilledSlots.Count + draft.PreFilledFlexSlots.Count + draft.PreFilledMembers.Count;
         var hostWillBeAssigned = !string.IsNullOrWhiteSpace(hostJob) && !TryParseFlexPositionToken(hostPosition, out _);
-        var initialFilledCount = preFilledCount + (hostWillBeAssigned ? 1 : 0);
-        var initialStatus = initialFilledCount >= positions.Count
-            ? RecruitPostStatus.Full
-            : RecruitPostStatus.Open;
-
-        var postDraft = new RecruitPost
-        {
-            Status = initialStatus,
-            Title = draft.Title,
-            DataCenter = draft.DataCenter,
-            ScheduleText = draft.Schedule,
-            ScheduleAt = draft.ScheduleAt,
-            Note = draft.Note,
-            DisallowDuplicateJobs = draft.DisallowDuplicateJobs,
-            HostFlexSpec = draft.HostFlexSpec,
-            HostFlexJobsSpec = draft.HostFlexJobsSpec,
-            CreatorUserId = ToDbId(Context.User.Id),
-            CreatedAt = DateTimeOffset.UtcNow,
-            UpdatedAt = DateTimeOffset.UtcNow
-        };
 
         var slots = positions
             .Select(position => new RecruitSlot
@@ -8246,6 +8225,27 @@ public sealed class RecruitmentModule : InteractionModuleBase<SocketInteractionC
             hostSlot.Job = hostJob;
             hostSlot.Comment = null;
         }
+
+        var initialFilledCount = slots.Count(slot => slot.UserId.HasValue || slot.IsClosed);
+        var initialStatus = initialFilledCount >= positions.Count
+            ? RecruitPostStatus.Full
+            : RecruitPostStatus.Open;
+
+        var postDraft = new RecruitPost
+        {
+            Status = initialStatus,
+            Title = draft.Title,
+            DataCenter = draft.DataCenter,
+            ScheduleText = draft.Schedule,
+            ScheduleAt = draft.ScheduleAt,
+            Note = draft.Note,
+            DisallowDuplicateJobs = draft.DisallowDuplicateJobs,
+            HostFlexSpec = draft.HostFlexSpec,
+            HostFlexJobsSpec = draft.HostFlexJobsSpec,
+            CreatorUserId = ToDbId(Context.User.Id),
+            CreatedAt = DateTimeOffset.UtcNow,
+            UpdatedAt = DateTimeOffset.UtcNow
+        };
 
         var embed = BuildRecruitEmbed(postDraft, slots, draft.DisallowDuplicateJobs);
         IUserMessage? posted = null;

@@ -589,28 +589,68 @@ public sealed class InquiryModule : InteractionModuleBase<SocketInteractionConte
         return guild.Roles.FirstOrDefault(r => string.Equals(r.Name, roleName, StringComparison.OrdinalIgnoreCase));
     }
 
-    private static Task ApplyInquiryPermissionsAsync(IGuildChannel channel, SocketGuild guild, SocketGuildUser requester, IRole? adminRole)
+    private async Task ApplyInquiryPermissionsAsync(IGuildChannel channel, SocketGuild guild, SocketGuildUser requester, IRole? adminRole)
     {
         var denyEveryone = new OverwritePermissions(viewChannel: PermValue.Deny);
         var allowParticipant = BuildInquiryParticipantPermissions();
-        var tasks = new List<Task>
+
+        await channel.AddPermissionOverwriteAsync(guild.EveryoneRole, denyEveryone);
+        try
         {
-            channel.AddPermissionOverwriteAsync(guild.EveryoneRole, denyEveryone),
-            channel.AddPermissionOverwriteAsync(requester, allowParticipant)
-        };
+            await channel.AddPermissionOverwriteAsync(requester, allowParticipant);
+        }
+        catch
+        {
+            IGuildUser? restRequester = null;
+            try
+            {
+                restRequester = await Context.Client.Rest.GetGuildUserAsync(guild.Id, requester.Id);
+            }
+            catch
+            {
+            }
+
+            if (restRequester is null)
+            {
+                throw;
+            }
+
+            await channel.AddPermissionOverwriteAsync(restRequester, allowParticipant);
+        }
 
         if (adminRole is not null)
         {
-            tasks.Add(channel.AddPermissionOverwriteAsync(adminRole, allowParticipant));
+            try
+            {
+                await channel.AddPermissionOverwriteAsync(adminRole, allowParticipant);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(
+                    ex,
+                    "Failed to grant inquiry admin role permission. GuildId={GuildId}, ChannelId={ChannelId}, RoleId={RoleId}",
+                    guild.Id,
+                    channel.Id,
+                    adminRole.Id);
+            }
         }
-
-        return Task.WhenAll(tasks);
     }
 
     private async Task ApplyTicketPermissionStateAsync(SocketTextChannel channel, SocketGuild guild, InquiryTicket ticket, bool closed)
     {
         var adminRole = ResolveAdminRole(guild);
-        var requester = guild.GetUser(ToUlong(ticket.RequesterUserId));
+        var requesterUserId = ToUlong(ticket.RequesterUserId);
+        IGuildUser? requester = guild.GetUser(requesterUserId);
+        if (requester is null)
+        {
+            try
+            {
+                requester = await Context.Client.Rest.GetGuildUserAsync(guild.Id, requesterUserId);
+            }
+            catch
+            {
+            }
+        }
         var denyEveryone = new OverwritePermissions(viewChannel: PermValue.Deny);
 
         await channel.AddPermissionOverwriteAsync(guild.EveryoneRole, denyEveryone);
@@ -618,6 +658,14 @@ public sealed class InquiryModule : InteractionModuleBase<SocketInteractionConte
         {
             var permissions = closed ? BuildInquiryReadOnlyPermissions() : BuildInquiryParticipantPermissions();
             await channel.AddPermissionOverwriteAsync(requester, permissions);
+        }
+        else
+        {
+            _logger.LogWarning(
+                "Failed to resolve inquiry requester while applying permissions. GuildId={GuildId}, ChannelId={ChannelId}, RequesterUserId={RequesterUserId}",
+                guild.Id,
+                channel.Id,
+                requesterUserId);
         }
 
         if (adminRole is not null)
@@ -651,8 +699,26 @@ public sealed class InquiryModule : InteractionModuleBase<SocketInteractionConte
             props.Topic = $"問い合わせ: {requester} ({requester.Id})";
         });
 
-        await ApplyInquiryPermissionsAsync(created, guild, requester, adminRole);
-        return created;
+        try
+        {
+            await ApplyInquiryPermissionsAsync(created, guild, requester, adminRole);
+            return created;
+        }
+        catch
+        {
+            try
+            {
+                await created.DeleteAsync(new RequestOptions
+                {
+                    AuditLogReason = $"Inquiry channel permission apply failed. UserId={requester.Id}"
+                });
+            }
+            catch
+            {
+            }
+
+            throw;
+        }
     }
 
     private async Task TryRefreshInquiryManagementPanelAsync(SocketGuild guild)
