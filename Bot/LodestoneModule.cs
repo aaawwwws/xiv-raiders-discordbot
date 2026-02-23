@@ -1363,7 +1363,8 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
             profile,
             title: "メンバー登録プレビュー",
             color: Color.Blue,
-            descriptionPrefix: "送信前確認");
+            descriptionPrefix: "送信前確認",
+            includeDiscordDateFields: false);
 
     private async Task<Embed> BuildMemberRegistrationReviewEmbedAsync(SocketGuildUser guildUser, DiscordUserProfile profile)
         => await BuildMemberRegistrationSummaryEmbedAsync(
@@ -1371,14 +1372,16 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
             profile,
             title: "メンバー登録申請",
             color: Color.Orange,
-            descriptionPrefix: "申請者");
+            descriptionPrefix: "申請者",
+            includeDiscordDateFields: true);
 
     private async Task<Embed> BuildMemberRegistrationSummaryEmbedAsync(
         SocketGuildUser guildUser,
         DiscordUserProfile profile,
         string title,
         Color color,
-        string descriptionPrefix)
+        string descriptionPrefix,
+        bool includeDiscordDateFields)
     {
         var guild = Context.Guild!;
         var roleDefinitions = await LoadMemberContentRoleDefinitionsAsync(guild.Id);
@@ -1392,8 +1395,18 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
         var bio = string.IsNullOrWhiteSpace(profile.Bio) ? "(なし)" : TruncateForLog(profile.Bio, 900);
         var displayName = string.IsNullOrWhiteSpace(profile.DisplayName) ? guildUser.DisplayName : profile.DisplayName;
         var discordName = string.IsNullOrWhiteSpace(profile.DiscordName) ? guildUser.Username : profile.DiscordName;
-        var discordCreatedAt = $"<t:{guildUser.CreatedAt.ToUnixTimeSeconds()}:F>";
-        var joinedAt = guildUser.JoinedAt.HasValue ? $"<t:{guildUser.JoinedAt.Value.ToUnixTimeSeconds()}:F>" : "(不明)";
+        var discordLines = new List<string>
+        {
+            $"表示名: {TruncateForLog(displayName, 120)}",
+            $"ユーザー名: {TruncateForLog(discordName, 120)}"
+        };
+        if (includeDiscordDateFields)
+        {
+            var discordCreatedAt = $"<t:{guildUser.CreatedAt.ToUnixTimeSeconds()}:F>";
+            var joinedAt = guildUser.JoinedAt.HasValue ? $"<t:{guildUser.JoinedAt.Value.ToUnixTimeSeconds()}:F>" : "(不明)";
+            discordLines.Add($"Discord開始日: {discordCreatedAt}");
+            discordLines.Add($"サーバー参加日: {joinedAt}");
+        }
 
         var avatar = guildUser.GetAvatarUrl() ?? guildUser.GetDisplayAvatarUrl();
         var embed = new EmbedBuilder()
@@ -1401,7 +1414,7 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
             .WithColor(color)
             .WithCurrentTimestamp()
             .WithDescription($"{descriptionPrefix}: {guildUser.Mention}\nUserId: `{guildUser.Id}`")
-            .AddField("Discord", $"表示名: {TruncateForLog(displayName, 120)}\nユーザー名: {TruncateForLog(discordName, 120)}\nDiscord開始日: {discordCreatedAt}\nサーバー参加日: {joinedAt}", false)
+            .AddField("Discord", string.Join('\n', discordLines), false)
             .AddField("FFXIV", $"{ffxivName}@{ffxivWorld} [{dataCenter}]", false)
             .AddField("SNS", $"𝕏: {TruncateForLog(xText, 120)}\nBluesky: {TruncateForLog(blueskyText, 120)}", false)
             .AddField("一言", bio, false)

@@ -1218,7 +1218,7 @@ public sealed class RecruitmentModule : InteractionModuleBase<SocketInteractionC
         }
 
         var previous = await _db.GetRecruitSlotByUserAsync(post.Id, Context.User.Id);
-        var displayName = (Context.User as SocketGuildUser)?.DisplayName ?? Context.User.GlobalName ?? Context.User.Username;
+        var displayName = await ResolveRecruitStoredUserNameAsync(Context.User);
         var (status, assignedPosition, assignedJob) = await AssignRecruitSlotByContextAsync(post, context, Context.User.Id, displayName, comment);
         var isFlexRequest = !context.ForceFixedSelection &&
                             (context.CandidatePositions is { Count: > 1 } ||
@@ -3753,7 +3753,7 @@ public sealed class RecruitmentModule : InteractionModuleBase<SocketInteractionC
             var selectedJobLabel = string.Join('/', selectedJobs);
 
             await DeferAsync(ephemeral: true);
-            var flexDisplayName = selectedUser.DisplayName ?? selectedUser.GlobalName ?? selectedUser.Username;
+            var flexDisplayName = await ResolveRecruitStoredUserNameAsync(selectedUser);
             var flexStatus = await _db.AssignRecruitSlotAsync(
                 post.Id,
                 anchorPosition,
@@ -3805,7 +3805,7 @@ public sealed class RecruitmentModule : InteractionModuleBase<SocketInteractionC
         }
 
         await DeferAsync(ephemeral: true);
-        var displayName = selectedUser.DisplayName ?? selectedUser.GlobalName ?? selectedUser.Username;
+        var displayName = await ResolveRecruitStoredUserNameAsync(selectedUser);
         var status = await _db.AssignRecruitSlotAsync(post.Id, normalizedPosition, userId, displayName, matchedJob.Code, string.Empty, post.DisallowDuplicateJobs);
         if (status != RecruitAssignStatus.Success)
         {
@@ -4623,7 +4623,8 @@ public sealed class RecruitmentModule : InteractionModuleBase<SocketInteractionC
             post = latestPost;
         }
 
-        var slots = await _db.ListRecruitSlotsAsync(post.Id);
+        var slots = (await _db.ListRecruitSlotsAsync(post.Id)).ToList();
+        await ApplyRecruitProfileDisplayNamesAsync(slots);
         var filled = slots.Count(slot => slot.UserId.HasValue || slot.IsClosed);
         var slotCount = slots.Count;
         var nextStatus = post.Status;
@@ -4947,6 +4948,36 @@ public sealed class RecruitmentModule : InteractionModuleBase<SocketInteractionC
         return Task.FromResult<IGuildUser?>(Context.Guild.GetUser(userId));
     }
 
+    private async Task<string> ResolveRecruitStoredUserNameAsync(SocketUser user)
+    {
+        try
+        {
+            var profile = await _db.GetDiscordUserProfileAsync(user.Id);
+            if (!string.IsNullOrWhiteSpace(profile?.FfxivName))
+            {
+                var ffxivName = profile.FfxivName.Trim();
+                var ffxivWorld = profile.FfxivWorld?.Trim();
+                if (!string.IsNullOrWhiteSpace(ffxivWorld))
+                {
+                    return $"{ffxivName}@{ffxivWorld}";
+                }
+
+                return ffxivName;
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to resolve recruit display name from profile for user {UserId}.", user.Id);
+        }
+
+        var guildUser = Context.Guild?.GetUser(user.Id);
+        return guildUser?.DisplayName
+            ?? (user as SocketGuildUser)?.DisplayName
+            ?? user.Username
+            ?? user.GlobalName
+            ?? $"u:{user.Id}";
+    }
+
     private async Task<bool> TryModifyThreadMessageAsync(IThreadChannel threadChannel, ulong messageId, Embed embed)
     {
         try
@@ -5061,6 +5092,48 @@ public sealed class RecruitmentModule : InteractionModuleBase<SocketInteractionC
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Failed to post recruit change log for post {PostId}.", post.Id);
+        }
+    }
+
+    private async Task ApplyRecruitProfileDisplayNamesAsync(IList<RecruitSlot> slots)
+    {
+        var userIds = slots
+            .Where(slot => slot.UserId.HasValue && slot.UserId.Value > 0)
+            .Select(slot => ToUlong(slot.UserId!.Value))
+            .Distinct()
+            .ToArray();
+        if (userIds.Length == 0)
+        {
+            return;
+        }
+
+        IReadOnlyList<DiscordUserProfile> profiles;
+        try
+        {
+            profiles = await _db.ListDiscordUserProfilesAsync(userIds);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to load recruit profile display names for post slots.");
+            return;
+        }
+
+        var profileNameByUserId = profiles
+            .Select(profile => (UserId: ToUlong(profile.DiscordUserId), Name: BuildRecruitProfileDisplayName(profile)))
+            .Where(x => !string.IsNullOrWhiteSpace(x.Name))
+            .ToDictionary(x => x.UserId, x => x.Name!, EqualityComparer<ulong>.Default);
+
+        foreach (var slot in slots)
+        {
+            if (!slot.UserId.HasValue || slot.UserId.Value <= 0)
+            {
+                continue;
+            }
+
+            if (profileNameByUserId.TryGetValue(ToUlong(slot.UserId.Value), out var profileName))
+            {
+                slot.UserName = profileName;
+            }
         }
     }
 
@@ -7514,7 +7587,7 @@ public sealed class RecruitmentModule : InteractionModuleBase<SocketInteractionC
         var resolvedFlexJobsSpec = selectedJobs.Count >= 2 ? string.Join(',', selectedJobs) : null;
         memberSlots[resolvedPosition] = new RecruitPreFilledMember(
             selectedUserId,
-            selectedUser.DisplayName ?? selectedUser.GlobalName ?? selectedUser.Username,
+            await ResolveRecruitStoredUserNameAsync(selectedUser),
             resolvedJob,
             resolvedFlexSpec,
             resolvedFlexJobsSpec);
@@ -8527,7 +8600,7 @@ public sealed class RecruitmentModule : InteractionModuleBase<SocketInteractionC
 
     private async Task<string?> TryCreateRecruitPostAsync(ITextChannel channel, RecruitCreateDraftContext draft, string hostPosition, string? hostJob)
     {
-        var creatorName = (Context.User as SocketGuildUser)?.DisplayName ?? Context.User.GlobalName ?? Context.User.Username;
+        var creatorName = await ResolveRecruitStoredUserNameAsync(Context.User);
         var positions = draft.Positions;
         var hostWillBeAssigned = !string.IsNullOrWhiteSpace(hostJob) && !TryParseFlexPositionToken(hostPosition, out _);
 
@@ -12665,6 +12738,20 @@ public sealed class RecruitmentModule : InteractionModuleBase<SocketInteractionC
 
         var delta = (post.ScheduleAt.Value - post.CreatedAt).Duration();
         return delta <= TimeSpan.FromMinutes(2);
+    }
+
+    private static string? BuildRecruitProfileDisplayName(DiscordUserProfile profile)
+    {
+        if (string.IsNullOrWhiteSpace(profile.FfxivName))
+        {
+            return null;
+        }
+
+        var ffxivName = profile.FfxivName.Trim();
+        var ffxivWorld = profile.FfxivWorld?.Trim();
+        return string.IsNullOrWhiteSpace(ffxivWorld)
+            ? ffxivName
+            : $"{ffxivName}@{ffxivWorld}";
     }
 
     private static string FormatRecruitStatusLabel(RecruitPostStatus status)

@@ -2337,7 +2337,8 @@ public sealed class DiscordBotService : IHostedService
             return;
         }
 
-        var slots = await _db.ListRecruitSlotsAsync(post.Id);
+        var slots = (await _db.ListRecruitSlotsAsync(post.Id)).ToList();
+        await ApplyRecruitProfileDisplayNamesAsync(slots);
         var tuning = _runtimeTuning.GetSnapshot();
         var embed = BuildRecruitEmbed(
             post,
@@ -2351,6 +2352,48 @@ public sealed class DiscordBotService : IHostedService
             props.Embed = embed;
             props.Components = RecruitmentPanel.BuildRecruitComponents(post.Status, positions);
         });
+    }
+
+    private async Task ApplyRecruitProfileDisplayNamesAsync(IList<RecruitSlot> slots)
+    {
+        var userIds = slots
+            .Where(slot => slot.UserId.HasValue && slot.UserId.Value > 0)
+            .Select(slot => ToUlong(slot.UserId!.Value))
+            .Distinct()
+            .ToArray();
+        if (userIds.Length == 0)
+        {
+            return;
+        }
+
+        IReadOnlyList<DiscordUserProfile> profiles;
+        try
+        {
+            profiles = await _db.ListDiscordUserProfilesAsync(userIds);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to load recruit profile display names for post slots. PostId={PostId}", slots.FirstOrDefault()?.PostId);
+            return;
+        }
+
+        var nameByUserId = profiles
+            .Select(profile => (UserId: ToUlong(profile.DiscordUserId), Name: BuildRecruitProfileDisplayName(profile)))
+            .Where(x => !string.IsNullOrWhiteSpace(x.Name))
+            .ToDictionary(x => x.UserId, x => x.Name!, EqualityComparer<ulong>.Default);
+
+        foreach (var slot in slots)
+        {
+            if (!slot.UserId.HasValue || slot.UserId.Value <= 0)
+            {
+                continue;
+            }
+
+            if (nameByUserId.TryGetValue(ToUlong(slot.UserId.Value), out var name))
+            {
+                slot.UserName = name;
+            }
+        }
     }
 
     private async Task<bool> TryPostRecruitNoticeAsync(
@@ -2477,6 +2520,20 @@ public sealed class DiscordBotService : IHostedService
             .WithButton("1時間延長", $"recruit_underfilled_extend60:{recruitMessageId}", ButtonStyle.Secondary, row: 0)
             .WithButton("終了/再開", $"recruit_underfilled_close:{recruitMessageId}", ButtonStyle.Danger, row: 1)
             .Build();
+    }
+
+    private static string? BuildRecruitProfileDisplayName(DiscordUserProfile profile)
+    {
+        if (string.IsNullOrWhiteSpace(profile.FfxivName))
+        {
+            return null;
+        }
+
+        var ffxivName = profile.FfxivName.Trim();
+        var ffxivWorld = profile.FfxivWorld?.Trim();
+        return string.IsNullOrWhiteSpace(ffxivWorld)
+            ? ffxivName
+            : $"{ffxivName}@{ffxivWorld}";
     }
 
     private async Task<bool> TryDeleteRecruitThreadAsync(RecruitPost post)
