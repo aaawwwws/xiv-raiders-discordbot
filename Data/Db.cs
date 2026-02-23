@@ -86,6 +86,16 @@ ADD COLUMN IF NOT EXISTS flex_jobs_spec TEXT NULL;";
         await conn.ExecuteAsync(sql);
     }
 
+    public async Task EnsureRecruitUnderfilledDecisionDeadlineColumnAsync()
+    {
+        const string sql = @"
+ALTER TABLE IF EXISTS recruit_posts
+ADD COLUMN IF NOT EXISTS underfilled_decision_deadline_at TIMESTAMPTZ NULL;";
+
+        await using var conn = CreateConnection();
+        await conn.ExecuteAsync(sql);
+    }
+
     public async Task BackfillRecruitSlotFlexJobsSpecAsync()
     {
         const string sql = @"
@@ -133,6 +143,17 @@ CREATE TABLE IF NOT EXISTS guild_lodestone_panels (
     message_id BIGINT NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );";
+
+        await using var conn = CreateConnection();
+        await conn.ExecuteAsync(sql);
+    }
+
+    public async Task EnsureLodestoneCharacterExtrasCacheColumnsAsync()
+    {
+        const string sql = @"
+ALTER TABLE IF EXISTS lodestone_characters
+ADD COLUMN IF NOT EXISTS extras_json JSONB NULL,
+ADD COLUMN IF NOT EXISTS extras_synced_at TIMESTAMPTZ NULL;";
 
         await using var conn = CreateConnection();
         await conn.ExecuteAsync(sql);
@@ -260,7 +281,11 @@ ADD COLUMN IF NOT EXISTS registration_review_channel_id BIGINT NOT NULL DEFAULT 
 ADD COLUMN IF NOT EXISTS registration_approval_required BOOLEAN NOT NULL DEFAULT TRUE,
 ADD COLUMN IF NOT EXISTS inactive_auto_kick_enabled BOOLEAN NOT NULL DEFAULT TRUE,
 ADD COLUMN IF NOT EXISTS log_channel_id BIGINT NOT NULL DEFAULT 0,
-ADD COLUMN IF NOT EXISTS control_channel_id BIGINT NOT NULL DEFAULT 0;";
+ADD COLUMN IF NOT EXISTS control_channel_id BIGINT NOT NULL DEFAULT 0,
+ADD COLUMN IF NOT EXISTS runtime_cleanup_interval_minutes INTEGER NULL,
+ADD COLUMN IF NOT EXISTS runtime_recruit_closed_retention_hours INTEGER NULL,
+ADD COLUMN IF NOT EXISTS runtime_recruit_canceled_retention_hours INTEGER NULL,
+ADD COLUMN IF NOT EXISTS runtime_tuning_updated_at TIMESTAMPTZ NULL;";
 
         await using var conn = CreateConnection();
         await conn.ExecuteAsync(sql);
@@ -1568,6 +1593,38 @@ WHERE lodestone_id = @LodestoneId;";
         });
     }
 
+    public async Task<LodestoneCharacterExtrasCache?> GetCharacterExtrasCacheAsync(long lodestoneId)
+    {
+        const string sql = @"
+SELECT lodestone_id AS LodestoneId,
+       CAST(extras_json AS TEXT) AS ExtrasJson,
+       extras_synced_at AS ExtrasSyncedAt
+FROM lodestone_characters
+WHERE lodestone_id = @LodestoneId
+LIMIT 1;";
+
+        await using var conn = CreateConnection();
+        return await conn.QuerySingleOrDefaultAsync<LodestoneCharacterExtrasCache>(sql, new { LodestoneId = lodestoneId });
+    }
+
+    public async Task UpdateCharacterExtrasCacheAsync(long lodestoneId, string extrasJson, DateTimeOffset syncedAt)
+    {
+        const string sql = @"
+UPDATE lodestone_characters
+SET extras_json = CAST(@ExtrasJson AS JSONB),
+    extras_synced_at = @ExtrasSyncedAt,
+    updated_at = NOW()
+WHERE lodestone_id = @LodestoneId;";
+
+        await using var conn = CreateConnection();
+        await conn.ExecuteAsync(sql, new
+        {
+            LodestoneId = lodestoneId,
+            ExtrasJson = extrasJson,
+            ExtrasSyncedAt = syncedAt
+        });
+    }
+
     public async Task<RecruitPost> CreateRecruitPostAsync(
         ulong guildId,
         ulong channelId,
@@ -1603,6 +1660,7 @@ RETURNING id AS Id,
           schedule_text AS ScheduleText,
           schedule_at AS ScheduleAt,
           reminder_sent_at AS ReminderSentAt,
+          underfilled_decision_deadline_at AS UnderfilledDecisionDeadlineAt,
           note AS Note,
           disallow_duplicate_jobs AS DisallowDuplicateJobs,
           host_flex_spec AS HostFlexSpec,
@@ -1794,6 +1852,7 @@ SELECT id AS Id,
        schedule_text AS ScheduleText,
        schedule_at AS ScheduleAt,
        reminder_sent_at AS ReminderSentAt,
+       underfilled_decision_deadline_at AS UnderfilledDecisionDeadlineAt,
        note AS Note,
        disallow_duplicate_jobs AS DisallowDuplicateJobs,
        host_flex_spec AS HostFlexSpec,
@@ -1881,6 +1940,46 @@ ORDER BY p.created_at DESC;";
         {
             GuildId = ToDbId(guildId),
             CreatorUserId = ToDbId(creatorUserId)
+        });
+        return rows.ToList();
+    }
+
+    public async Task<IReadOnlyList<RecruitPostSummary>> ListActiveRecruitPostsByParticipantAsync(ulong guildId, ulong userId, int maxRows = 10)
+    {
+        const string sql = @"
+SELECT p.id AS Id,
+       p.channel_id AS ChannelId,
+       p.message_id AS MessageId,
+       p.creator_user_id AS CreatorUserId,
+       p.title AS Title,
+       p.data_center AS DataCenter,
+       p.schedule_text AS ScheduleText,
+       p.schedule_at AS ScheduleAt,
+       p.status AS Status,
+       COALESCE(SUM(CASE WHEN s.user_id IS NOT NULL OR s.is_closed = TRUE THEN 1 ELSE 0 END), 0) AS FilledCount,
+       COUNT(s.id) AS SlotCount,
+       p.created_at AS CreatedAt,
+       p.updated_at AS UpdatedAt
+FROM recruit_posts p
+LEFT JOIN recruit_slots s ON s.post_id = p.id
+WHERE p.guild_id = @GuildId
+  AND p.status IN (0, 1)
+  AND EXISTS (
+      SELECT 1
+      FROM recruit_slots rs
+      WHERE rs.post_id = p.id
+        AND rs.user_id = @UserId
+  )
+GROUP BY p.id
+ORDER BY p.schedule_at ASC NULLS LAST, p.created_at DESC
+LIMIT @MaxRows;";
+
+        await using var conn = CreateConnection();
+        var rows = await conn.QueryAsync<RecruitPostSummary>(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            UserId = ToDbId(userId),
+            MaxRows = Math.Clamp(maxRows, 1, 50)
         });
         return rows.ToList();
     }
@@ -2996,6 +3095,7 @@ WHERE id = @Id;";
 UPDATE recruit_posts
 SET status = @Status,
     closed_at = CASE WHEN @Status IN (2, 3) THEN NOW() ELSE NULL END,
+    underfilled_decision_deadline_at = NULL,
     updated_at = NOW()
 WHERE id = @PostId;";
 
@@ -3017,6 +3117,7 @@ SET title = @Title,
     schedule_at = @ScheduleAt,
     note = @Note,
     reminder_sent_at = NULL,
+    underfilled_decision_deadline_at = NULL,
     updated_at = NOW()
 WHERE id = @PostId;";
 
@@ -3061,6 +3162,46 @@ WHERE id = @PostId;";
         return rows > 0;
     }
 
+    public async Task<bool> UpdateRecruitPostScheduleAsync(int postId, string? scheduleText, DateTimeOffset? scheduleAt)
+    {
+        const string sql = @"
+UPDATE recruit_posts
+SET schedule_text = @ScheduleText,
+    schedule_at = @ScheduleAt,
+    reminder_sent_at = NULL,
+    underfilled_decision_deadline_at = NULL,
+    updated_at = NOW()
+WHERE id = @PostId;";
+
+        await using var conn = CreateConnection();
+        var rows = await conn.ExecuteAsync(sql, new
+        {
+            PostId = postId,
+            ScheduleText = NullIfBlank(scheduleText),
+            ScheduleAt = scheduleAt
+        });
+
+        return rows > 0;
+    }
+
+    public async Task<bool> SetRecruitUnderfilledDecisionDeadlineAsync(int postId, DateTimeOffset? deadlineAt)
+    {
+        const string sql = @"
+UPDATE recruit_posts
+SET underfilled_decision_deadline_at = @DeadlineAt,
+    updated_at = NOW()
+WHERE id = @PostId;";
+
+        await using var conn = CreateConnection();
+        var rows = await conn.ExecuteAsync(sql, new
+        {
+            PostId = postId,
+            DeadlineAt = deadlineAt
+        });
+
+        return rows > 0;
+    }
+
     public async Task<IReadOnlyList<RecruitPost>> ListDueRecruitPostsForReminderAsync(DateTimeOffset fromUtcExclusive, DateTimeOffset toUtcInclusive)
     {
         const string sql = @"
@@ -3078,6 +3219,7 @@ SELECT id AS Id,
        schedule_text AS ScheduleText,
        schedule_at AS ScheduleAt,
        reminder_sent_at AS ReminderSentAt,
+       underfilled_decision_deadline_at AS UnderfilledDecisionDeadlineAt,
        note AS Note,
        disallow_duplicate_jobs AS DisallowDuplicateJobs,
        host_flex_spec AS HostFlexSpec,
@@ -3118,6 +3260,7 @@ SELECT id AS Id,
        schedule_text AS ScheduleText,
        schedule_at AS ScheduleAt,
        reminder_sent_at AS ReminderSentAt,
+       underfilled_decision_deadline_at AS UnderfilledDecisionDeadlineAt,
        note AS Note,
        disallow_duplicate_jobs AS DisallowDuplicateJobs,
        host_flex_spec AS HostFlexSpec,
@@ -3125,7 +3268,7 @@ SELECT id AS Id,
        created_at AS CreatedAt,
        updated_at AS UpdatedAt
 FROM recruit_posts
-WHERE status = 1
+WHERE status IN (0, 1)
   AND schedule_at IS NOT NULL
   AND schedule_at <= @NowUtc
 ORDER BY schedule_at ASC;";
@@ -3400,6 +3543,10 @@ SELECT guild_id AS GuildId,
        inactive_auto_kick_enabled AS InactiveAutoKickEnabled,
        log_channel_id AS LogChannelId,
        control_channel_id AS ControlChannelId,
+       runtime_cleanup_interval_minutes AS RuntimeCleanupIntervalMinutes,
+       runtime_recruit_closed_retention_hours AS RuntimeRecruitClosedRetentionHours,
+       runtime_recruit_canceled_retention_hours AS RuntimeRecruitCanceledRetentionHours,
+       runtime_tuning_updated_at AS RuntimeTuningUpdatedAt,
        updated_at AS UpdatedAt
 FROM guild_settings
 WHERE guild_id = @GuildId
@@ -3476,6 +3623,87 @@ WHERE guild_id = @GuildId;";
         await using var conn = CreateConnection();
         var affected = await conn.ExecuteAsync(sql, new { GuildId = ToDbId(guildId), Enabled = enabled });
         return affected > 0;
+    }
+
+    public async Task UpsertGuildRuntimeTuningAsync(
+        ulong guildId,
+        int cleanupIntervalMinutes,
+        int recruitClosedRetentionHours,
+        int recruitCanceledRetentionHours)
+    {
+        const string sql = @"
+INSERT INTO guild_settings (
+    guild_id,
+    admin_role_id,
+    member_role_id,
+    provisional_role_id,
+    registration_channel_id,
+    registration_review_channel_id,
+    registration_approval_required,
+    inactive_auto_kick_enabled,
+    log_channel_id,
+    control_channel_id,
+    runtime_cleanup_interval_minutes,
+    runtime_recruit_closed_retention_hours,
+    runtime_recruit_canceled_retention_hours,
+    runtime_tuning_updated_at)
+VALUES (
+    @GuildId,
+    0,
+    0,
+    0,
+    0,
+    0,
+    TRUE,
+    TRUE,
+    0,
+    0,
+    @CleanupIntervalMinutes,
+    @RecruitClosedRetentionHours,
+    @RecruitCanceledRetentionHours,
+    NOW())
+ON CONFLICT (guild_id) DO UPDATE
+SET runtime_cleanup_interval_minutes = EXCLUDED.runtime_cleanup_interval_minutes,
+    runtime_recruit_closed_retention_hours = EXCLUDED.runtime_recruit_closed_retention_hours,
+    runtime_recruit_canceled_retention_hours = EXCLUDED.runtime_recruit_canceled_retention_hours,
+    runtime_tuning_updated_at = NOW(),
+    updated_at = NOW();";
+
+        await using var conn = CreateConnection();
+        await conn.ExecuteAsync(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            CleanupIntervalMinutes = cleanupIntervalMinutes,
+            RecruitClosedRetentionHours = recruitClosedRetentionHours,
+            RecruitCanceledRetentionHours = recruitCanceledRetentionHours
+        });
+    }
+
+    public async Task<GuildSettings?> GetLatestGuildRuntimeTuningAsync()
+    {
+        const string sql = @"
+SELECT guild_id AS GuildId,
+       admin_role_id AS AdminRoleId,
+       member_role_id AS MemberRoleId,
+       provisional_role_id AS ProvisionalRoleId,
+       registration_channel_id AS RegistrationChannelId,
+       registration_review_channel_id AS RegistrationReviewChannelId,
+       registration_approval_required AS RegistrationApprovalRequired,
+       inactive_auto_kick_enabled AS InactiveAutoKickEnabled,
+       log_channel_id AS LogChannelId,
+       control_channel_id AS ControlChannelId,
+       runtime_cleanup_interval_minutes AS RuntimeCleanupIntervalMinutes,
+       runtime_recruit_closed_retention_hours AS RuntimeRecruitClosedRetentionHours,
+       runtime_recruit_canceled_retention_hours AS RuntimeRecruitCanceledRetentionHours,
+       runtime_tuning_updated_at AS RuntimeTuningUpdatedAt,
+       updated_at AS UpdatedAt
+FROM guild_settings
+WHERE runtime_tuning_updated_at IS NOT NULL
+ORDER BY runtime_tuning_updated_at DESC
+LIMIT 1;";
+
+        await using var conn = CreateConnection();
+        return await conn.QuerySingleOrDefaultAsync<GuildSettings>(sql);
     }
 
     public async Task<GuildPanel?> GetGuildControlPanelAsync(ulong guildId)
@@ -4448,6 +4676,52 @@ LIMIT @MaxRows;";
         var rows = await conn.QueryAsync<Lottery>(sql, new
         {
             GuildId = ToDbId(guildId),
+            MaxRows = Math.Clamp(maxRows, 1, 50)
+        });
+        return rows.ToList();
+    }
+
+    public async Task<IReadOnlyList<Lottery>> ListActiveLotteriesByEntryUserAsync(ulong guildId, ulong userId, int maxRows = 10)
+    {
+        const string sql = @"
+SELECT l.id AS Id,
+       l.guild_id AS GuildId,
+       l.channel_id AS ChannelId,
+       l.message_id AS MessageId,
+       l.participant_role_id AS ParticipantRoleId,
+       l.participant_role_delete_at AS ParticipantRoleDeleteAt,
+       l.title AS Title,
+       l.description AS Description,
+       l.prize_list AS PrizeList,
+       l.allow_duplicate_winners AS AllowDuplicateWinners,
+       l.winner_count AS WinnerCount,
+       l.status AS Status,
+       l.close_at AS CloseAt,
+       l.created_by_user_id AS CreatedByUserId,
+       l.created_by_name AS CreatedByName,
+       l.created_at AS CreatedAt,
+       l.updated_at AS UpdatedAt,
+       l.drawn_at AS DrawnAt,
+       l.canceled_at AS CanceledAt
+FROM public.lotteries l
+WHERE l.guild_id = @GuildId
+  AND l.status IN (@OpenStatus, @ClosedStatus)
+  AND EXISTS (
+      SELECT 1
+      FROM public.lottery_entries e
+      WHERE e.lottery_id = l.id
+        AND e.user_id = @UserId
+  )
+ORDER BY l.close_at ASC, l.id ASC
+LIMIT @MaxRows;";
+
+        await using var conn = CreateConnection();
+        var rows = await conn.QueryAsync<Lottery>(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            UserId = ToDbId(userId),
+            OpenStatus = LotteryStatus.Open,
+            ClosedStatus = LotteryStatus.Closed,
             MaxRows = Math.Clamp(maxRows, 1, 50)
         });
         return rows.ToList();

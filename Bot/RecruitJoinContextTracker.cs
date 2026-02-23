@@ -10,7 +10,8 @@ public sealed record RecruitJoinContext(
     DateTimeOffset CreatedAt,
     IReadOnlyList<string>? CandidatePositions = null,
     string? RequestedLabel = null,
-    IReadOnlyList<string>? CandidateJobs = null);
+    IReadOnlyList<string>? CandidateJobs = null,
+    bool ForceFixedSelection = false);
 
 public sealed class RecruitJoinContextTracker
 {

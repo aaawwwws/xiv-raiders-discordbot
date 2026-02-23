@@ -1,3 +1,4 @@
+using System.Text.Json;
 using Discord;
 using Discord.WebSocket;
 using Microsoft.Extensions.Logging;
@@ -9,6 +10,7 @@ namespace RaidDcBot.Services;
 
 public sealed class UserProfileEmbedService
 {
+    private static readonly TimeSpan LodestoneExtrasResyncInterval = TimeSpan.FromDays(1);
     private readonly Db _db;
     private readonly LodestoneClient _lodestone;
     private readonly DiscordOptions _options;
@@ -32,6 +34,7 @@ public sealed class UserProfileEmbedService
         string title,
         Color color,
         bool includeBio = true,
+        bool includeLodestoneExtras = false,
         Action<EmbedBuilder>? configure = null)
     {
         var snapshot = await BuildProfileSnapshotAsync(user, guild);
@@ -45,6 +48,11 @@ public sealed class UserProfileEmbedService
 
         embed.AddField("基本情報", snapshot.BasicInfo, false);
         embed.AddField("キャラクター", snapshot.CharacterInfo, true);
+        if (includeLodestoneExtras)
+        {
+            var lodestoneExtras = await BuildLodestoneExtrasInfoAsync(snapshot.LinkedCharacter);
+            embed.AddField("Lodestone追加情報", lodestoneExtras, false);
+        }
         embed.AddField("SNS", snapshot.SnsInfo, true);
         if (includeBio)
         {
@@ -125,8 +133,106 @@ public sealed class UserProfileEmbedService
             BuildVoiceBasicInfo(user),
             BuildVoiceRoleInfo(guildUser),
             BuildVoiceCharacterInfo(character, profile),
+            character,
             BuildVoiceSnsInfo(profile),
             BuildVoiceBioInfo(profile, _options.VoiceProfileMaxBioLength));
+    }
+
+    private async Task<string> BuildLodestoneExtrasInfoAsync(LinkedCharacter? character)
+    {
+        if (character is null || string.IsNullOrWhiteSpace(character.LodestoneUrl))
+        {
+            return "未連携";
+        }
+
+        try
+        {
+            var extrasDetails = await GetOrRefreshLodestoneExtrasDetailsAsync(character);
+            if (extrasDetails is null)
+            {
+                return "取得失敗";
+            }
+
+            var extras = ToSummarySnapshot(extrasDetails);
+            var lines = new List<string>
+            {
+                $"マウント: {FormatLodestoneCount(extras.Mounts)}",
+                $"ミニオン: {FormatLodestoneCount(extras.Minions)}",
+                $"アチーブメント: {FormatLodestoneCount(extras.Achievements)}",
+                $"ジョブLv: {FormatLodestoneJobLevels(extras.JobLevels)}"
+            };
+
+            return Truncate(string.Join('\n', lines), 1000);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to fetch Lodestone extras for {LodestoneId}.", character.LodestoneId);
+            return "取得失敗";
+        }
+    }
+
+    private async Task<LodestoneCharacterExtrasDetailsSnapshot?> GetOrRefreshLodestoneExtrasDetailsAsync(LinkedCharacter character)
+    {
+        LodestoneCharacterExtrasCache? cache = null;
+        LodestoneCharacterExtrasDetailsSnapshot? cachedSnapshot = null;
+
+        try
+        {
+            cache = await _db.GetCharacterExtrasCacheAsync(character.LodestoneId);
+            cachedSnapshot = TryDeserializeLodestoneExtrasDetails(cache?.ExtrasJson);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to load Lodestone extras cache for {LodestoneId}.", character.LodestoneId);
+        }
+
+        var now = DateTimeOffset.UtcNow;
+        var cacheIsFresh = cache?.ExtrasSyncedAt is DateTimeOffset syncedAt &&
+                           syncedAt >= now - LodestoneExtrasResyncInterval &&
+                           cachedSnapshot is not null;
+        if (cacheIsFresh)
+        {
+            return cachedSnapshot;
+        }
+
+        try
+        {
+            var refreshed = await _lodestone.FetchCharacterExtrasDetailsAsync(character.LodestoneUrl);
+            var json = JsonSerializer.Serialize(refreshed);
+            await _db.UpdateCharacterExtrasCacheAsync(character.LodestoneId, json, now);
+            return refreshed;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to refresh Lodestone extras details for {LodestoneId}.", character.LodestoneId);
+            return cachedSnapshot;
+        }
+    }
+
+    private static LodestoneCharacterExtrasDetailsSnapshot? TryDeserializeLodestoneExtrasDetails(string? json)
+    {
+        if (string.IsNullOrWhiteSpace(json))
+        {
+            return null;
+        }
+
+        try
+        {
+            return JsonSerializer.Deserialize<LodestoneCharacterExtrasDetailsSnapshot>(json);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static LodestoneCharacterExtrasSnapshot ToSummarySnapshot(LodestoneCharacterExtrasDetailsSnapshot details)
+    {
+        return new LodestoneCharacterExtrasSnapshot(
+            details.JobLevels,
+            new LodestoneCountSnapshot(details.Mounts.Status, details.Mounts.Count ?? details.Mounts.Items.Count),
+            new LodestoneCountSnapshot(details.Minions.Status, details.Minions.Count ?? details.Minions.Items.Count),
+            new LodestoneCountSnapshot(details.Achievements.Status, details.Achievements.Count ?? details.Achievements.Items.Count));
     }
 
     private async Task<string?> EnsureCharacterPortraitAsync(LinkedCharacter character)
@@ -248,6 +354,47 @@ public sealed class UserProfileEmbedService
         return value[..maxLength];
     }
 
+    private static string FormatLodestoneCount(LodestoneCountSnapshot snapshot)
+    {
+        return snapshot.Status switch
+        {
+            LodestonePageDataStatus.Available when snapshot.Count.HasValue => snapshot.Count.Value.ToString(),
+            LodestonePageDataStatus.Private => "非公開",
+            LodestonePageDataStatus.NotFound => "未取得",
+            _ => "取得失敗"
+        };
+    }
+
+    private static string FormatLodestoneJobLevels(LodestoneJobLevelsSnapshot snapshot)
+    {
+        if (snapshot.Status == LodestonePageDataStatus.Private)
+        {
+            return "非公開";
+        }
+
+        if (snapshot.Status == LodestonePageDataStatus.NotFound)
+        {
+            return "未取得";
+        }
+
+        if (snapshot.Status != LodestonePageDataStatus.Available || snapshot.Jobs.Count == 0)
+        {
+            return "取得失敗";
+        }
+
+        var jobs = snapshot.Jobs
+            .OrderByDescending(x => x.Level)
+            .ThenBy(x => x.Name, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        var maxLevel = jobs.Max(x => x.Level);
+        var maxCount = jobs.Count(x => x.Level == maxLevel);
+        var shown = jobs.Take(8).Select(x => $"{x.Name} {x.Level}").ToList();
+        var suffix = jobs.Count > shown.Count ? $" (+{jobs.Count - shown.Count})" : string.Empty;
+
+        return $"最大{maxLevel} ({maxCount}ジョブ) / {string.Join(", ", shown)}{suffix}";
+    }
+
     private static string MentionUser(ulong userId) => $"<@{userId}>";
     private static string FormatTimestamp(DateTimeOffset time) => $"<t:{time.ToUnixTimeSeconds()}:F>";
 
@@ -258,6 +405,7 @@ public sealed class UserProfileEmbedService
         string BasicInfo,
         string RoleInfo,
         string CharacterInfo,
+        LinkedCharacter? LinkedCharacter,
         string SnsInfo,
         string BioInfo);
 }

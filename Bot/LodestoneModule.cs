@@ -18,6 +18,8 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
     private const string MemberProfileChangeDcPrefix = "member_profile_change_dc";
     private const string MemberProfileChangeWorldPrefix = "member_profile_change_world";
     private const string MemberRegistrationSubmitCustomId = "member_registration_submit";
+    private const string MemberRegistrationSubmitConfirmCustomId = "member_registration_submit_confirm";
+    private const string MemberRegistrationSubmitCancelCustomId = "member_registration_submit_cancel";
     private const string MemberRegistrationSubmitWithVoiceCustomId = "member_registration_submit_with_voice";
     private const string MemberRegistrationSubmitWithoutVoiceCustomId = "member_registration_submit_without_voice";
     private const string MemberProfileEditModalCustomId = "member_profile_edit_modal";
@@ -646,36 +648,52 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
             "プレイ中のコンテンツロールを選択し、最後に「登録申請を送信」を押してください。";
         await RespondAsync(completedMessage, components: contentRoleComponents, ephemeral: true);
         await FollowupAsync(
-            "ロール選択が終わったら、こちらから申請を送信してください。",
+            "最終確認: ロール選択が終わったら、こちらから申請を送信してください。",
             components: BuildMemberRegistrationSubmitComponents(),
             ephemeral: true);
     }
 
     [ComponentInteraction(MemberRegistrationSubmitCustomId, ignoreGroupNames: true)]
-    public async Task ShowMemberRegistrationSubmitOptionsAsync()
+    public async Task ShowMemberRegistrationSubmitConfirmAsync()
     {
-        if (Context.Guild is null || Context.User is not SocketGuildUser)
+        if (Context.Guild is null || Context.User is not SocketGuildUser guildUser)
         {
             await RespondAsync("この操作はサーバー内でのみ使えます。", ephemeral: true);
             return;
         }
 
+        var profile = await _db.GetDiscordUserProfileAsync(Context.User.Id);
+        if (!HasCompletedRegistrationProfile(profile))
+        {
+            await RespondAsync("登録情報が不足しています。もう一度「メンバー登録」から入力してください。", ephemeral: true);
+            return;
+        }
+
+        var previewEmbed = await BuildMemberRegistrationPreviewEmbedAsync(guildUser, profile!);
         await RespondAsync(
-            "通話通知ロールを付与してから登録申請を送信しますか？\n" +
-            "このロールを持っていると、VC入室時に通知されます（後で設定パネルから変更可能）。",
-            components: BuildMemberRegistrationSubmitOptionsComponents(),
+            "最終確認: この内容でメンバー登録申請を送信しますか？",
+            embed: previewEmbed,
+            components: BuildMemberRegistrationSubmitConfirmComponents(),
             ephemeral: true);
     }
 
+    [ComponentInteraction(MemberRegistrationSubmitConfirmCustomId, ignoreGroupNames: true)]
+    public Task ConfirmMemberRegistrationSubmitAsync()
+        => SubmitMemberRegistrationInternalAsync();
+
+    [ComponentInteraction(MemberRegistrationSubmitCancelCustomId, ignoreGroupNames: true)]
+    public Task CancelMemberRegistrationSubmitAsync()
+        => RespondAsync("送信を取り消しました。", ephemeral: true);
+
     [ComponentInteraction(MemberRegistrationSubmitWithVoiceCustomId, ignoreGroupNames: true)]
-    public Task SubmitMemberRegistrationWithVoiceRoleAsync()
-        => SubmitMemberRegistrationInternalAsync(grantVoiceNotificationRole: true);
+    public Task GrantVoiceNotificationRoleAfterRegistrationAsync()
+        => HandlePostRegistrationVoiceNotificationOptionAsync(grantVoiceNotificationRole: true);
 
     [ComponentInteraction(MemberRegistrationSubmitWithoutVoiceCustomId, ignoreGroupNames: true)]
-    public Task SubmitMemberRegistrationWithoutVoiceRoleAsync()
-        => SubmitMemberRegistrationInternalAsync(grantVoiceNotificationRole: false);
+    public Task SkipVoiceNotificationRoleAfterRegistrationAsync()
+        => HandlePostRegistrationVoiceNotificationOptionAsync(grantVoiceNotificationRole: false);
 
-    private async Task SubmitMemberRegistrationInternalAsync(bool grantVoiceNotificationRole)
+    private async Task SubmitMemberRegistrationInternalAsync()
     {
         if (Context.Guild is null || Context.User is not SocketGuildUser guildUser)
         {
@@ -761,14 +779,8 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
                 completedProfile.XHandle,
                 completedProfile.BlueskyHandle);
             _ = _stats.RefreshIfConfiguredAsync(Context.Guild);
-            var voiceRoleMessage = await TryGrantVoiceNotificationRoleForRegistrationAsync(Context.Guild, guildUser, grantVoiceNotificationRole);
-            var directMessage = "登録を完了しました。メンバーロールを付与しました。";
-            if (!string.IsNullOrWhiteSpace(voiceRoleMessage))
-            {
-                directMessage = $"{directMessage}\n{voiceRoleMessage}";
-            }
-
-            await FollowupAsync(directMessage, ephemeral: true);
+            await FollowupAsync("登録を完了しました。メンバーロールを付与しました。", ephemeral: true);
+            await ShowPostRegistrationVoiceNotificationOfferAsync();
             return;
         }
 
@@ -842,15 +854,35 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
         }
 
         await LogMemberRegistrationRequestedAsync(completedProfile, guildUser);
-        var approvalMessage = "登録申請を送信しました。管理者の許可後にメンバーロールが付与されます。";
-        var voiceRoleStatus = await TryGrantVoiceNotificationRoleForRegistrationAsync(Context.Guild, guildUser, grantVoiceNotificationRole);
-        if (!string.IsNullOrWhiteSpace(voiceRoleStatus))
+        await FollowupAsync("登録申請を送信しました。管理者の許可後にメンバーロールが付与されます。", ephemeral: true);
+        await ShowPostRegistrationVoiceNotificationOfferAsync();
+    }
+
+    private async Task HandlePostRegistrationVoiceNotificationOptionAsync(bool grantVoiceNotificationRole)
+    {
+        if (Context.Guild is null || Context.User is not SocketGuildUser guildUser)
         {
-            approvalMessage = $"{approvalMessage}\n{voiceRoleStatus}";
+            await RespondAsync("この操作はサーバー内でのみ使えます。", ephemeral: true);
+            return;
         }
 
-        await FollowupAsync(approvalMessage, ephemeral: true);
+        await DeferAsync(ephemeral: true);
+
+        var status = await TryGrantVoiceNotificationRoleForRegistrationAsync(Context.Guild, guildUser, grantVoiceNotificationRole);
+        if (!grantVoiceNotificationRole)
+        {
+            await FollowupAsync("通話通知ロールは付与しませんでした。必要なら後で設定パネルから変更できます。", ephemeral: true);
+            return;
+        }
+
+        await FollowupAsync(status ?? "通話通知ロールを付与しました。", ephemeral: true);
     }
+
+    private Task ShowPostRegistrationVoiceNotificationOfferAsync()
+        => FollowupAsync(
+            "オプション: 通話通知ロールを付与しますか？\nこのロールを持っていると、VC入室時に通知されます（後で設定パネルから変更可能）。",
+            components: BuildMemberRegistrationSubmitOptionsComponents(),
+            ephemeral: true);
 
     [RequireBotAdmin]
     [ComponentInteraction("member_registration_review_approve:*", ignoreGroupNames: true)]
@@ -1076,10 +1108,16 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
             .WithButton("登録申請を送信", MemberRegistrationSubmitCustomId, ButtonStyle.Primary)
             .Build();
 
+    private static MessageComponent BuildMemberRegistrationSubmitConfirmComponents()
+        => new ComponentBuilder()
+            .WithButton("送信する", MemberRegistrationSubmitConfirmCustomId, ButtonStyle.Success, row: 0)
+            .WithButton("中止", MemberRegistrationSubmitCancelCustomId, ButtonStyle.Secondary, row: 0)
+            .Build();
+
     private static MessageComponent BuildMemberRegistrationSubmitOptionsComponents()
         => new ComponentBuilder()
-            .WithButton("付与して送信", MemberRegistrationSubmitWithVoiceCustomId, ButtonStyle.Success, row: 0)
-            .WithButton("付与せず送信", MemberRegistrationSubmitWithoutVoiceCustomId, ButtonStyle.Secondary, row: 0)
+            .WithButton("通話通知を付与", MemberRegistrationSubmitWithVoiceCustomId, ButtonStyle.Success, row: 0)
+            .WithButton("付与しない", MemberRegistrationSubmitWithoutVoiceCustomId, ButtonStyle.Secondary, row: 0)
             .Build();
 
     private static MessageComponent BuildMemberRegistrationReviewComponents(ulong userId)
@@ -1319,7 +1357,28 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
                && !string.IsNullOrWhiteSpace(profile.Bio);
     }
 
+    private async Task<Embed> BuildMemberRegistrationPreviewEmbedAsync(SocketGuildUser guildUser, DiscordUserProfile profile)
+        => await BuildMemberRegistrationSummaryEmbedAsync(
+            guildUser,
+            profile,
+            title: "メンバー登録プレビュー",
+            color: Color.Blue,
+            descriptionPrefix: "送信前確認");
+
     private async Task<Embed> BuildMemberRegistrationReviewEmbedAsync(SocketGuildUser guildUser, DiscordUserProfile profile)
+        => await BuildMemberRegistrationSummaryEmbedAsync(
+            guildUser,
+            profile,
+            title: "メンバー登録申請",
+            color: Color.Orange,
+            descriptionPrefix: "申請者");
+
+    private async Task<Embed> BuildMemberRegistrationSummaryEmbedAsync(
+        SocketGuildUser guildUser,
+        DiscordUserProfile profile,
+        string title,
+        Color color,
+        string descriptionPrefix)
     {
         var guild = Context.Guild!;
         var roleDefinitions = await LoadMemberContentRoleDefinitionsAsync(guild.Id);
@@ -1338,10 +1397,10 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
 
         var avatar = guildUser.GetAvatarUrl() ?? guildUser.GetDisplayAvatarUrl();
         var embed = new EmbedBuilder()
-            .WithTitle("メンバー登録申請")
-            .WithColor(Color.Orange)
+            .WithTitle(title)
+            .WithColor(color)
             .WithCurrentTimestamp()
-            .WithDescription($"申請者: {guildUser.Mention}\nUserId: `{guildUser.Id}`")
+            .WithDescription($"{descriptionPrefix}: {guildUser.Mention}\nUserId: `{guildUser.Id}`")
             .AddField("Discord", $"表示名: {TruncateForLog(displayName, 120)}\nユーザー名: {TruncateForLog(discordName, 120)}\nDiscord開始日: {discordCreatedAt}\nサーバー参加日: {joinedAt}", false)
             .AddField("FFXIV", $"{ffxivName}@{ffxivWorld} [{dataCenter}]", false)
             .AddField("SNS", $"𝕏: {TruncateForLog(xText, 120)}\nBluesky: {TruncateForLog(blueskyText, 120)}", false)

@@ -17,6 +17,9 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
     private readonly DiscordOptions _options;
     private readonly LotteryCreateDraftContextTracker _lotteryCreateDraftTracker;
     private readonly GuildAuditLogService _audit;
+    private readonly RuntimeDiagnosticsService _runtimeDiagnostics;
+    private readonly RuntimeTuningService _runtimeTuning;
+    private readonly RecruitmentListService _recruitListService;
     private const int LotteryCreateSchedulePageSize = 7;
     private const int LotteryCreateCloseMaxDayOffset = 60;
     private static readonly TimeSpan JapanTimeOffset = TimeSpan.FromHours(9);
@@ -44,17 +47,25 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
     private const string LotteryCreateTestModalCustomId = "lottery_create_test_modal";
     private const string LotteryClaimToggleCustomId = "lottery_claim_toggle";
     private const string LotteryClaimDeleteCustomId = "lottery_claim_delete";
+    private const string RuntimeTuningEditCustomId = "admin_runtime_tuning_edit";
+    private const string RuntimeTuningModalCustomId = "admin_runtime_tuning_modal";
 
     public AdminControlPanelModule(
         Db db,
         IOptions<DiscordOptions> options,
         LotteryCreateDraftContextTracker lotteryCreateDraftTracker,
-        GuildAuditLogService audit)
+        GuildAuditLogService audit,
+        RuntimeDiagnosticsService runtimeDiagnostics,
+        RuntimeTuningService runtimeTuning,
+        RecruitmentListService recruitListService)
     {
         _db = db;
         _options = options.Value;
         _lotteryCreateDraftTracker = lotteryCreateDraftTracker;
         _audit = audit;
+        _runtimeDiagnostics = runtimeDiagnostics;
+        _runtimeTuning = runtimeTuning;
+        _recruitListService = recruitListService;
     }
 
     [RequireBotAdmin]
@@ -156,6 +167,41 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
     }
 
     [RequireBotAdmin]
+    [SlashCommand("perm_diag", "チャンネル権限を簡易診断します")]
+    public async Task PermissionDiagnosticsAsync(
+        [Summary("channel", "対象チャンネル（省略時: 現在チャンネル）")] IChannel? channel = null,
+        [Summary("user", "確認したいユーザー（省略時: Botのみ）")] SocketGuildUser? user = null)
+    {
+        if (Context.Guild is null)
+        {
+            await RespondAsync("このコマンドはサーバー内でのみ使えます。", ephemeral: true);
+            return;
+        }
+
+        if ((channel ?? Context.Channel) is not IGuildChannel guildChannel)
+        {
+            await RespondAsync("このチャンネルは診断対象にできません。", ephemeral: true);
+            return;
+        }
+
+        await DeferAsync(ephemeral: true);
+
+        var embed = new EmbedBuilder()
+            .WithTitle("権限診断")
+            .WithColor(Color.Blue)
+            .WithCurrentTimestamp()
+            .AddField("対象チャンネル", $"<#{guildChannel.Id}> ({guildChannel.Name})", false)
+            .AddField("Bot", BuildChannelPermissionDiagnostic(Context.Guild.CurrentUser, guildChannel), false);
+
+        if (user is not null)
+        {
+            embed.AddField($"ユーザー ({user.DisplayName ?? user.Username})", BuildChannelPermissionDiagnostic(user, guildChannel), false);
+        }
+
+        await FollowupAsync(embed: embed.Build(), ephemeral: true);
+    }
+
+    [RequireBotAdmin]
     [ComponentInteraction(AdminControlPanel.HealthCheckCustomId, ignoreGroupNames: true)]
     public async Task HealthByButtonAsync()
     {
@@ -167,6 +213,108 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
 
         await DeferAsync(ephemeral: true);
         await ShowHealthAsync();
+    }
+
+    [RequireBotAdmin]
+    [SlashCommand("integrity", "募集/抽選/お問い合わせの参照整合性を確認します")]
+    public async Task IntegrityCheckByCommandAsync(
+        [Summary("repair", "可能な範囲で簡易修復する")] bool repair = false)
+    {
+        if (Context.Guild is null)
+        {
+            await RespondAsync("このコマンドはサーバー内でのみ使えます。", ephemeral: true);
+            return;
+        }
+
+        await DeferAsync(ephemeral: true);
+        await ShowIntegrityCheckAsync(repair);
+    }
+
+    [RequireBotAdmin]
+    [ComponentInteraction(AdminControlPanel.IntegrityCheckCustomId, ignoreGroupNames: true)]
+    public async Task IntegrityCheckByButtonAsync()
+    {
+        if (Context.Guild is null)
+        {
+            await RespondAsync("この操作はサーバー内でのみ使えます。", ephemeral: true);
+            return;
+        }
+
+        await DeferAsync(ephemeral: true);
+        await ShowIntegrityCheckAsync(repair: false);
+    }
+
+    [RequireBotAdmin]
+    [ComponentInteraction(AdminControlPanel.RuntimeTuningCustomId, ignoreGroupNames: true)]
+    public async Task ShowRuntimeTuningPanelAsync()
+    {
+        if (Context.Guild is null)
+        {
+            await RespondAsync("この操作はサーバー内でのみ使えます。", ephemeral: true);
+            return;
+        }
+
+        await RespondAsync(
+            embed: BuildRuntimeTuningEmbed(),
+            components: new ComponentBuilder()
+                .WithButton("編集", RuntimeTuningEditCustomId, ButtonStyle.Primary, row: 0)
+                .Build(),
+            ephemeral: true);
+    }
+
+    [RequireBotAdmin]
+    [ComponentInteraction(RuntimeTuningEditCustomId, ignoreGroupNames: true)]
+    public async Task ShowRuntimeTuningModalAsync()
+    {
+        if (Context.Guild is null)
+        {
+            await RespondAsync("この操作はサーバー内でのみ使えます。", ephemeral: true);
+            return;
+        }
+
+        await RespondWithModalAsync<AdminRuntimeTuningModal>(RuntimeTuningModalCustomId);
+    }
+
+    [RequireBotAdmin]
+    [ModalInteraction(RuntimeTuningModalCustomId, ignoreGroupNames: true)]
+    public async Task HandleRuntimeTuningModalAsync(AdminRuntimeTuningModal modal)
+    {
+        if (Context.Guild is null)
+        {
+            await RespondAsync("この操作はサーバー内でのみ使えます。", ephemeral: true);
+            return;
+        }
+
+        if (!int.TryParse(modal.CleanupIntervalMinutes, out var cleanupMinutes))
+        {
+            await RespondAsync("Cleanup間隔(分)は数値で入力してください。", ephemeral: true);
+            return;
+        }
+        if (!int.TryParse(modal.RecruitClosedRetentionHours, out var closedHours))
+        {
+            await RespondAsync("終了後保持時間(h)は数値で入力してください。", ephemeral: true);
+            return;
+        }
+        if (!int.TryParse(modal.RecruitCanceledRetentionHours, out var canceledHours))
+        {
+            await RespondAsync("中断後保持時間(h)は数値で入力してください。", ephemeral: true);
+            return;
+        }
+
+        var updated = _runtimeTuning.Update(cleanupMinutes, closedHours, canceledHours);
+        await _db.UpsertGuildRuntimeTuningAsync(
+            Context.Guild.Id,
+            updated.CleanupIntervalMinutes,
+            updated.RecruitClosedRetentionHours,
+            updated.RecruitCanceledRetentionHours);
+        await _audit.SendAsync(
+            Context.Guild,
+            "運用設定更新",
+            $"👤 実行者: {Context.User.Mention} ({Context.User})\n⏱️ Cleanup間隔: {updated.CleanupIntervalMinutes}分\n📦 募集保持(終了): {updated.RecruitClosedRetentionHours}h\n📦 募集保持(中断): {updated.RecruitCanceledRetentionHours}h\n💾 DBに保存しました（再起動後も維持）。",
+            Color.Blue,
+            Context.User);
+
+        await RespondAsync(embed: BuildRuntimeTuningEmbed(), ephemeral: true);
     }
 
     [RequireBotAdmin]
@@ -1531,12 +1679,29 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
                 : HealthCheckItem.Ok("設定ControlChannelId", settings.ControlChannelId.ToString()));
         }
 
+        var startupReady = _runtimeDiagnostics.Get("startup.ready.end");
+        checks.Add(startupReady is null
+            ? HealthCheckItem.Warn("起動復旧確認", "まだ記録がありません（起動直後の可能性）")
+            : HealthCheckItem.Ok("起動復旧確認", FormatHeartbeatSummary(startupReady)));
+
+        checks.Add(BuildLoopHealthItem("定期処理/Cleanup", "loop.cleanup"));
+        if (_options.RecruitFeatureEnabled)
+        {
+            checks.Add(BuildLoopHealthItem("定期処理/募集Schedule", "loop.recruit_schedule"));
+        }
+        checks.Add(BuildLoopHealthItem("定期処理/ActivityRole", "loop.activity_role_sync"));
+
         var hasError = checks.Any(x => x.Level == "ERROR");
         var hasWarn = checks.Any(x => x.Level == "WARN");
         var overall = hasError ? "ERROR" : hasWarn ? "WARN" : "OK";
         var color = hasError ? Color.Red : hasWarn ? Color.Orange : Color.Green;
         var summaryLines = checks.Select(x => $"[{x.Level}] {x.Name}: {x.Message}");
         var summary = JoinWithinLimit(summaryLines, 950);
+        var tuning = _runtimeTuning.GetSnapshot();
+        var cleanupIntervalMinutes = tuning.CleanupIntervalMinutes;
+        var recruitCleanupPolicy = _options.RecruitFeatureEnabled
+            ? $"終了=開始+{tuning.RecruitClosedRetentionHours}h / 中断=中断+{tuning.RecruitCanceledRetentionHours}h"
+            : "募集機能OFF";
         var embed = new EmbedBuilder()
             .WithTitle("Bot Health Check")
             .WithColor(color)
@@ -1544,10 +1709,246 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
             .AddField("総合", overall, true)
             .AddField("自動キック", autoKickEnabled ? "ON" : "OFF", true)
             .AddField("対象Guild", $"{guild.Name} ({guild.Id})", true)
+            .AddField("Cleanup間隔", $"{cleanupIntervalMinutes}分", true)
+            .AddField("募集Cleanup", recruitCleanupPolicy, true)
+            .AddField("修復導線", "ADMINパネルの `パネル再同期` を使用", true)
             .AddField("詳細", string.IsNullOrWhiteSpace(summary) ? "なし" : summary, false)
             .Build();
 
         await FollowupAsync(embed: embed, ephemeral: true);
+    }
+
+    private Embed BuildRuntimeTuningEmbed()
+    {
+        var tuning = _runtimeTuning.GetSnapshot();
+        return new EmbedBuilder()
+            .WithTitle("運用設定")
+            .WithColor(Color.Blue)
+            .WithCurrentTimestamp()
+            .AddField("Cleanup間隔", $"{tuning.CleanupIntervalMinutes}分", true)
+            .AddField("募集保持(終了)", $"{tuning.RecruitClosedRetentionHours}時間", true)
+            .AddField("募集保持(中断)", $"{tuning.RecruitCanceledRetentionHours}時間", true)
+            .AddField("保存", "DB保存（再起動後も維持）", false)
+            .Build();
+    }
+
+    private async Task ShowIntegrityCheckAsync(bool repair)
+    {
+        if (Context.Guild is null)
+        {
+            return;
+        }
+
+        var guild = Context.Guild;
+        var lines = new List<string>();
+        var errors = 0;
+        var warns = 0;
+        var repaired = 0;
+
+        var recruitSummaries = await _db.ListRecruitPostSummariesAsync(guild.Id);
+        var recruitPosts = new List<RecruitPost>();
+        foreach (var summary in recruitSummaries)
+        {
+            var post = await _db.GetRecruitPostByMessageIdAsync(ToUlong(summary.MessageId));
+            if (post is not null)
+            {
+                recruitPosts.Add(post);
+            }
+        }
+
+        var staleRecruitThreadRefs = 0;
+        foreach (var post in recruitPosts.Where(p => p.ThreadChannelId.HasValue && p.ThreadChannelId.Value != 0))
+        {
+            var threadId = ToUlong(post.ThreadChannelId!.Value);
+            var exists = guild.GetThreadChannel(threadId) is not null;
+            if (!exists)
+            {
+                try
+                {
+                    exists = (await Context.Client.Rest.GetChannelAsync(threadId)) is IThreadChannel;
+                }
+                catch
+                {
+                    exists = false;
+                }
+            }
+
+            if (exists)
+            {
+                continue;
+            }
+
+            staleRecruitThreadRefs++;
+            if (repair)
+            {
+                await _db.UpdateRecruitThreadAsync(post.Id, null, null);
+                repaired++;
+            }
+        }
+
+        if (staleRecruitThreadRefs > 0)
+        {
+            warns++;
+            lines.Add($"[WARN] 募集スレッド参照切れ: {staleRecruitThreadRefs}件{(repair ? "（DB参照を解除）" : string.Empty)}");
+        }
+        else
+        {
+            lines.Add("[OK] 募集スレッド参照切れ: なし");
+        }
+
+        var missingRecruitMessages = 0;
+        foreach (var post in recruitPosts.Take(100))
+        {
+            var channel = guild.GetTextChannel(ToUlong(post.ChannelId));
+            if (channel is null)
+            {
+                missingRecruitMessages++;
+                continue;
+            }
+
+            try
+            {
+                var message = await channel.GetMessageAsync(ToUlong(post.MessageId));
+                if (message is null)
+                {
+                    missingRecruitMessages++;
+                }
+            }
+            catch
+            {
+                missingRecruitMessages++;
+            }
+        }
+
+        if (missingRecruitMessages > 0)
+        {
+            warns++;
+            lines.Add($"[WARN] 募集メッセージ参照切れ: {missingRecruitMessages}件（先頭100件確認）");
+        }
+        else
+        {
+            lines.Add("[OK] 募集メッセージ参照切れ: なし（確認範囲内）");
+        }
+
+        var inquiryTickets = await _db.ListInquiryTicketsAsync(guild.Id, includeClosed: false, maxRows: 200);
+        var missingInquiryChannels = inquiryTickets.Count(ticket => guild.GetTextChannel(ToUlong(ticket.ChannelId)) is null);
+        if (missingInquiryChannels > 0)
+        {
+            warns++;
+            lines.Add($"[WARN] お問い合わせチャンネル参照切れ: {missingInquiryChannels}件");
+        }
+        else
+        {
+            lines.Add("[OK] お問い合わせチャンネル参照切れ: なし");
+        }
+
+        var lotteries = await _db.ListRecentLotteriesAsync(guild.Id, 100);
+        var missingLotteryChannels = 0;
+        foreach (var lottery in lotteries)
+        {
+            var channelId = ToUlong(lottery.ChannelId);
+            if (!lottery.MessageId.HasValue || lottery.MessageId.Value == 0)
+            {
+                missingLotteryChannels++;
+                continue;
+            }
+
+            var messageId = ToUlong(lottery.MessageId.Value);
+            var channel = guild.GetTextChannel(channelId);
+            if (channel is null)
+            {
+                missingLotteryChannels++;
+                continue;
+            }
+
+            try
+            {
+                var msg = await channel.GetMessageAsync(messageId);
+                if (msg is null)
+                {
+                    missingLotteryChannels++;
+                }
+            }
+            catch
+            {
+                missingLotteryChannels++;
+            }
+        }
+        if (missingLotteryChannels > 0)
+        {
+            warns++;
+            lines.Add($"[WARN] 抽選メッセージ/チャンネル参照切れ: {missingLotteryChannels}件（直近100件）");
+        }
+        else
+        {
+            lines.Add("[OK] 抽選メッセージ/チャンネル参照切れ: なし（確認範囲内）");
+        }
+
+        if (repair)
+        {
+            try
+            {
+                if (Context.Channel is IMessageChannel fallbackChannel)
+                {
+                    await _recruitListService.RefreshAsync(guild, fallbackChannel);
+                    lines.Add("[OK] 募集一覧を再生成しました。");
+                }
+            }
+            catch (Exception ex)
+            {
+                warns++;
+                lines.Add($"[WARN] 募集一覧再生成失敗: {ex.Message}");
+            }
+        }
+
+        var color = errors > 0 ? Color.Red : warns > 0 ? Color.Orange : Color.Green;
+        var embed = new EmbedBuilder()
+            .WithTitle(repair ? "整合性チェック（簡易修復あり）" : "整合性チェック")
+            .WithColor(color)
+            .WithCurrentTimestamp()
+            .AddField("結果", errors > 0 ? "ERROR" : warns > 0 ? "WARN" : "OK", true)
+            .AddField("募集件数", recruitPosts.Count.ToString(), true)
+            .AddField("修復数", repaired.ToString(), true)
+            .AddField("詳細", JoinWithinLimit(lines, 1000), false)
+            .AddField("修復の範囲", "現在は `募集スレッド参照切れのDB解除` と `募集一覧再生成` のみ自動対応", false)
+            .Build();
+
+        if (repair)
+        {
+            await _audit.SendAsync(
+                guild,
+                "整合性チェック（簡易修復）",
+                $"👤 実行者: {Context.User.Mention} ({Context.User})\n🛠️ 修復数: {repaired}\n⚠️ 警告: {warns}\n❌ エラー: {errors}",
+                color,
+                Context.User);
+        }
+
+        await FollowupAsync(embed: embed, ephemeral: true);
+    }
+
+    private HealthCheckItem BuildLoopHealthItem(string name, string key)
+    {
+        var heartbeat = _runtimeDiagnostics.Get(key);
+        if (heartbeat is null)
+        {
+            return HealthCheckItem.Warn(name, "記録なし");
+        }
+
+        var age = DateTimeOffset.UtcNow - heartbeat.LastRunAtUtc;
+        if (age > TimeSpan.FromHours(1))
+        {
+            return HealthCheckItem.Warn(name, $"{FormatHeartbeatSummary(heartbeat)} / 遅延の可能性");
+        }
+
+        return heartbeat.LastSuccess
+            ? HealthCheckItem.Ok(name, FormatHeartbeatSummary(heartbeat))
+            : HealthCheckItem.Error(name, FormatHeartbeatSummary(heartbeat));
+    }
+
+    private static string FormatHeartbeatSummary(RuntimeHeartbeat heartbeat)
+    {
+        var ts = $"<t:{heartbeat.LastRunAtUtc.ToUnixTimeSeconds()}:R>";
+        return string.IsNullOrWhiteSpace(heartbeat.LastNote) ? ts : $"{ts} ({heartbeat.LastNote})";
     }
 
     private async Task PreviewInactiveKickAsync(int top)
@@ -1634,6 +2035,28 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
             .Build();
 
         await FollowupAsync(embed: embed, ephemeral: true);
+    }
+
+    private static string BuildChannelPermissionDiagnostic(SocketGuildUser target, IGuildChannel channel)
+    {
+        try
+        {
+            var p = target.GetPermissions(channel);
+            var lines = new[]
+            {
+                $"ViewChannel: {(p.ViewChannel ? "OK" : "NG")}",
+                $"ReadMessageHistory: {(p.ReadMessageHistory ? "OK" : "NG")}",
+                $"SendMessages: {(p.SendMessages ? "OK" : "NG")}",
+                $"UseApplicationCommands: {(p.UseApplicationCommands ? "OK" : "NG")}",
+                $"AttachFiles: {(p.AttachFiles ? "OK" : "NG")}",
+                $"ManageChannels: {(p.ManageChannel ? "OK" : "NG")}"
+            };
+            return string.Join('\n', lines);
+        }
+        catch (Exception ex)
+        {
+            return $"取得失敗: {ex.Message}";
+        }
     }
 
     private async Task ShowInquiryTicketDetailAsync(int ticketId)
@@ -3283,4 +3706,21 @@ public sealed class LotteryCreateTestModal : IModal
     [ModalTextInput("lottery_create_test_description", TextInputStyle.Paragraph, maxLength: 300)]
     [RequiredInput(false)]
     public string? Description { get; set; }
+}
+
+public sealed class AdminRuntimeTuningModal : IModal
+{
+    public string Title => "運用設定";
+
+    [InputLabel("Cleanup間隔（分 / 1-720）")]
+    [ModalTextInput("admin_runtime_cleanup_interval_minutes", maxLength: 3)]
+    public string CleanupIntervalMinutes { get; set; } = "10";
+
+    [InputLabel("募集保持: 終了後（時間 / 1-720）")]
+    [ModalTextInput("admin_runtime_recruit_closed_retention_hours", maxLength: 3)]
+    public string RecruitClosedRetentionHours { get; set; } = "24";
+
+    [InputLabel("募集保持: 中断後（時間 / 1-720）")]
+    [ModalTextInput("admin_runtime_recruit_canceled_retention_hours", maxLength: 3)]
+    public string RecruitCanceledRetentionHours { get; set; } = "24";
 }

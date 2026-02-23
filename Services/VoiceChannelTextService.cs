@@ -2,14 +2,21 @@ using Discord;
 using Discord.WebSocket;
 using Microsoft.Extensions.Logging;
 using RaidDcBot.Bot;
+using System.Collections.Concurrent;
 
 namespace RaidDcBot.Services;
 
 public sealed class VoiceChannelTextService
 {
+    public const string StatusPromptSetCustomId = "voice_status_prompt_set";
+    public const string StatusPromptClearCustomId = "voice_status_prompt_clear";
+    public const string StatusPromptModalCustomId = "voice_status_prompt_modal";
+
     private readonly DiscordSocketClient _client;
     private readonly VoiceTransferTracker _tracker;
     private readonly ILogger<VoiceChannelTextService> _logger;
+    private readonly ConcurrentDictionary<ulong, ulong> _statusPromptMessageIds = new();
+    private readonly ConcurrentDictionary<ulong, DateTimeOffset> _statusPromptTouchedAt = new();
 
     public VoiceChannelTextService(
         DiscordSocketClient client,
@@ -79,9 +86,125 @@ public sealed class VoiceChannelTextService
         await DeleteExistingTransferAsync(textChannel, channel.Id);
     }
 
+    public async Task UpsertStatusPromptAsync(
+        SocketVoiceChannel channel,
+        SocketUser? actor = null,
+        string? notice = null,
+        string? descriptionOverride = null,
+        bool suppressNotification = false,
+        bool forceRepost = false)
+    {
+        var textChannel = await ResolveAsync(channel);
+        if (textChannel is null)
+        {
+            return;
+        }
+
+        var embed = BuildStatusPromptEmbed(channel, actor, notice, descriptionOverride);
+        var components = BuildStatusPromptComponents();
+        if (!forceRepost && _statusPromptMessageIds.TryGetValue(channel.Id, out var existingMessageId))
+        {
+            try
+            {
+                var existing = await textChannel.GetMessageAsync(existingMessageId) as IUserMessage;
+                if (existing is not null)
+                {
+                    await existing.ModifyAsync(props =>
+                    {
+                        props.Embed = embed;
+                        props.Components = components;
+                    });
+                    _statusPromptTouchedAt[channel.Id] = DateTimeOffset.UtcNow;
+                    return;
+                }
+            }
+            catch
+            {
+                _statusPromptMessageIds.TryRemove(channel.Id, out _);
+            }
+        }
+        else if (forceRepost)
+        {
+            await DeleteExistingStatusPromptAsync(textChannel, channel.Id);
+        }
+
+        var posted = suppressNotification
+            ? await textChannel.SendMessageAsync(
+                embed: embed,
+                components: components,
+                flags: MessageFlags.SuppressNotification)
+            : await textChannel.SendMessageAsync(
+                embed: embed,
+                components: components);
+        _statusPromptMessageIds[channel.Id] = posted.Id;
+        _statusPromptTouchedAt[channel.Id] = DateTimeOffset.UtcNow;
+    }
+
+    public async Task ClearStatusPromptAsync(SocketVoiceChannel channel)
+    {
+        var textChannel = await ResolveAsync(channel);
+        if (textChannel is null)
+        {
+            _statusPromptMessageIds.TryRemove(channel.Id, out _);
+            _statusPromptTouchedAt.TryRemove(channel.Id, out _);
+            return;
+        }
+
+        await DeleteExistingStatusPromptAsync(textChannel, channel.Id);
+        _statusPromptTouchedAt.TryRemove(channel.Id, out _);
+    }
+
+    public async Task TryPostStatusPromptReminderAsync(SocketVoiceChannel channel, TimeSpan interval)
+    {
+        if (interval <= TimeSpan.Zero)
+        {
+            return;
+        }
+
+        if (!channel.ConnectedUsers.Any(user => !user.IsBot))
+        {
+            return;
+        }
+
+        var now = DateTimeOffset.UtcNow;
+        if (_statusPromptTouchedAt.TryGetValue(channel.Id, out var lastTouchedAt) &&
+            now - lastTouchedAt < interval)
+        {
+            return;
+        }
+
+        var notice = string.IsNullOrWhiteSpace(GetVoiceChannelStatusText(channel))
+            ? "1時間ほど経過しました。VCステータスを設定しませんか？"
+            : "1時間ほど経過しました。VCステータスを変更しませんか？";
+
+        await UpsertStatusPromptAsync(
+            channel,
+            actor: null,
+            notice: notice,
+            descriptionOverride: "VCステータスの確認タイミングです。必要なら更新してください。",
+            suppressNotification: true,
+            forceRepost: true);
+    }
+
     private async Task DeleteExistingTransferAsync(IMessageChannel textChannel, ulong channelId)
     {
         if (!_tracker.TryRemove(channelId, out var messageId))
+        {
+            return;
+        }
+
+        try
+        {
+            await textChannel.DeleteMessageAsync(messageId);
+        }
+        catch
+        {
+        }
+    }
+
+    private async Task DeleteExistingStatusPromptAsync(IMessageChannel textChannel, ulong channelId)
+    {
+        if (!_statusPromptMessageIds.TryRemove(channelId, out var messageId))
         {
             return;
         }
@@ -104,6 +227,62 @@ public sealed class VoiceChannelTextService
 
         var display = user.GlobalName ?? user.DisplayName ?? user.Username;
         return $"{user.Mention} ({display})";
+    }
+
+    private static Embed BuildStatusPromptEmbed(SocketVoiceChannel channel, SocketUser? actor, string? notice, string? descriptionOverride)
+    {
+        var status = GetVoiceChannelStatusText(channel);
+        var actorDisplay = actor switch
+        {
+            SocketGuildUser guildUser => guildUser.DisplayName ?? guildUser.GlobalName ?? guildUser.Username,
+            not null => actor.GlobalName ?? actor.Username,
+            _ => null
+        };
+
+        var description = !string.IsNullOrWhiteSpace(descriptionOverride)
+            ? descriptionOverride
+            : string.IsNullOrWhiteSpace(status)
+                ? "最初の参加者が入りました。チャンネルステータスを設定しませんか？"
+                : "最初の参加者が入りました。必要ならチャンネルステータスを変更できます。";
+
+        if (!string.IsNullOrWhiteSpace(notice))
+        {
+            description = $"{description}\n\n{notice}";
+        }
+
+        if (!string.IsNullOrWhiteSpace(actorDisplay))
+        {
+            description = $"{description}\n起点: {MentionUser(actor!.Id)} ({actorDisplay})";
+        }
+
+        return new EmbedBuilder()
+            .WithTitle("VCステータス設定")
+            .WithColor(Color.Blue)
+            .WithCurrentTimestamp()
+            .WithDescription(description)
+            .AddField("VC", $"<#{channel.Id}> ({channel.Name})", false)
+            .AddField("現在のステータス", string.IsNullOrWhiteSpace(status) ? "未設定" : status, false)
+            .Build();
+    }
+
+    private static MessageComponent BuildStatusPromptComponents()
+    {
+        return new ComponentBuilder()
+            .WithButton("ステータス設定", StatusPromptSetCustomId, ButtonStyle.Primary, row: 0)
+            .WithButton("クリア", StatusPromptClearCustomId, ButtonStyle.Danger, row: 0)
+            .Build();
+    }
+
+    private static string? GetVoiceChannelStatusText(SocketVoiceChannel channel)
+    {
+        var status = channel.Status?.Trim();
+        if (!string.IsNullOrWhiteSpace(status))
+        {
+            return status;
+        }
+
+        var topic = channel.Topic?.Trim();
+        return string.IsNullOrWhiteSpace(topic) ? null : topic;
     }
 
     private static string MentionUser(ulong userId) => $"<@{userId}>";

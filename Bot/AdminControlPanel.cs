@@ -8,6 +8,8 @@ public static class AdminControlPanel
     public const string ExportMessageCsvCustomId = "admin_export_message_csv_7d";
     public const string PreviewInactiveKickCustomId = "admin_preview_inactive_kick";
     public const string HealthCheckCustomId = "admin_health_check";
+    public const string IntegrityCheckCustomId = "admin_integrity_check";
+    public const string RuntimeTuningCustomId = "admin_runtime_tuning";
     public const string LotteryCustomId = "admin_lottery";
     public const string InquiryDashboardCustomId = "admin_inquiry_dashboard";
     public const string ToggleRegistrationApprovalCustomId = "admin_toggle_registration_approval";
@@ -25,9 +27,11 @@ public static class AdminControlPanel
             .WithButton("メッセージCSV(全期間)", ExportMessageCsvCustomId, ButtonStyle.Secondary, row: 0)
             .WithButton("自動キック候補", PreviewInactiveKickCustomId, ButtonStyle.Primary, row: 0)
             .WithButton("ヘルスチェック", HealthCheckCustomId, ButtonStyle.Secondary, row: 0)
+            .WithButton("整合性チェック", IntegrityCheckCustomId, ButtonStyle.Secondary, row: 0)
             .WithButton("抽選管理", LotteryCustomId, ButtonStyle.Success, row: 0)
             .WithButton(statusLabel, ToggleRegistrationApprovalCustomId, statusStyle, row: 1)
             .WithButton(autoKickLabel, ToggleInactiveAutoKickCustomId, autoKickStyle, row: 1)
+            .WithButton("運用設定", RuntimeTuningCustomId, ButtonStyle.Secondary, row: 1)
             .WithButton("パネル再同期", ResyncPanelsCustomId, ButtonStyle.Secondary, row: 1)
             .Build();
     }

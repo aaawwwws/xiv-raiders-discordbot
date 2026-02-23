@@ -29,6 +29,8 @@ public sealed class DiscordBotService : IHostedService
     private readonly UserProfileEmbedService _profileEmbeds;
     private readonly RecruitmentListService _recruitListService;
     private readonly GuildAuditLogService _audit;
+    private readonly RuntimeDiagnosticsService _runtimeDiagnostics;
+    private readonly RuntimeTuningService _runtimeTuning;
     private readonly StatsEmbedService _stats;
     private readonly VoiceStatsService _voiceStats;
     private readonly string? _attachmentArchiveRootPath;
@@ -43,8 +45,7 @@ public sealed class DiscordBotService : IHostedService
     private static readonly TimeSpan JapanTimeOffset = TimeSpan.FromHours(9);
     private static readonly TimeSpan FailureAlertCooldown = TimeSpan.FromMinutes(15);
     private static readonly TimeSpan LotteryParticipantRoleRetention = TimeSpan.FromHours(24);
-    private static readonly TimeSpan RecruitClosedArtifactRetention = TimeSpan.FromHours(24);
-    private static readonly TimeSpan RecruitCanceledArtifactRetention = TimeSpan.FromHours(24);
+    private static readonly TimeSpan VoiceStatusPromptReminderInterval = TimeSpan.FromHours(1);
     private const string RecruitScheduleFormat = "yyyy/MM/dd HH:mm";
     private CancellationTokenSource? _cleanupCts;
     private Task? _cleanupTask;
@@ -64,6 +65,8 @@ public sealed class DiscordBotService : IHostedService
         UserProfileEmbedService profileEmbeds,
         RecruitmentListService recruitListService,
         GuildAuditLogService audit,
+        RuntimeDiagnosticsService runtimeDiagnostics,
+        RuntimeTuningService runtimeTuning,
         StatsEmbedService stats,
         VoiceStatsService voiceStats)
     {
@@ -77,6 +80,8 @@ public sealed class DiscordBotService : IHostedService
         _profileEmbeds = profileEmbeds;
         _recruitListService = recruitListService;
         _audit = audit;
+        _runtimeDiagnostics = runtimeDiagnostics;
+        _runtimeTuning = runtimeTuning;
         _stats = stats;
         _voiceStats = voiceStats;
         _attachmentArchiveRootPath = ResolveAttachmentArchiveRootPath(_options);
@@ -84,6 +89,7 @@ public sealed class DiscordBotService : IHostedService
 
     public async Task StartAsync(CancellationToken cancellationToken)
     {
+        _runtimeDiagnostics.Mark("startup.begin", success: true, note: "StartAsync");
         if (string.IsNullOrWhiteSpace(_options.Token))
         {
             throw new InvalidOperationException("Discord:Token is required.");
@@ -95,10 +101,12 @@ public sealed class DiscordBotService : IHostedService
         await _db.EnsureRecruitHostFlexJobsSpecColumnAsync();
         await _db.EnsureRecruitSlotFlexSpecColumnAsync();
         await _db.EnsureRecruitSlotFlexJobsSpecColumnAsync();
+        await _db.EnsureRecruitUnderfilledDecisionDeadlineColumnAsync();
         await _db.BackfillRecruitSlotFlexJobsSpecAsync();
         await _db.EnsureDiscordUserProfileCharacterColumnsAsync();
         await _db.EnsureDiscordUserVoiceNotificationColumnAsync();
         await _db.EnsureGuildLodestonePanelTableAsync();
+        await _db.EnsureLodestoneCharacterExtrasCacheColumnsAsync();
         await _db.EnsureGuildAdminControlPanelTableAsync();
         await _db.EnsureGuildMemberContentRolesTableAsync();
         await _db.EnsureGuildStatsPanelTableAsync();
@@ -110,6 +118,7 @@ public sealed class DiscordBotService : IHostedService
         await _db.EnsureRecruitTemplatesTableAsync();
         await _db.EnsureMessageLogPayloadColumnsAsync();
         await _db.EnsureUserReactionLogsTableAsync();
+        await RestoreRuntimeTuningAsync();
         EnsureAttachmentArchiveDirectory();
 
         _client.Log += HandleLogAsync;
@@ -136,6 +145,36 @@ public sealed class DiscordBotService : IHostedService
 
         await _client.LoginAsync(TokenType.Bot, _options.Token);
         await _client.StartAsync();
+    }
+
+    private async Task RestoreRuntimeTuningAsync()
+    {
+        var persisted = await _db.GetLatestGuildRuntimeTuningAsync();
+        if (persisted is null ||
+            !persisted.RuntimeCleanupIntervalMinutes.HasValue ||
+            !persisted.RuntimeRecruitClosedRetentionHours.HasValue ||
+            !persisted.RuntimeRecruitCanceledRetentionHours.HasValue)
+        {
+            return;
+        }
+
+        var updated = _runtimeTuning.Update(
+            persisted.RuntimeCleanupIntervalMinutes.Value,
+            persisted.RuntimeRecruitClosedRetentionHours.Value,
+            persisted.RuntimeRecruitCanceledRetentionHours.Value);
+
+        _logger.LogInformation(
+            "Restored runtime tuning from DB. GuildId={GuildId}, CleanupIntervalMinutes={CleanupIntervalMinutes}, RecruitClosedRetentionHours={RecruitClosedRetentionHours}, RecruitCanceledRetentionHours={RecruitCanceledRetentionHours}, RuntimeTuningUpdatedAt={RuntimeTuningUpdatedAt}",
+            persisted.GuildId,
+            updated.CleanupIntervalMinutes,
+            updated.RecruitClosedRetentionHours,
+            updated.RecruitCanceledRetentionHours,
+            persisted.RuntimeTuningUpdatedAt);
+
+        _runtimeDiagnostics.Mark(
+            "runtime_tuning.restore",
+            success: true,
+            note: $"guild={persisted.GuildId},cleanup={updated.CleanupIntervalMinutes}m");
     }
 
     public async Task StopAsync(CancellationToken cancellationToken)
@@ -193,6 +232,7 @@ public sealed class DiscordBotService : IHostedService
 
     private async Task OnReadyAsync()
     {
+        _runtimeDiagnostics.Mark("startup.ready.begin", success: true, note: "OnReadyAsync");
         await RegisterInteractionModulesAsync();
 
         if (_options.GuildId != 0)
@@ -206,10 +246,15 @@ public sealed class DiscordBotService : IHostedService
 
         _logger.LogInformation("Bot ready. Commands registered.");
         await EnsureGuildResourcesAsync();
+        foreach (var guild in _client.Guilds)
+        {
+            await TrySendStartupRecoveryAuditAsync(guild);
+        }
         if (ShouldRunActivityMaintenance())
         {
             await SyncActivityRolesAsync(DateTimeOffset.UtcNow);
         }
+        _runtimeDiagnostics.Mark("startup.ready.end", success: true, note: "OnReadyAsync completed");
     }
 
     private async Task OnInteractionCreatedAsync(SocketInteraction interaction)
@@ -238,6 +283,45 @@ public sealed class DiscordBotService : IHostedService
         {
             await TryLogInteractionFailureAsync(context, result);
             _logger.LogWarning("Interaction failed: {Error} - {Reason}", result.Error, result.ErrorReason);
+        }
+    }
+
+    private async Task TrySendStartupRecoveryAuditAsync(SocketGuild guild)
+    {
+        try
+        {
+            var recruitActiveCount = 0;
+            var inquiryOpenCount = 0;
+            var lotteryOpenCount = 0;
+
+            if (_options.RecruitFeatureEnabled)
+            {
+                var recruitSummaries = await _db.ListRecruitPostSummariesAsync(guild.Id);
+                recruitActiveCount = recruitSummaries.Count(post => post.Status is RecruitPostStatus.Open or RecruitPostStatus.Full);
+            }
+
+            var tickets = await _db.ListInquiryTicketsAsync(guild.Id, includeClosed: false, maxRows: 1);
+            inquiryOpenCount = tickets.Count;
+
+            var lotteries = await _db.ListRecentLotteriesAsync(guild.Id, 50);
+            lotteryOpenCount = lotteries.Count(lottery => !LotteryStatus.IsClosed(lottery.Status));
+
+            var tuning = _runtimeTuning.GetSnapshot();
+            var lines = new List<string>
+            {
+                "🔄 再起動後の復旧チェックを完了しました。",
+                $"🧩 募集クリーンアップ: 終了=開始+{tuning.RecruitClosedRetentionHours}h / 中断=中断+{tuning.RecruitCanceledRetentionHours}h",
+                $"⏱️ クリーンアップ間隔: {tuning.CleanupIntervalMinutes}分",
+                $"📣 募集(OPEN/FULL): {recruitActiveCount}件",
+                $"✉️ お問い合わせ(OPEN): {inquiryOpenCount}件",
+                $"🎁 抽選(OPEN): {lotteryOpenCount}件"
+            };
+
+            await _audit.SendSystemAsync(guild, "起動復旧確認", string.Join('\n', lines), Color.LightGrey);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to send startup recovery audit. GuildId={GuildId}", guild.Id);
         }
     }
 
@@ -418,13 +502,12 @@ public sealed class DiscordBotService : IHostedService
 
     private async Task CleanupLoopAsync(CancellationToken token)
     {
-        var configuredMinutes = _options.CleanupIntervalMinutes <= 0
-            ? 10
-            : _options.CleanupIntervalMinutes;
-        var interval = TimeSpan.FromMinutes(Math.Clamp(configuredMinutes, 1, 720));
         while (!token.IsCancellationRequested)
         {
+            var tuning = _runtimeTuning.GetSnapshot();
+            var interval = TimeSpan.FromMinutes(tuning.CleanupIntervalMinutes);
             await RunCleanupAsync();
+            _runtimeDiagnostics.Mark("loop.cleanup", success: true, note: $"interval={interval.TotalMinutes:0}m");
 
             try
             {
@@ -446,6 +529,7 @@ public sealed class DiscordBotService : IHostedService
         while (!token.IsCancellationRequested)
         {
             await RunRecruitScheduleTickAsync();
+            _runtimeDiagnostics.Mark("loop.recruit_schedule", success: true, note: $"interval={interval.TotalSeconds:0}s");
 
             try
             {
@@ -529,6 +613,31 @@ public sealed class DiscordBotService : IHostedService
             _logger.LogWarning(ex, "Failed to cleanup recruit artifacts.");
         }
 
+        try
+        {
+            await RunVoiceStatusPromptReminderTickAsync();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to send voice status prompt reminders.");
+        }
+
+    }
+
+    private async Task RunVoiceStatusPromptReminderTickAsync()
+    {
+        foreach (var guild in _client.Guilds)
+        {
+            foreach (var channel in guild.VoiceChannels)
+            {
+                if (channel.ConnectedUsers.Count == 0)
+                {
+                    continue;
+                }
+
+                await _voiceTextService.TryPostStatusPromptReminderAsync(channel, VoiceStatusPromptReminderInterval);
+            }
+        }
     }
 
     private async Task ActivityRoleSyncLoopAsync(CancellationToken token)
@@ -550,6 +659,7 @@ public sealed class DiscordBotService : IHostedService
             }
 
             await RunActivityRoleSyncAsync();
+            _runtimeDiagnostics.Mark("loop.activity_role_sync", success: true, note: $"interval={interval.TotalMinutes:0}m");
         }
     }
 
@@ -1047,8 +1157,11 @@ public sealed class DiscordBotService : IHostedService
 
     private async Task CleanupRecruitArtifactsAsync(DateTimeOffset nowUtc)
     {
-        var closedCutoffUtc = nowUtc.Subtract(RecruitClosedArtifactRetention);
-        var canceledCutoffUtc = nowUtc.Subtract(RecruitCanceledArtifactRetention);
+        var tuning = _runtimeTuning.GetSnapshot();
+        var closedRetention = TimeSpan.FromHours(tuning.RecruitClosedRetentionHours);
+        var canceledRetention = TimeSpan.FromHours(tuning.RecruitCanceledRetentionHours);
+        var closedCutoffUtc = nowUtc.Subtract(closedRetention);
+        var canceledCutoffUtc = nowUtc.Subtract(canceledRetention);
         var targets = await _db.ListRecruitPostsDueForArtifactCleanupAsync(closedCutoffUtc, canceledCutoffUtc);
         if (targets.Count == 0)
         {
@@ -1117,8 +1230,8 @@ public sealed class DiscordBotService : IHostedService
             _logger.LogInformation(
                 "Cleaned up {Count} recruit posts due for artifact cleanup. closed=start+{ClosedHours}h, canceled=cancel+{CanceledHours}h",
                 deletedCount,
-                RecruitClosedArtifactRetention.TotalHours,
-                RecruitCanceledArtifactRetention.TotalHours);
+                closedRetention.TotalHours,
+                canceledRetention.TotalHours);
         }
     }
 
@@ -1541,16 +1654,86 @@ public sealed class DiscordBotService : IHostedService
             return;
         }
 
+        var nowUtc = DateTimeOffset.UtcNow;
         var previousStatus = post.Status;
-        var mentionUserIds = await BuildRecruitNoticeMentionUserIdsAsync(post);
+        var slots = await _db.ListRecruitSlotsAsync(post.Id);
+        var filled = slots.Count(slot => slot.UserId.HasValue || slot.IsClosed);
+        var capacity = slots.Count > 0 ? slots.Count : RecruitmentRules.Positions.Count;
+        var isUnderfilled = filled < capacity;
+
+        if (isUnderfilled)
+        {
+            var pendingDeadline = post.UnderfilledDecisionDeadlineAt;
+
+            if (IsImmediateScheduleInitialGraceDeadline(post, pendingDeadline))
+            {
+                if (pendingDeadline!.Value > nowUtc)
+                {
+                    return;
+                }
+
+                var promptDeadline = nowUtc.AddHours(1);
+                var promptText = $"開始時刻になりましたが、現在 {filled}/{capacity}（人数未達）です。\n主催の方は 1 時間以内に「終了/再開」または延長を選んでください。未操作の場合は自動終了します。";
+                var promptSent = await TryPostRecruitNoticeAsync(
+                    guild,
+                    post,
+                    promptText,
+                    new[] { ToUlong(post.CreatorUserId) },
+                    BuildRecruitUnderfilledDecisionPromptComponents(post));
+                if (promptSent)
+                {
+                    await _db.SetRecruitUnderfilledDecisionDeadlineAsync(post.Id, promptDeadline);
+                    post.UnderfilledDecisionDeadlineAt = promptDeadline;
+                    return;
+                }
+
+                _logger.LogWarning("Failed to post underfilled decision prompt after immediate-schedule grace for recruit post {PostId}; falling back to auto-close.", post.Id);
+            }
+
+            if (!pendingDeadline.HasValue)
+            {
+                var promptDeadline = nowUtc.AddHours(1);
+                var promptText = $"開始時刻になりましたが、現在 {filled}/{capacity}（人数未達）です。\n主催の方は 1 時間以内に「終了/再開」または延長を選んでください。未操作の場合は自動終了します。";
+                var promptSent = await TryPostRecruitNoticeAsync(
+                    guild,
+                    post,
+                    promptText,
+                    new[] { ToUlong(post.CreatorUserId) },
+                    BuildRecruitUnderfilledDecisionPromptComponents(post));
+                if (promptSent)
+                {
+                    await _db.SetRecruitUnderfilledDecisionDeadlineAsync(post.Id, promptDeadline);
+                    return;
+                }
+
+                _logger.LogWarning("Failed to post underfilled decision prompt for recruit post {PostId}; falling back to auto-close.", post.Id);
+            }
+            else if (pendingDeadline.HasValue && pendingDeadline.Value > nowUtc)
+            {
+                return;
+            }
+        }
+
+        IReadOnlyList<ulong> mentionUserIds = isUnderfilled
+            ? new[] { ToUlong(post.CreatorUserId) }
+            : await BuildRecruitNoticeMentionUserIdsAsync(post);
+
         await _db.UpdateRecruitPostStatusAsync(post.Id, RecruitPostStatus.Closed);
         post.Status = RecruitPostStatus.Closed;
         await UpdateRecruitPostMessageAsync(guild, post);
+
+        var reopenPromptComponents = isUnderfilled
+            ? BuildRecruitAutoReopenPromptComponents(post)
+            : null;
+        var noticeText = isUnderfilled
+            ? $"開始時刻になったため募集を自動で終了しました。現在 {filled}/{capacity}（人数未達）です。\n主催の方は再開する場合、下のボタンを押してください。"
+            : "開始時刻になったため募集を自動で終了しました。";
         await TryPostRecruitNoticeAsync(
             guild,
             post,
-            "開始時刻になったため募集を自動で終了しました。",
-            mentionUserIds);
+            noticeText,
+            mentionUserIds,
+            reopenPromptComponents);
 
         var fallback = guild.GetTextChannel(ToUlong(post.ChannelId));
         if (fallback is not null)
@@ -1570,6 +1753,29 @@ public sealed class DiscordBotService : IHostedService
                 $"🔗 メッセージ: {BuildMessageLink(guild.Id, ToUlong(post.ChannelId), ToUlong(post.MessageId))}"
             }),
             Color.DarkGrey);
+    }
+
+    private static bool IsImmediateScheduleRecruit(RecruitPost post)
+    {
+        if (!post.ScheduleAt.HasValue)
+        {
+            return false;
+        }
+
+        // 「今」指定は保存時点と開始時刻がほぼ同時になるため、そのケースだけ即時通知を抑制する。
+        var delta = (post.ScheduleAt.Value - post.CreatedAt).Duration();
+        return delta <= TimeSpan.FromMinutes(2);
+    }
+
+    private static bool IsImmediateScheduleInitialGraceDeadline(RecruitPost post, DateTimeOffset? deadlineAt)
+    {
+        if (!deadlineAt.HasValue || !IsImmediateScheduleRecruit(post))
+        {
+            return false;
+        }
+
+        var graceOffset = deadlineAt.Value - post.CreatedAt;
+        return graceOffset >= TimeSpan.FromMinutes(50) && graceOffset <= TimeSpan.FromMinutes(70);
     }
 
     private async Task<IReadOnlyList<ulong>> BuildRecruitNoticeMentionUserIdsAsync(RecruitPost post)
@@ -1603,7 +1809,11 @@ public sealed class DiscordBotService : IHostedService
         var topCount = Math.Clamp(_options.DailyActivityRankingTopCount, 1, 10);
         var intervalMinutes = Math.Clamp(_options.DailyActivityRankingUpdateIntervalMinutes, 5, 180);
         var nowJst = nowUtc.ToOffset(JapanTimeOffset);
-        var slotKey = (int)(nowJst.ToUnixTimeSeconds() / (intervalMinutes * 60L));
+        var intervalSlotKey = (int)(nowJst.ToUnixTimeSeconds() / (intervalMinutes * 60L));
+        var isFinalDailyRefresh = nowJst.Hour == 23 && nowJst.Minute == 59;
+        var slotKey = isFinalDailyRefresh
+            ? -((nowJst.Year * 10000) + (nowJst.Month * 100) + nowJst.Day)
+            : intervalSlotKey;
         var dayStartJst = new DateTimeOffset(nowJst.Year, nowJst.Month, nowJst.Day, 0, 0, 0, JapanTimeOffset);
         var fromUtc = dayStartJst.ToUniversalTime();
 
@@ -2128,7 +2338,13 @@ public sealed class DiscordBotService : IHostedService
         }
 
         var slots = await _db.ListRecruitSlotsAsync(post.Id);
-        var embed = BuildRecruitEmbed(post, slots, post.DisallowDuplicateJobs);
+        var tuning = _runtimeTuning.GetSnapshot();
+        var embed = BuildRecruitEmbed(
+            post,
+            slots,
+            post.DisallowDuplicateJobs,
+            tuning.RecruitClosedRetentionHours,
+            tuning.RecruitCanceledRetentionHours);
         var positions = GetOrderedPositions(slots.Where(slot => !slot.IsClosed).ToList());
         await message.ModifyAsync(props =>
         {
@@ -2141,8 +2357,11 @@ public sealed class DiscordBotService : IHostedService
         SocketGuild guild,
         RecruitPost post,
         string text,
-        IReadOnlyCollection<ulong>? mentionUserIds = null)
+        IReadOnlyCollection<ulong>? mentionUserIds = null,
+        MessageComponent? components = null)
     {
+        static TimeSpan GetRetryDelay(int attempt) => TimeSpan.FromSeconds(attempt);
+
         var targetIds = mentionUserIds?
             .Where(id => id != 0)
             .Distinct()
@@ -2157,21 +2376,69 @@ public sealed class DiscordBotService : IHostedService
             ? AllowedMentions.None
             : new AllowedMentions { UserIds = targetIds };
 
-        var thread = post.ThreadChannelId.HasValue
-            ? await ResolveRecruitThreadChannelAsync(ToUlong(post.ThreadChannelId.Value))
-            : null;
-
-        if (thread is not null)
+        if (post.ThreadChannelId.HasValue)
         {
-            try
+            var threadId = ToUlong(post.ThreadChannelId.Value);
+            for (var attempt = 1; attempt <= 3; attempt++)
             {
-                await thread.SendMessageAsync(payload, allowedMentions: allowedMentions);
-                return true;
+                var thread = await ResolveRecruitThreadChannelAsync(threadId);
+                if (thread is null)
+                {
+                    if (attempt < 3)
+                    {
+                        await Task.Delay(GetRetryDelay(attempt));
+                        continue;
+                    }
+
+                    _logger.LogWarning(
+                        "Failed to resolve recruit thread for notice after retries. PostId={PostId} ThreadId={ThreadId}",
+                        post.Id,
+                        threadId);
+                    return false;
+                }
+
+                try
+                {
+                    try
+                    {
+                        await thread.ModifyAsync(props =>
+                        {
+                            props.Archived = false;
+                            props.Locked = false;
+                        });
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogDebug(ex, "Failed to unarchive recruit thread before posting notice. PostId={PostId} ThreadId={ThreadId}", post.Id, thread.Id);
+                    }
+
+                    await thread.SendMessageAsync(payload, allowedMentions: allowedMentions, components: components);
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    if (attempt < 3)
+                    {
+                        _logger.LogWarning(
+                            ex,
+                            "Failed to post recruit notice in thread. PostId={PostId} ThreadId={ThreadId} Attempt={Attempt}/3. Retrying...",
+                            post.Id,
+                            thread.Id,
+                            attempt);
+                        await Task.Delay(GetRetryDelay(attempt));
+                        continue;
+                    }
+
+                    _logger.LogWarning(
+                        ex,
+                        "Failed to post recruit notice in thread after retries; skip channel fallback. PostId={PostId} ThreadId={ThreadId}",
+                        post.Id,
+                        thread.Id);
+                    return false;
+                }
             }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Failed to post recruit notice in thread for post {PostId}.", post.Id);
-            }
+
+            return false;
         }
 
         var channel = guild.GetTextChannel(ToUlong(post.ChannelId));
@@ -2183,7 +2450,7 @@ public sealed class DiscordBotService : IHostedService
         var link = BuildMessageLink(guild.Id, channel.Id, ToUlong(post.MessageId));
         try
         {
-            await channel.SendMessageAsync($"{payload}\n<{link}>", allowedMentions: allowedMentions);
+            await channel.SendMessageAsync($"{payload}\n<{link}>", allowedMentions: allowedMentions, components: components);
             return true;
         }
         catch (Exception ex)
@@ -2191,6 +2458,25 @@ public sealed class DiscordBotService : IHostedService
             _logger.LogWarning(ex, "Failed to post recruit notice in channel for post {PostId}.", post.Id);
             return false;
         }
+    }
+
+    private static MessageComponent BuildRecruitAutoReopenPromptComponents(RecruitPost post)
+    {
+        var recruitMessageId = ToUlong(post.MessageId);
+        return new ComponentBuilder()
+            .WithButton("再開", $"recruit_auto_reopen:{recruitMessageId}", ButtonStyle.Success)
+            .Build();
+    }
+
+    private static MessageComponent BuildRecruitUnderfilledDecisionPromptComponents(RecruitPost post)
+    {
+        var recruitMessageId = ToUlong(post.MessageId);
+        return new ComponentBuilder()
+            .WithButton("10分延長", $"recruit_underfilled_extend10:{recruitMessageId}", ButtonStyle.Secondary, row: 0)
+            .WithButton("30分延長", $"recruit_underfilled_extend30:{recruitMessageId}", ButtonStyle.Secondary, row: 0)
+            .WithButton("1時間延長", $"recruit_underfilled_extend60:{recruitMessageId}", ButtonStyle.Secondary, row: 0)
+            .WithButton("終了/再開", $"recruit_underfilled_close:{recruitMessageId}", ButtonStyle.Danger, row: 1)
+            .Build();
     }
 
     private async Task<bool> TryDeleteRecruitThreadAsync(RecruitPost post)
@@ -2264,6 +2550,14 @@ public sealed class DiscordBotService : IHostedService
     }
 
     private static Embed BuildRecruitEmbed(RecruitPost post, IReadOnlyList<RecruitSlot> slots, bool disallowDuplicateJobs)
+        => BuildRecruitEmbed(post, slots, disallowDuplicateJobs, 24, 24);
+
+    private static Embed BuildRecruitEmbed(
+        RecruitPost post,
+        IReadOnlyList<RecruitSlot> slots,
+        bool disallowDuplicateJobs,
+        int closedRetentionHours,
+        int canceledRetentionHours)
     {
         var filled = slots.Count(slot => slot.UserId.HasValue || slot.IsClosed);
         var max = slots.Count > 0 ? slots.Count : RecruitmentRules.Positions.Count;
@@ -2279,7 +2573,7 @@ public sealed class DiscordBotService : IHostedService
             .WithTitle($"{statusPrefix}募集: {post.Title}")
             .WithColor(color)
             .WithCurrentTimestamp()
-            .AddField("主催", MentionUser(ToUlong(post.CreatorUserId)), true)
+            .AddField("主催", BuildRecruitCreatorName(post, slots), true)
             .AddField("DC", string.IsNullOrWhiteSpace(post.DataCenter) ? "未指定" : post.DataCenter, true)
             .AddField("開始", FormatRecruitSchedule(post.ScheduleText, post.ScheduleAt), true)
             .AddField("人数", $"{filled}/{max}", true)
@@ -2292,9 +2586,24 @@ public sealed class DiscordBotService : IHostedService
         {
             var closedAt = post.ClosedAt?.ToOffset(JapanTimeOffset).ToString(RecruitScheduleFormat, CultureInfo.InvariantCulture) ?? "不明";
             embedBuilder.AddField("終了", closedAt, true);
+            var deleteAt = ResolveRecruitArtifactDeleteAt(post, closedRetentionHours, canceledRetentionHours);
+            if (deleteAt.HasValue)
+            {
+                embedBuilder.AddField("削除予定", $"<t:{deleteAt.Value.ToUnixTimeSeconds()}:F>\n(<t:{deleteAt.Value.ToUnixTimeSeconds()}:R>)", true);
+            }
         }
 
         return embedBuilder.Build();
+    }
+
+    private static DateTimeOffset? ResolveRecruitArtifactDeleteAt(RecruitPost post, int closedRetentionHours = 24, int canceledRetentionHours = 24)
+    {
+        return post.Status switch
+        {
+            RecruitPostStatus.Closed => (post.ScheduleAt ?? post.ClosedAt ?? post.UpdatedAt).AddHours(Math.Clamp(closedRetentionHours, 1, 24 * 30)),
+            RecruitPostStatus.Canceled => (post.ClosedAt ?? post.UpdatedAt).AddHours(Math.Clamp(canceledRetentionHours, 1, 24 * 30)),
+            _ => null
+        };
     }
 
     private static string BuildRecruitSlotLines(IReadOnlyList<RecruitSlot> slots)
@@ -2332,10 +2641,41 @@ public sealed class DiscordBotService : IHostedService
             }
 
             var job = string.IsNullOrWhiteSpace(slot.Job) ? "?" : slot.Job;
-            lines.Add($"{position}: {MentionUser(ToUlong(slot.UserId.Value))} ({job})");
+            lines.Add($"{position}: {BuildRecruitUserName(slot)} ({job})");
         }
 
         return string.Join('\n', lines);
+    }
+
+    private static string BuildRecruitCreatorName(RecruitPost post, IReadOnlyList<RecruitSlot> slots)
+    {
+        var creatorUserId = post.CreatorUserId;
+        var hostSlot = slots.FirstOrDefault(slot =>
+            slot.UserId.HasValue &&
+            slot.UserId.Value == creatorUserId &&
+            !string.IsNullOrWhiteSpace(slot.UserName));
+
+        if (hostSlot is not null)
+        {
+            return hostSlot.UserName!.Trim();
+        }
+
+        return creatorUserId > 0 ? $"u:{creatorUserId}" : "unknown";
+    }
+
+    private static string BuildRecruitUserName(RecruitSlot slot)
+    {
+        if (!string.IsNullOrWhiteSpace(slot.UserName))
+        {
+            return slot.UserName!.Trim();
+        }
+
+        if (slot.UserId.HasValue && slot.UserId.Value > 0)
+        {
+            return $"u:{slot.UserId.Value}";
+        }
+
+        return "unknown";
     }
 
     private static IReadOnlyList<string> GetOrderedPositions(IReadOnlyList<RecruitSlot> slots)
@@ -3017,6 +3357,18 @@ public sealed class DiscordBotService : IHostedService
             await SendNotificationEmbedAsync(guild, firstJoinEmbed, mentionVoiceRole: true);
         }
 
+        if (isFirstJoinInChannel && afterChannel is not null)
+        {
+            try
+            {
+                await _voiceTextService.UpsertStatusPromptAsync(afterChannel, user);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to post voice status prompt. ChannelId={ChannelId}", afterChannel.Id);
+            }
+        }
+
         if (shouldNotifyUserVoiceActivity && endedChannel is not null)
         {
             var endedEmbed = CreateLogEmbedBase(guild, "通話終了", Color.DarkGrey, user, preferGuildDisplayName: true)
@@ -3048,7 +3400,12 @@ public sealed class DiscordBotService : IHostedService
         if (beforeChannel is not null && IsTempVoiceChannel(beforeChannel, lobby) && beforeChannel.ConnectedUsers.Count == 0)
         {
             await _voiceTextService.ClearOwnerTransferAsync(beforeChannel);
+            await _voiceTextService.ClearStatusPromptAsync(beforeChannel);
             await ScheduleTempVoiceDeletionAsync(beforeChannel);
+        }
+        else if (beforeChannel is not null && beforeChannel.Id != afterChannel?.Id && beforeChannel.ConnectedUsers.Count == 0)
+        {
+            await _voiceTextService.ClearStatusPromptAsync(beforeChannel);
         }
     }
 
@@ -4598,7 +4955,7 @@ public sealed class DiscordBotService : IHostedService
         }
 
         var embed = await _profileEmbeds.BuildProfileEmbedAsync(user, channel.Guild, "VC参加", Color.Blue);
-        await textChannel.SendMessageAsync(embed: embed, flags: MessageFlags.SuppressNotification);
+        await textChannel.SendMessageAsync(embed: embed);
     }
 
     private async Task<IMessageChannel?> ResolveVoiceTextChannelAsync(SocketVoiceChannel channel)

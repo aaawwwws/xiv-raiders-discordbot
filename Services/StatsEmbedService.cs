@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Collections.Concurrent;
 using Discord;
 using Discord.WebSocket;
 using Microsoft.Extensions.Logging;
@@ -18,6 +19,12 @@ public sealed class StatsEmbedService
     private const string DataCenterTitle = "データセンター人口分布";
     private const string ServerTitleSuffix = "サーバー人口分布";
     private const int ChartMaxSlices = 8;
+    private static readonly TimeSpan AutoRefreshDebounceWindow = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan MessageUpsertSpacing = TimeSpan.FromMilliseconds(250);
+    private static readonly TimeSpan EditRetryDelay = TimeSpan.FromMilliseconds(800);
+    private const int EditRetryCount = 2;
+    private static readonly ConcurrentDictionary<ulong, SemaphoreSlim> RefreshLocks = new();
+    private static readonly ConcurrentDictionary<ulong, DateTimeOffset> LastAutoRefreshAt = new();
 
     private static readonly Rgba32[][] ChartPalettes =
     [
@@ -96,7 +103,7 @@ public sealed class StatsEmbedService
     }
 
     public Task<StatsRefreshResult> SetupAndRefreshAsync(SocketGuild guild, IMessageChannel channel)
-        => RefreshPopulationEmbedsInternalAsync(guild, channel, persistPanel: true);
+        => RefreshPopulationEmbedsGuardedAsync(guild, channel, persistPanel: true, panel: null, applyAutoDebounce: false);
 
     public async Task<StatsRefreshResult> RefreshIfConfiguredAsync(SocketGuild guild)
     {
@@ -112,7 +119,43 @@ public sealed class StatsEmbedService
             return new StatsRefreshResult(false, false, 0, "統計チャンネル未検出");
         }
 
-        return await RefreshPopulationEmbedsInternalAsync(guild, channel, persistPanel: true, panel);
+        return await RefreshPopulationEmbedsGuardedAsync(guild, channel, persistPanel: true, panel, applyAutoDebounce: true);
+    }
+
+    private async Task<StatsRefreshResult> RefreshPopulationEmbedsGuardedAsync(
+        SocketGuild guild,
+        IMessageChannel channel,
+        bool persistPanel,
+        GuildStatsPanel? panel,
+        bool applyAutoDebounce)
+    {
+        var gate = RefreshLocks.GetOrAdd(guild.Id, static _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync();
+        try
+        {
+            if (applyAutoDebounce &&
+                LastAutoRefreshAt.TryGetValue(guild.Id, out var lastAutoRefreshAt) &&
+                DateTimeOffset.UtcNow - lastAutoRefreshAt < AutoRefreshDebounceWindow)
+            {
+                _logger.LogDebug(
+                    "Skipped stats refresh by debounce. GuildId={GuildId} LastRefreshAt={LastRefreshAt}",
+                    guild.Id,
+                    lastAutoRefreshAt);
+                return new StatsRefreshResult(false, false, 0, "デバウンス");
+            }
+
+            var result = await RefreshPopulationEmbedsInternalAsync(guild, channel, persistPanel, panel);
+            if (result.Updated)
+            {
+                LastAutoRefreshAt[guild.Id] = DateTimeOffset.UtcNow;
+            }
+
+            return result;
+        }
+        finally
+        {
+            gate.Release();
+        }
     }
 
     private async Task<StatsRefreshResult> RefreshPopulationEmbedsInternalAsync(
@@ -153,8 +196,14 @@ public sealed class StatsEmbedService
             .ToDictionary(group => group.Key, group => group.First(), StringComparer.Ordinal);
         var createdByTitle = new Dictionary<string, IUserMessage>(StringComparer.Ordinal);
 
+        var upsertIndex = 0;
         foreach (var spec in specs)
         {
+            if (upsertIndex > 0)
+            {
+                await Task.Delay(MessageUpsertSpacing);
+            }
+
             existingByTitle.TryGetValue(spec.EmbedTitle, out var existing);
             var chartPng = BuildPieChartPng(spec.ChartTitle, spec.ChartSlices, spec.TotalCount, spec.PaletteIndex);
             var embed = BuildDistributionEmbed(
@@ -167,6 +216,7 @@ public sealed class StatsEmbedService
 
             var posted = await UpsertStatsMessageAsync(channel, existing, embed, chartPng, spec.ChartFileName);
             createdByTitle[spec.EmbedTitle] = posted;
+            upsertIndex++;
         }
 
         foreach (var stale in existingMessages)
@@ -399,32 +449,56 @@ public sealed class StatsEmbedService
     {
         if (existing is not null)
         {
-            try
+            for (var attempt = 1; attempt <= EditRetryCount + 1; attempt++)
             {
-                if (chartPng is null || chartPng.Length == 0)
+                try
                 {
-                    await existing.ModifyAsync(props =>
+                    if (chartPng is null || chartPng.Length == 0)
                     {
-                        props.Embed = embed;
-                        props.Attachments = Optional.Create<IEnumerable<FileAttachment>>(Array.Empty<FileAttachment>());
-                    });
-                }
-                else
-                {
-                    await using var updateStream = new MemoryStream(chartPng, writable: false);
-                    await existing.ModifyAsync(props =>
+                        await existing.ModifyAsync(props =>
+                        {
+                            props.Embed = embed;
+                            props.Attachments = Optional.Create<IEnumerable<FileAttachment>>(Array.Empty<FileAttachment>());
+                        });
+                    }
+                    else
                     {
-                        props.Embed = embed;
-                        props.Attachments = Optional.Create<IEnumerable<FileAttachment>>(
-                            [new FileAttachment(updateStream, chartFileName)]);
-                    });
-                }
+                        await using var updateStream = new MemoryStream(chartPng, writable: false);
+                        await existing.ModifyAsync(props =>
+                        {
+                            props.Embed = embed;
+                            props.Attachments = Optional.Create<IEnumerable<FileAttachment>>(
+                                [new FileAttachment(updateStream, chartFileName)]);
+                        });
+                    }
 
-                return existing;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Failed to update stats message. MessageId={MessageId}. Falling back to repost.", existing.Id);
+                    return existing;
+                }
+                catch (Exception ex) when (attempt <= EditRetryCount)
+                {
+                    _logger.LogWarning(
+                        ex,
+                        "Failed to update stats message. MessageId={MessageId} Attempt={Attempt}/{MaxAttempt}. Retrying...",
+                        existing.Id,
+                        attempt,
+                        EditRetryCount + 1);
+
+                    await Task.Delay(TimeSpan.FromMilliseconds(EditRetryDelay.TotalMilliseconds * attempt));
+
+                    try
+                    {
+                        existing = await channel.GetMessageAsync(existing.Id) as IUserMessage ?? existing;
+                    }
+                    catch (Exception refreshEx)
+                    {
+                        _logger.LogDebug(refreshEx, "Failed to re-fetch stats message before retry. MessageId={MessageId}", existing.Id);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to update stats message. MessageId={MessageId}. Falling back to repost.", existing.Id);
+                    break;
+                }
             }
         }
 

@@ -16,6 +16,7 @@ public sealed class RecruitPost
     public string? ScheduleText { get; set; }
     public DateTimeOffset? ScheduleAt { get; set; }
     public DateTimeOffset? ReminderSentAt { get; set; }
+    public DateTimeOffset? UnderfilledDecisionDeadlineAt { get; set; }
     public string? Note { get; set; }
     public bool DisallowDuplicateJobs { get; set; } = true;
     public string? HostFlexSpec { get; set; }

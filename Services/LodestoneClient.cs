@@ -109,6 +109,65 @@ public sealed class LodestoneClient
     public Task<string> FetchProfileHtmlAsync(string url, CancellationToken cancellationToken = default)
         => FetchHtmlAsync(url, cancellationToken);
 
+    public async Task<LodestoneCharacterExtrasSnapshot> FetchCharacterExtrasAsync(
+        string characterUrl,
+        CancellationToken cancellationToken = default)
+    {
+        var classJobUrl = BuildCharacterSubpageUrl(characterUrl, "class_job/");
+        var mountUrl = BuildCharacterSubpageUrl(characterUrl, "mount/");
+        var minionUrl = BuildCharacterSubpageUrl(characterUrl, "minion/");
+        var achievementUrl = BuildCharacterSubpageUrl(characterUrl, "achievement/");
+        if (classJobUrl is null || mountUrl is null || minionUrl is null || achievementUrl is null)
+        {
+            return CreateErrorExtrasSnapshot();
+        }
+
+        var classJobTask = TryFetchOptionalHtmlAsync(classJobUrl, cancellationToken);
+        var mountTask = TryFetchOptionalHtmlAsync(mountUrl, cancellationToken);
+        var minionTask = TryFetchOptionalHtmlAsync(minionUrl, cancellationToken);
+        var achievementTask = TryFetchOptionalHtmlAsync(achievementUrl, cancellationToken);
+
+        await Task.WhenAll(classJobTask, mountTask, minionTask, achievementTask);
+
+        return new LodestoneCharacterExtrasSnapshot(
+            ParseJobLevelsSnapshot(await classJobTask),
+            ParseMinionOrMountCountSnapshot(await mountTask),
+            ParseMinionOrMountCountSnapshot(await minionTask),
+            ParseAchievementCountSnapshot(await achievementTask));
+    }
+
+    public async Task<LodestoneCharacterExtrasDetailsSnapshot> FetchCharacterExtrasDetailsAsync(
+        string characterUrl,
+        CancellationToken cancellationToken = default)
+    {
+        var classJobUrl = BuildCharacterSubpageUrl(characterUrl, "class_job/");
+        var mountUrl = BuildCharacterSubpageUrl(characterUrl, "mount/");
+        var minionUrl = BuildCharacterSubpageUrl(characterUrl, "minion/");
+        var achievementUrl = BuildCharacterSubpageUrl(characterUrl, "achievement/");
+        if (classJobUrl is null || mountUrl is null || minionUrl is null || achievementUrl is null)
+        {
+            return CreateErrorExtrasDetailsSnapshot();
+        }
+
+        var classJobTask = TryFetchOptionalHtmlAsync(classJobUrl, cancellationToken);
+        var mountTask = TryFetchOptionalHtmlAsync(mountUrl, cancellationToken);
+        var minionTask = TryFetchOptionalHtmlAsync(minionUrl, cancellationToken);
+        var achievementTask = TryFetchOptionalHtmlAsync(achievementUrl, cancellationToken);
+        await Task.WhenAll(classJobTask, mountTask, minionTask, achievementTask);
+
+        var classJobHtml = await classJobTask;
+        var mountHtml = await mountTask;
+        var minionHtml = await minionTask;
+        var achievementHtml = await achievementTask;
+
+        var jobs = ParseJobLevelsSnapshot(classJobHtml);
+        var mounts = await ParseCollectibleListWithTooltipsAsync(mountHtml, mountUrl, "mount", cancellationToken);
+        var minions = await ParseCollectibleListWithTooltipsAsync(minionHtml, minionUrl, "minion", cancellationToken);
+        var achievements = await ParseAchievementListAsync(achievementHtml, achievementUrl, cancellationToken);
+
+        return new LodestoneCharacterExtrasDetailsSnapshot(jobs, mounts, minions, achievements);
+    }
+
     public async Task<string> FetchHtmlAsync(string url, CancellationToken cancellationToken = default)
     {
         using var request = new HttpRequestMessage(HttpMethod.Get, url);
@@ -183,6 +242,478 @@ public sealed class LodestoneClient
         }
 
         return url.Contains("/f/", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static LodestoneCharacterExtrasSnapshot CreateErrorExtrasSnapshot()
+    {
+        return new LodestoneCharacterExtrasSnapshot(
+            new LodestoneJobLevelsSnapshot(LodestonePageDataStatus.Error, Array.Empty<LodestoneJobLevel>()),
+            new LodestoneCountSnapshot(LodestonePageDataStatus.Error, null),
+            new LodestoneCountSnapshot(LodestonePageDataStatus.Error, null),
+            new LodestoneCountSnapshot(LodestonePageDataStatus.Error, null));
+    }
+
+    private static LodestoneCharacterExtrasDetailsSnapshot CreateErrorExtrasDetailsSnapshot()
+    {
+        return new LodestoneCharacterExtrasDetailsSnapshot(
+            new LodestoneJobLevelsSnapshot(LodestonePageDataStatus.Error, Array.Empty<LodestoneJobLevel>()),
+            new LodestoneCollectibleListSnapshot(LodestonePageDataStatus.Error, null, Array.Empty<LodestoneCollectibleItem>()),
+            new LodestoneCollectibleListSnapshot(LodestonePageDataStatus.Error, null, Array.Empty<LodestoneCollectibleItem>()),
+            new LodestoneAchievementListSnapshot(LodestonePageDataStatus.Error, null, Array.Empty<LodestoneAchievementItem>()));
+    }
+
+    private async Task<string?> TryFetchOptionalHtmlAsync(string url, CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await FetchHtmlAsync(url, cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static string? BuildCharacterSubpageUrl(string characterUrl, string suffix)
+    {
+        if (!Uri.TryCreate(characterUrl, UriKind.Absolute, out var uri))
+        {
+            return null;
+        }
+
+        var match = LodestoneIdRegex.Match(uri.AbsoluteUri);
+        if (!match.Success)
+        {
+            return null;
+        }
+
+        var id = match.Groups[1].Value;
+        var normalizedSuffix = suffix.Trim('/');
+        return $"https://{uri.Host}/lodestone/character/{id}/{normalizedSuffix}/";
+    }
+
+    private static LodestoneJobLevelsSnapshot ParseJobLevelsSnapshot(string? html)
+    {
+        if (string.IsNullOrWhiteSpace(html))
+        {
+            return new LodestoneJobLevelsSnapshot(LodestonePageDataStatus.Error, Array.Empty<LodestoneJobLevel>());
+        }
+
+        var status = DetectPageDataStatus(html);
+        if (status != LodestonePageDataStatus.Available)
+        {
+            return new LodestoneJobLevelsSnapshot(status, Array.Empty<LodestoneJobLevel>());
+        }
+
+        var jobs = new List<LodestoneJobLevel>();
+        var matches = Regex.Matches(
+            html,
+            "<li[^>]*>.*?<div[^>]*class=[\"'][^\"']*character__job__level[^\"']*[\"'][^>]*>(?<level>.*?)</div>.*?" +
+            "<div[^>]*class=[\"'][^\"']*character__job__name[^\"']*[\"'][^>]*>(?<name>.*?)</div>.*?</li>",
+            RegexOptions.IgnoreCase | RegexOptions.Singleline);
+
+        foreach (Match match in matches)
+        {
+            var levelText = NormalizeInnerText(match.Groups["level"].Value);
+            if (!int.TryParse(levelText.Replace(",", string.Empty), out var level))
+            {
+                continue;
+            }
+
+            var name = NormalizeInnerText(match.Groups["name"].Value);
+            if (string.IsNullOrWhiteSpace(name))
+            {
+                continue;
+            }
+
+            jobs.Add(new LodestoneJobLevel(name, level));
+        }
+
+        return new LodestoneJobLevelsSnapshot(
+            jobs.Count > 0 ? LodestonePageDataStatus.Available : LodestonePageDataStatus.Error,
+            jobs);
+    }
+
+    private static LodestoneCountSnapshot ParseMinionOrMountCountSnapshot(string? html)
+    {
+        if (string.IsNullOrWhiteSpace(html))
+        {
+            return new LodestoneCountSnapshot(LodestonePageDataStatus.Error, null);
+        }
+
+        var status = DetectPageDataStatus(html);
+        if (status != LodestonePageDataStatus.Available)
+        {
+            return new LodestoneCountSnapshot(status, null);
+        }
+
+        var count = TryExtractIntegerLoose(
+            html,
+            "<p\\s+class=[\"'][^\"']*minion__sort__total[^\"']*[\"'][^>]*>.*?<span>([\\d,]+)</span>");
+
+        return count.HasValue
+            ? new LodestoneCountSnapshot(LodestonePageDataStatus.Available, count.Value)
+            : new LodestoneCountSnapshot(LodestonePageDataStatus.Error, null);
+    }
+
+    private static LodestoneCountSnapshot ParseAchievementCountSnapshot(string? html)
+    {
+        if (string.IsNullOrWhiteSpace(html))
+        {
+            return new LodestoneCountSnapshot(LodestonePageDataStatus.Error, null);
+        }
+
+        var status = DetectPageDataStatus(html);
+        if (status != LodestonePageDataStatus.Available)
+        {
+            return new LodestoneCountSnapshot(status, null);
+        }
+
+        var count = TryExtractIntegerLoose(
+            html,
+            "<div\\s+class=[\"'][^\"']*parts__total[^\"']*[\"'][^>]*>\\s*([\\d,]+)\\b");
+
+        return count.HasValue
+            ? new LodestoneCountSnapshot(LodestonePageDataStatus.Available, count.Value)
+            : new LodestoneCountSnapshot(LodestonePageDataStatus.Error, null);
+    }
+
+    private static LodestonePageDataStatus DetectPageDataStatus(string html)
+    {
+        if (IsPermissionDeniedPage(html))
+        {
+            return LodestonePageDataStatus.Private;
+        }
+
+        if (IsLodestoneErrorPage(html))
+        {
+            return LodestonePageDataStatus.NotFound;
+        }
+
+        return LodestonePageDataStatus.Available;
+    }
+
+    private static bool IsPermissionDeniedPage(string html)
+    {
+        return html.Contains("You do not have permission to view this page.", StringComparison.OrdinalIgnoreCase)
+            || (html.Contains("閲覧", StringComparison.Ordinal) && html.Contains("権限", StringComparison.Ordinal));
+    }
+
+    private static bool IsLodestoneErrorPage(string html)
+    {
+        return html.Contains("class=\"error__body\"", StringComparison.OrdinalIgnoreCase)
+            || html.Contains("Page not found.", StringComparison.OrdinalIgnoreCase)
+            || html.Contains("ページが見つかりません", StringComparison.Ordinal)
+            || html.Contains("お探しのページ", StringComparison.Ordinal);
+    }
+
+    private async Task<LodestoneCollectibleListSnapshot> ParseCollectibleListWithTooltipsAsync(
+        string? html,
+        string pageUrl,
+        string collectibleType,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(html))
+        {
+            return new LodestoneCollectibleListSnapshot(LodestonePageDataStatus.Error, null, Array.Empty<LodestoneCollectibleItem>());
+        }
+
+        var status = DetectPageDataStatus(html);
+        if (status != LodestonePageDataStatus.Available)
+        {
+            return new LodestoneCollectibleListSnapshot(status, null, Array.Empty<LodestoneCollectibleItem>());
+        }
+
+        var count = TryExtractIntegerLoose(
+            html,
+            "<p\\s+class=[\"'][^\"']*minion__sort__total[^\"']*[\"'][^>]*>.*?<span>([\\d,]+)</span>");
+
+        var baseItems = ParseCollectibleTooltipRefs(html, pageUrl);
+        if (baseItems.Count == 0)
+        {
+            return new LodestoneCollectibleListSnapshot(LodestonePageDataStatus.Available, count, Array.Empty<LodestoneCollectibleItem>());
+        }
+
+        var resolvedItems = await ResolveCollectibleNamesAsync(baseItems, collectibleType, cancellationToken);
+        return new LodestoneCollectibleListSnapshot(LodestonePageDataStatus.Available, count ?? resolvedItems.Count, resolvedItems);
+    }
+
+    private async Task<IReadOnlyList<LodestoneCollectibleItem>> ResolveCollectibleNamesAsync(
+        IReadOnlyList<CollectibleTooltipRef> refs,
+        string collectibleType,
+        CancellationToken cancellationToken)
+    {
+        var results = new LodestoneCollectibleItem[refs.Count];
+        using var gate = new SemaphoreSlim(6);
+        var tasks = refs.Select(async (entry, index) =>
+        {
+            await gate.WaitAsync(cancellationToken);
+            try
+            {
+                var name = entry.TooltipUrl is not null
+                    ? await TryFetchCollectibleTooltipNameAsync(entry.TooltipUrl, collectibleType, cancellationToken)
+                    : null;
+
+                results[index] = new LodestoneCollectibleItem(
+                    string.IsNullOrWhiteSpace(name) ? $"unknown:{entry.TooltipKey ?? (index + 1).ToString()}" : name,
+                    entry.TooltipKey,
+                    entry.TooltipUrl,
+                    entry.IconUrl);
+            }
+            finally
+            {
+                gate.Release();
+            }
+        });
+
+        await Task.WhenAll(tasks);
+        return results;
+    }
+
+    private async Task<string?> TryFetchCollectibleTooltipNameAsync(
+        string tooltipUrl,
+        string collectibleType,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var html = await FetchHtmlAsync(tooltipUrl, cancellationToken);
+            return ParseCollectibleTooltipName(html, collectibleType);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static string? ParseCollectibleTooltipName(string html, string collectibleType)
+    {
+        var className = collectibleType.Equals("mount", StringComparison.OrdinalIgnoreCase)
+            ? "mount__header__label"
+            : "minion__header__label";
+
+        return FindClassText(html, className);
+    }
+
+    private static List<CollectibleTooltipRef> ParseCollectibleTooltipRefs(string html, string pageUrl)
+    {
+        var list = new List<CollectibleTooltipRef>();
+        Uri? sourceUri = null;
+        if (Uri.TryCreate(pageUrl, UriKind.Absolute, out var parsed))
+        {
+            sourceUri = parsed;
+        }
+
+        var matches = Regex.Matches(
+            html,
+            "<li[^>]*class=[\"'][^\"']*(?:mount__list_icon|minion__list_icon)[^\"']*[\"'][^>]*data-tooltip_href=[\"'](?<tooltip>[^\"']+)[\"'][^>]*>.*?" +
+            "<img[^>]*class=[\"'][^\"']*character__item_icon__img[^\"']*[\"'][^>]*src=[\"'](?<icon>[^\"']+)[\"']",
+            RegexOptions.IgnoreCase | RegexOptions.Singleline);
+
+        foreach (Match match in matches)
+        {
+            var tooltipPath = WebUtility.HtmlDecode(match.Groups["tooltip"].Value).Trim();
+            if (string.IsNullOrWhiteSpace(tooltipPath))
+            {
+                continue;
+            }
+
+            var tooltipUrl = ToAbsoluteUrl(sourceUri, tooltipPath);
+            var tooltipKeyMatch = Regex.Match(tooltipPath, "/tooltip/([0-9a-f]+)", RegexOptions.IgnoreCase);
+            var tooltipKey = tooltipKeyMatch.Success ? tooltipKeyMatch.Groups[1].Value : null;
+            var iconUrl = match.Groups["icon"].Success
+                ? WebUtility.HtmlDecode(match.Groups["icon"].Value).Trim()
+                : null;
+
+            list.Add(new CollectibleTooltipRef(tooltipKey, tooltipUrl, string.IsNullOrWhiteSpace(iconUrl) ? null : iconUrl));
+        }
+
+        return list;
+    }
+
+    private async Task<LodestoneAchievementListSnapshot> ParseAchievementListAsync(
+        string? firstPageHtml,
+        string achievementPageUrl,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(firstPageHtml))
+        {
+            return new LodestoneAchievementListSnapshot(LodestonePageDataStatus.Error, null, Array.Empty<LodestoneAchievementItem>());
+        }
+
+        var status = DetectPageDataStatus(firstPageHtml);
+        if (status != LodestonePageDataStatus.Available)
+        {
+            return new LodestoneAchievementListSnapshot(status, null, Array.Empty<LodestoneAchievementItem>());
+        }
+
+        var count = TryExtractIntegerLoose(
+            firstPageHtml,
+            "<div\\s+class=[\"'][^\"']*parts__total[^\"']*[\"'][^>]*>\\s*([\\d,]+)\\b");
+
+        var items = new List<LodestoneAchievementItem>();
+        items.AddRange(ParseAchievementItemsFromPage(firstPageHtml, achievementPageUrl));
+
+        var totalPages = TryParseAchievementTotalPages(firstPageHtml) ?? 1;
+        if (totalPages > 1)
+        {
+            var additionalPageUrls = Enumerable.Range(2, totalPages - 1)
+                .Select(page => BuildPagedAchievementUrl(achievementPageUrl, page))
+                .Where(url => !string.IsNullOrWhiteSpace(url))
+                .ToArray();
+
+            using var gate = new SemaphoreSlim(3);
+            var pageTasks = additionalPageUrls.Select(async url =>
+            {
+                await gate.WaitAsync(cancellationToken);
+                try
+                {
+                    var html = await TryFetchOptionalHtmlAsync(url!, cancellationToken);
+                    if (string.IsNullOrWhiteSpace(html))
+                    {
+                        return Array.Empty<LodestoneAchievementItem>();
+                    }
+
+                    if (DetectPageDataStatus(html) != LodestonePageDataStatus.Available)
+                    {
+                        return Array.Empty<LodestoneAchievementItem>();
+                    }
+
+                    return ParseAchievementItemsFromPage(html, url!).ToArray();
+                }
+                finally
+                {
+                    gate.Release();
+                }
+            });
+
+            var pages = await Task.WhenAll(pageTasks);
+            foreach (var pageItems in pages)
+            {
+                items.AddRange(pageItems);
+            }
+        }
+
+        var deduped = items
+            .GroupBy(x => x.AchievementId)
+            .Select(group => group.OrderByDescending(x => x.EarnedAt ?? DateTimeOffset.MinValue).First())
+            .OrderByDescending(x => x.EarnedAt ?? DateTimeOffset.MinValue)
+            .ThenBy(x => x.AchievementId)
+            .ToList();
+
+        return new LodestoneAchievementListSnapshot(LodestonePageDataStatus.Available, count ?? deduped.Count, deduped);
+    }
+
+    private static List<LodestoneAchievementItem> ParseAchievementItemsFromPage(string html, string sourceUrl)
+    {
+        var list = new List<LodestoneAchievementItem>();
+        Uri? sourceUri = null;
+        if (Uri.TryCreate(sourceUrl, UriKind.Absolute, out var parsed))
+        {
+            sourceUri = parsed;
+        }
+
+        var matches = Regex.Matches(
+            html,
+            "<a[^>]*href=[\"'](?<detail>/lodestone/character/\\d+/achievement/detail/(?<id>\\d+)/)[\"'][^>]*class=[\"'][^\"']*entry__achievement[^\"']*[\"'][^>]*>.*?" +
+            "(?:ldst_strftime\\((?<epoch>\\d+),\\s*'YMD'\\))?.*?" +
+            "<p[^>]*class=[\"'][^\"']*entry__activity__txt[^\"']*[\"'][^>]*>(?<text>.*?)</p>.*?</a>",
+            RegexOptions.IgnoreCase | RegexOptions.Singleline);
+
+        foreach (Match match in matches)
+        {
+            if (!int.TryParse(match.Groups["id"].Value, out var achievementId))
+            {
+                continue;
+            }
+
+            var rawText = NormalizeInnerText(match.Groups["text"].Value);
+            if (string.IsNullOrWhiteSpace(rawText))
+            {
+                rawText = $"achievement:{achievementId}";
+            }
+
+            DateTimeOffset? earnedAt = null;
+            if (match.Groups["epoch"].Success && long.TryParse(match.Groups["epoch"].Value, out var epoch))
+            {
+                try
+                {
+                    earnedAt = DateTimeOffset.FromUnixTimeSeconds(epoch);
+                }
+                catch
+                {
+                    earnedAt = null;
+                }
+            }
+
+            var (category, title) = TryParseAchievementText(rawText);
+            var detailPath = WebUtility.HtmlDecode(match.Groups["detail"].Value).Trim();
+            list.Add(new LodestoneAchievementItem(
+                achievementId,
+                title,
+                category,
+                rawText,
+                earnedAt,
+                ToAbsoluteUrl(sourceUri, detailPath)));
+        }
+
+        return list;
+    }
+
+    private static int? TryParseAchievementTotalPages(string html)
+    {
+        return TryExtractIntegerLoose(
+            html,
+            "<li\\s+class=[\"'][^\"']*btn__pager__current[^\"']*[\"'][^>]*>\\s*Page\\s+\\d+\\s+of\\s+([\\d,]+)\\s*</li>");
+    }
+
+    private static string? BuildPagedAchievementUrl(string baseAchievementUrl, int page)
+    {
+        if (page <= 1 || !Uri.TryCreate(baseAchievementUrl, UriKind.Absolute, out var uri))
+        {
+            return baseAchievementUrl;
+        }
+
+        var builder = new UriBuilder(uri)
+        {
+            Query = $"page={page}"
+        };
+        return builder.Uri.ToString();
+    }
+
+    private static (string? Category, string? Title) TryParseAchievementText(string rawText)
+    {
+        if (string.IsNullOrWhiteSpace(rawText))
+        {
+            return (null, null);
+        }
+
+        var en = Regex.Match(
+            rawText,
+            "^(?<category>.+?)\\s+achievement\\s+\"(?<title>.+)\"\\s+earned!$",
+            RegexOptions.IgnoreCase);
+        if (en.Success)
+        {
+            return (
+                en.Groups["category"].Value.Trim(),
+                en.Groups["title"].Value.Trim());
+        }
+
+        var quoted = Regex.Match(rawText, "[\"“”「『](?<title>.+?)[\"”」』]");
+        if (quoted.Success)
+        {
+            return (null, quoted.Groups["title"].Value.Trim());
+        }
+
+        return (null, null);
     }
 
 
@@ -414,6 +945,23 @@ public sealed class LodestoneClient
         return value;
     }
 
+    private static int? TryExtractIntegerLoose(string html, string pattern)
+    {
+        var match = Regex.Match(html, pattern, RegexOptions.IgnoreCase | RegexOptions.Singleline);
+        if (!match.Success)
+        {
+            return null;
+        }
+
+        var raw = match.Groups[1].Value.Replace(",", string.Empty, StringComparison.Ordinal).Trim();
+        if (!int.TryParse(raw, out var value))
+        {
+            return null;
+        }
+
+        return value;
+    }
+
     private static DateTimeOffset? TryExtractCwlsFormedAt(string html)
     {
         var formedMatch = Regex.Match(
@@ -618,7 +1166,7 @@ public sealed class LodestoneClient
         return WebUtility.HtmlDecode(match.Groups[1].Value).Trim();
     }
 
-
+    private readonly record struct CollectibleTooltipRef(string? TooltipKey, string TooltipUrl, string? IconUrl);
     private readonly record struct ElementPattern(string ClassName, string Tag);
 
     private bool IsAllowedHost(string host)

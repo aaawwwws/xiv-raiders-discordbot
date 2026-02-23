@@ -134,6 +134,60 @@ public sealed class ControlPanelModule : InteractionModuleBase<SocketInteraction
         await FollowupAsync(embed: embed, ephemeral: true);
     }
 
+    [ComponentInteraction(VoiceChannelTextService.StatusPromptSetCustomId, ignoreGroupNames: true)]
+    public async Task OpenVoiceStatusPromptModalAsync()
+    {
+        if (Context.Guild is null || Context.User is not SocketGuildUser guildUser)
+        {
+            await RespondAsync("この操作はサーバー内でのみ使えます。", ephemeral: true);
+            return;
+        }
+
+        var (channel, error) = TryGetVoiceChannelFromPromptContext(guildUser);
+        if (channel is null)
+        {
+            await RespondAsync(error ?? "このVCテキストからのみ操作できます。", ephemeral: true);
+            return;
+        }
+
+        if (!CanSetVoiceChannelStatus(guildUser, channel))
+        {
+            await RespondAsync("このVCのステータスを変更する権限がありません。", ephemeral: true);
+            return;
+        }
+
+        await RespondWithModalAsync<VoiceStatusPromptModal>(VoiceChannelTextService.StatusPromptModalCustomId);
+    }
+
+    [ComponentInteraction(VoiceChannelTextService.StatusPromptClearCustomId, ignoreGroupNames: true)]
+    public async Task ClearVoiceStatusFromPromptAsync()
+    {
+        if (Context.Guild is null || Context.User is not SocketGuildUser guildUser)
+        {
+            await RespondAsync("この操作はサーバー内でのみ使えます。", ephemeral: true);
+            return;
+        }
+
+        await DeferAsync(ephemeral: true);
+
+        var (channel, error) = TryGetVoiceChannelFromPromptContext(guildUser);
+        if (channel is null)
+        {
+            await FollowupAsync(error ?? "このVCテキストからのみ操作できます。", ephemeral: true);
+            return;
+        }
+
+        if (!CanSetVoiceChannelStatus(guildUser, channel))
+        {
+            await FollowupAsync("このVCのステータスを変更する権限がありません。", ephemeral: true);
+            return;
+        }
+
+        await channel.SetStatusAsync(string.Empty);
+        await _voiceTextService.UpsertStatusPromptAsync(channel, guildUser, "VCステータスをクリアしました。");
+        await FollowupAsync("VCステータスをクリアしました。", ephemeral: true);
+    }
+
     [ModalInteraction("voice_rename_modal", ignoreGroupNames: true)]
     public async Task HandleRenameModalAsync(VoiceRenameModal modal)
     {
@@ -197,6 +251,42 @@ public sealed class ControlPanelModule : InteractionModuleBase<SocketInteraction
         await target.ModifyAsync(props => props.UserLimit = limit);
         var text = limit == 0 ? "人数制限を解除しました。" : $"人数制限を `{limit}` に変更しました。";
         await FollowupAsync(text, ephemeral: true);
+    }
+
+    [ModalInteraction(VoiceChannelTextService.StatusPromptModalCustomId, ignoreGroupNames: true)]
+    public async Task HandleVoiceStatusPromptModalAsync(VoiceStatusPromptModal modal)
+    {
+        if (Context.Guild is null || Context.User is not SocketGuildUser guildUser)
+        {
+            await RespondAsync("この操作はサーバー内でのみ使えます。", ephemeral: true);
+            return;
+        }
+
+        await DeferAsync(ephemeral: true);
+
+        var (channel, error) = TryGetVoiceChannelFromPromptContext(guildUser);
+        if (channel is null)
+        {
+            await FollowupAsync(error ?? "このVCテキストからのみ操作できます。", ephemeral: true);
+            return;
+        }
+
+        if (!CanSetVoiceChannelStatus(guildUser, channel))
+        {
+            await FollowupAsync("このVCのステータスを変更する権限がありません。", ephemeral: true);
+            return;
+        }
+
+        var status = modal.Status?.Trim() ?? string.Empty;
+        if (string.IsNullOrWhiteSpace(status))
+        {
+            await FollowupAsync("ステータスを入力してください。クリアしたい場合は `クリア` ボタンを使ってください。", ephemeral: true);
+            return;
+        }
+
+        await channel.SetStatusAsync(status);
+        await _voiceTextService.UpsertStatusPromptAsync(channel, guildUser, "VCステータスを更新しました。");
+        await FollowupAsync($"VCステータスを更新しました: `{status}`", ephemeral: true);
     }
 
     [ComponentInteraction("voice_owner_transfer_select", ignoreGroupNames: true)]
@@ -488,6 +578,38 @@ public sealed class ControlPanelModule : InteractionModuleBase<SocketInteraction
         return baseLabel.Length > 90 ? baseLabel[..90] : baseLabel;
     }
 
+    private (SocketVoiceChannel? Channel, string? Error) TryGetVoiceChannelFromPromptContext(SocketGuildUser user)
+    {
+        if (Context.Guild is null || Context.Channel is not SocketGuildChannel guildChannel)
+        {
+            return (null, "この操作はサーバー内でのみ使えます。");
+        }
+
+        var voiceChannel = guildChannel as SocketVoiceChannel ?? Context.Guild.GetVoiceChannel(guildChannel.Id);
+        if (voiceChannel is null)
+        {
+            return (null, "このVCテキストからのみ操作できます。");
+        }
+
+        if (user.VoiceChannel?.Id != voiceChannel.Id)
+        {
+            return (null, "VCに参加してから操作してください。");
+        }
+
+        return (voiceChannel, null);
+    }
+
+    private static bool CanSetVoiceChannelStatus(SocketGuildUser user, SocketVoiceChannel channel)
+    {
+        if (user.GuildPermissions.Administrator || user.GuildPermissions.ManageChannels)
+        {
+            return true;
+        }
+
+        var permissions = user.GetPermissions(channel);
+        return permissions.SetVoiceChannelStatus || permissions.ManageChannel;
+    }
+
     private static long ToDbId(ulong value) => unchecked((long)value);
     private static ulong ToUlong(long value) => unchecked((ulong)value);
 }
@@ -508,4 +630,13 @@ public sealed class VoiceLimitModal : IModal
     [InputLabel("人数 (0で解除, 最大99)")]
     [ModalTextInput("voice_limit", maxLength: 2)]
     public string UserLimit { get; set; } = string.Empty;
+}
+
+public sealed class VoiceStatusPromptModal : IModal
+{
+    public string Title => "VCステータス設定";
+
+    [InputLabel("ステータス")]
+    [ModalTextInput("voice_status_prompt_value", maxLength: 120, placeholder: "例: 雑談 / 零式 1-4通し / 地図")]
+    public string Status { get; set; } = string.Empty;
 }

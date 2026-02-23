@@ -8,6 +8,8 @@ public static class SettingsPanel
     public const string PanelMessage = PanelTitle;
     public const string ToggleSelfVoiceNotifyCustomId = "voice_notify_self_toggle";
     public const string ShowSelfStatusCustomId = "settings_show_self_status";
+    public const string ShowSelfProfileCustomId = "settings_show_self_profile";
+    public const string ShowMyPageCustomId = "settings_show_my_page";
 
     public static MessageComponent BuildComponents()
     {
@@ -19,6 +21,7 @@ public static class SettingsPanel
             .WithButton("プロフィール編集", LodestonePanel.EditProfileCustomId, ButtonStyle.Secondary, row: 2)
             .WithButton("DC/サーバー変更", LodestonePanel.ChangeDataCenterWorldCustomId, ButtonStyle.Secondary, row: 2)
             .WithButton("現在の設定を確認", ShowSelfStatusCustomId, ButtonStyle.Secondary, row: 2)
+            .WithButton("マイページ", ShowMyPageCustomId, ButtonStyle.Success, row: 3)
             .Build();
     }
 

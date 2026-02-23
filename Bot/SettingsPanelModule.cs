@@ -14,17 +14,20 @@ public sealed class SettingsPanelModule : InteractionModuleBase<SocketInteractio
 {
     private readonly Db _db;
     private readonly RecruitmentListService _recruitListService;
+    private readonly UserProfileEmbedService _profileEmbeds;
     private readonly ILogger<SettingsPanelModule> _logger;
     private readonly DiscordOptions _options;
 
     public SettingsPanelModule(
         Db db,
         RecruitmentListService recruitListService,
+        UserProfileEmbedService profileEmbeds,
         ILogger<SettingsPanelModule> logger,
         IOptions<DiscordOptions> options)
     {
         _db = db;
         _recruitListService = recruitListService;
+        _profileEmbeds = profileEmbeds;
         _logger = logger;
         _options = options.Value;
     }
@@ -95,6 +98,57 @@ public sealed class SettingsPanelModule : InteractionModuleBase<SocketInteractio
         {
             _logger.LogWarning(ex, "Failed to show self settings. UserId={UserId}", Context.User.Id);
             await FollowupAsync("設定の取得に失敗しました。時間をおいて再試行してください。", ephemeral: true);
+        }
+    }
+
+    [ComponentInteraction(SettingsPanel.ShowMyPageCustomId, ignoreGroupNames: true)]
+    public async Task ShowMyPageAsync()
+    {
+        if (Context.Guild is null || Context.User is not SocketGuildUser guildUser)
+        {
+            await RespondAsync("この操作はサーバー内でのみ使えます。", ephemeral: true);
+            return;
+        }
+
+        await DeferAsync(ephemeral: true);
+
+        try
+        {
+            var embed = await BuildMyPageEmbedAsync(guildUser);
+            await FollowupAsync(embed: embed, ephemeral: true);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to show my page. UserId={UserId}", Context.User.Id);
+            await FollowupAsync("マイページの表示に失敗しました。時間をおいて再試行してください。", ephemeral: true);
+        }
+    }
+
+    [ComponentInteraction(SettingsPanel.ShowSelfProfileCustomId, ignoreGroupNames: true)]
+    public async Task ShowSelfProfileAsync()
+    {
+        if (Context.Guild is null)
+        {
+            await RespondAsync("この操作はサーバー内でのみ使えます。", ephemeral: true);
+            return;
+        }
+
+        await DeferAsync(ephemeral: true);
+
+        try
+        {
+            var embed = await _profileEmbeds.BuildProfileEmbedAsync(
+                Context.User,
+                Context.Guild,
+                "自分の情報",
+                Color.Blue,
+                includeLodestoneExtras: true);
+            await FollowupAsync(embed: embed, ephemeral: true);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to show self profile from settings panel. UserId={UserId}", Context.User.Id);
+            await FollowupAsync("自分の情報の表示に失敗しました。時間をおいて再試行してください。", ephemeral: true);
         }
     }
 
@@ -404,6 +458,40 @@ public sealed class SettingsPanelModule : InteractionModuleBase<SocketInteractio
         return embed.Build();
     }
 
+    private async Task<Embed> BuildMyPageEmbedAsync(SocketGuildUser guildUser)
+    {
+        var guildId = guildUser.Guild.Id;
+        var userId = guildUser.Id;
+
+        var hostRecruitsTask = _db.ListActiveRecruitPostsByCreatorAsync(guildId, userId);
+        var joinedRecruitsTask = _db.ListActiveRecruitPostsByParticipantAsync(guildId, userId, maxRows: 5);
+        var activeLotteriesTask = _db.ListActiveLotteriesByEntryUserAsync(guildId, userId, maxRows: 5);
+        var inquiryTask = _db.GetOpenInquiryTicketByRequesterAsync(guildId, userId);
+
+        await Task.WhenAll(hostRecruitsTask, joinedRecruitsTask, activeLotteriesTask, inquiryTask);
+
+        var hostRecruits = (await hostRecruitsTask).Take(5).ToList();
+        var joinedRecruits = (await joinedRecruitsTask).ToList();
+        var activeLotteries = (await activeLotteriesTask).ToList();
+        var inquiry = await inquiryTask;
+
+        var embed = new EmbedBuilder()
+            .WithTitle("マイページ")
+            .WithColor(Color.Teal)
+            .WithCurrentTimestamp()
+            .WithAuthor(guildUser.DisplayName, guildUser.GetAvatarUrl() ?? guildUser.GetDefaultAvatarUrl())
+            .AddField(
+                "サマリー",
+                $"募集(主催中): {hostRecruits.Count}件\n募集(参加中): {joinedRecruits.Count}件\n抽選(応募中/結果待ち): {activeLotteries.Count}件\n問い合わせ(進行中): {(inquiry is null ? 0 : 1)}件",
+                false)
+            .AddField("募集(主催中)", BuildRecruitSummaryLines(guildId, hostRecruits), false)
+            .AddField("募集(参加中)", BuildRecruitSummaryLines(guildId, joinedRecruits), false)
+            .AddField("抽選(応募中/結果待ち)", BuildLotterySummaryLines(guildId, activeLotteries), false)
+            .AddField("問い合わせ", BuildInquirySummaryLine(guildId, inquiry), false);
+
+        return embed.Build();
+    }
+
     private static string Truncate(string value, int maxLength)
     {
         if (string.IsNullOrEmpty(value) || value.Length <= maxLength)
@@ -413,6 +501,77 @@ public sealed class SettingsPanelModule : InteractionModuleBase<SocketInteractio
 
         return value[..maxLength];
     }
+
+    private static string BuildRecruitSummaryLines(ulong guildId, IReadOnlyList<RecruitPostSummary> posts)
+    {
+        if (posts.Count == 0)
+        {
+            return "なし";
+        }
+
+        var lines = posts.Select(post =>
+        {
+            var status = post.Status switch
+            {
+                RecruitPostStatus.Open => "募集中",
+                RecruitPostStatus.Full => "満員",
+                RecruitPostStatus.Closed => "終了",
+                RecruitPostStatus.Canceled => "中断",
+                _ => post.Status.ToString()
+            };
+            var schedule = post.ScheduleAt.HasValue ? $"<t:{post.ScheduleAt.Value.ToUnixTimeSeconds()}:f>" : (post.ScheduleText ?? "日時未設定");
+            var title = string.IsNullOrWhiteSpace(post.Title) ? "(無題)" : post.Title.Trim();
+            var link = BuildDiscordMessageLink(guildId, ToUlong(post.ChannelId), ToUlong(post.MessageId));
+            return $"`{status}` {schedule}\n[{Truncate(title, 80)}]({link}) ({post.FilledCount}/{post.SlotCount})";
+        });
+
+        return Truncate(string.Join("\n", lines), 1000);
+    }
+
+    private static string BuildLotterySummaryLines(ulong guildId, IReadOnlyList<Lottery> lotteries)
+    {
+        if (lotteries.Count == 0)
+        {
+            return "なし";
+        }
+
+        var lines = lotteries.Select(lottery =>
+        {
+            var status = LotteryStatus.IsOpen(lottery.Status) ? "応募中" :
+                LotteryStatus.IsClosed(lottery.Status) ? "結果待ち" :
+                lottery.Status;
+            var closeAt = $"<t:{lottery.CloseAt.ToUnixTimeSeconds()}:f>";
+            var title = string.IsNullOrWhiteSpace(lottery.Title) ? "(無題)" : lottery.Title.Trim();
+            var link = lottery.MessageId.HasValue && lottery.MessageId.Value != 0
+                ? BuildDiscordMessageLink(guildId, ToUlong(lottery.ChannelId), ToUlong(lottery.MessageId.Value))
+                : $"https://discord.com/channels/{guildId}/{ToUlong(lottery.ChannelId)}";
+            return $"`{status}` 締切: {closeAt}\n[{Truncate(title, 80)}]({link})";
+        });
+
+        return Truncate(string.Join("\n", lines), 1000);
+    }
+
+    private static string BuildInquirySummaryLine(ulong guildId, InquiryTicket? inquiry)
+    {
+        if (inquiry is null)
+        {
+            return "なし";
+        }
+
+        var status = InquiryTicketStatus.ToLabel(inquiry.Status);
+        var channelLink = inquiry.ChannelId != 0
+            ? $"https://discord.com/channels/{guildId}/{ToUlong(inquiry.ChannelId)}"
+            : null;
+        var subject = string.IsNullOrWhiteSpace(inquiry.Subject) ? "(件名なし)" : inquiry.Subject.Trim();
+        var updated = $"<t:{inquiry.UpdatedAt.ToUnixTimeSeconds()}:R>";
+
+        return channelLink is null
+            ? $"`{status}` {Truncate(subject, 120)} / 更新: {updated}"
+            : $"`{status}` [{Truncate(subject, 120)}]({channelLink}) / 更新: {updated}";
+    }
+
+    private static string BuildDiscordMessageLink(ulong guildId, ulong channelId, ulong messageId)
+        => $"https://discord.com/channels/{guildId}/{channelId}/{messageId}";
 
     private static Embed BuildAdminPanelStatusEmbed(bool approvalRequired, bool inactiveAutoKickEnabled)
     {

@@ -12,5 +12,9 @@ public sealed class GuildSettings
     public bool InactiveAutoKickEnabled { get; init; }
     public long LogChannelId { get; init; }
     public long ControlChannelId { get; init; }
+    public int? RuntimeCleanupIntervalMinutes { get; init; }
+    public int? RuntimeRecruitClosedRetentionHours { get; init; }
+    public int? RuntimeRecruitCanceledRetentionHours { get; init; }
+    public DateTimeOffset? RuntimeTuningUpdatedAt { get; init; }
     public DateTimeOffset UpdatedAt { get; init; }
 }
