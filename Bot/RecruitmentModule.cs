@@ -4218,13 +4218,6 @@ public sealed class RecruitmentModule : InteractionModuleBase<SocketInteractionC
             }
         }
 
-        if (target.UserId.HasValue && target.UserId.Value == userId &&
-            !CanReconfigureCurrentJoinAsFixed(post, slots, target, userId))
-        {
-            await RespondAsync($"{position} には既に参加しています。", ephemeral: true);
-            return;
-        }
-
         if (target.UserId.HasValue &&
             target.UserId.Value != userId &&
             !CanJoinBySwappingFlexibleHost(post, slots, target, userId))

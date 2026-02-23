@@ -371,9 +371,10 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
             return;
         }
 
-        if (!string.IsNullOrWhiteSpace(inputFfxivName) && !IsSpacedCharacterName(inputFfxivName))
+        if (!string.IsNullOrWhiteSpace(inputFfxivName) &&
+            !TryNormalizeAndValidateFfxivCharacterName(inputFfxivName, out inputFfxivName, out var profileNameError))
         {
-            await FollowupAsync("FFXIV名は「姓 名」のように空白を入れて入力してください。", ephemeral: true);
+            await FollowupAsync(profileNameError ?? BuildFfxivNameValidationMessage(), ephemeral: true);
             return;
         }
 
@@ -426,10 +427,10 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
             await FollowupAsync("FFXIV名を入力してください。", ephemeral: true);
             return;
         }
-        if (!IsSpacedCharacterName(ffxivName))
+        if (!TryNormalizeAndValidateFfxivCharacterName(ffxivName, out ffxivName, out var registrationNameError))
         {
-            await LogInvalidOperationAsync("メンバー登録入力不正", $"👤 ユーザー: {FormatUser(Context.User)}\n🧩 入力名: {TruncateForLog(ffxivName, 80)}\n❌ 理由: 姓名の空白なし");
-            await FollowupAsync("FFXIV名は「姓 名」のように空白を入れて入力してください。", ephemeral: true);
+            await LogInvalidOperationAsync("メンバー登録入力不正", $"👤 ユーザー: {FormatUser(Context.User)}\n🧩 入力名: {TruncateForLog(ffxivName, 80)}\n❌ 理由: {registrationNameError ?? "FFXIV名の形式不正"}");
+            await FollowupAsync(registrationNameError ?? BuildFfxivNameValidationMessage(), ephemeral: true);
             return;
         }
 
@@ -1738,11 +1739,89 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
 
     private static ulong ToUlong(long value) => unchecked((ulong)value);
 
-    private static bool IsSpacedCharacterName(string value)
+    private static bool TryNormalizeAndValidateFfxivCharacterName(string value, out string normalized, out string? error)
     {
-        var parts = value.Split([' ', '\t', '\u3000'], StringSplitOptions.RemoveEmptyEntries);
-        return parts.Length >= 2;
+        normalized = string.Empty;
+        error = null;
+
+        var parts = value
+            .Split([' ', '\t', '\u3000'], StringSplitOptions.RemoveEmptyEntries)
+            .Select(part => part.Trim())
+            .Where(part => part.Length > 0)
+            .ToArray();
+        if (parts.Length != 2)
+        {
+            error = "FFXIV名は「姓 名」の形式で入力してください。";
+            return false;
+        }
+
+        var firstName = parts[0];
+        var familyName = parts[1];
+        if (firstName.Length < 2 || firstName.Length > 15)
+        {
+            error = "名は2文字以上15文字以内で入力してください。";
+            return false;
+        }
+
+        if (familyName.Length < 2 || familyName.Length > 15)
+        {
+            error = "姓は2文字以上15文字以内で入力してください。";
+            return false;
+        }
+
+        if (!IsValidFfxivNamePart(firstName))
+        {
+            error = "名は半角英字 / ' / - のみ使用でき、先頭は英字にしてください。";
+            return false;
+        }
+
+        if (!IsValidFfxivNamePart(familyName))
+        {
+            error = "姓は半角英字 / ' / - のみ使用でき、先頭は英字にしてください。";
+            return false;
+        }
+
+        if (firstName.Length + familyName.Length > 20)
+        {
+            error = "FFXIV名は姓と名の合計20文字以内で入力してください。";
+            return false;
+        }
+
+        normalized = $"{firstName} {familyName}";
+        return true;
     }
+
+    private static bool IsValidFfxivNamePart(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return false;
+        }
+
+        var first = value[0];
+        if (!IsAsciiLetter(first))
+        {
+            return false;
+        }
+
+        foreach (var ch in value)
+        {
+            if (IsAsciiLetter(ch) || ch == '\'' || ch == '-')
+            {
+                continue;
+            }
+
+            return false;
+        }
+
+        return true;
+    }
+
+    private static bool IsAsciiLetter(char ch)
+        => (ch is >= 'A' and <= 'Z') || (ch is >= 'a' and <= 'z');
+
+    private static string BuildFfxivNameValidationMessage()
+        => "FFXIV名は「姓 名」で入力してください。姓名とも2〜15文字、半角英字 / ' / - のみ使用でき、先頭は英字、合計20文字以内です。";
 
     private async Task<IMessageChannel?> ResolveSetupChannelAsync()
     {
