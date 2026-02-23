@@ -3615,7 +3615,8 @@ public sealed class DiscordBotService : IHostedService
             embeds,
             messageLink);
 
-        if (!IsLogIgnoredChannel(guildChannel))
+        // Discordのリンク展開で Embed 数だけ変わる更新は「メッセージ編集ログ」から除外する。
+        if (contentChanged && !IsLogIgnoredChannel(guildChannel))
         {
             var embedBuilder = CreateLogEmbedBase(guildChannel.Guild, "メッセージ編集", Color.Gold, after.Author)
                 .WithDescription(summary)

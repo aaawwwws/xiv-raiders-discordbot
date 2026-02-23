@@ -2373,7 +2373,8 @@ public sealed class RecruitmentModule : InteractionModuleBase<SocketInteractionC
         var emptyPositions = GetOrderedPositions(slots)
             .Where(position =>
                 slotMap.TryGetValue(position, out var slot) &&
-                CanSelectPositionForExternalFill(post, slots, slot))
+                (CanSelectPositionForExternalFill(post, slots, slot) ||
+                 CanEditPrefilledPositionAfterCreate(post, slot)))
             .ToList();
         var flexSelectablePositions = GetOrderedPositions(slots)
             .Where(position =>
@@ -2384,12 +2385,12 @@ public sealed class RecruitmentModule : InteractionModuleBase<SocketInteractionC
 
         if (emptyPositions.Count == 0 && !hasFlexCandidate)
         {
-            await RespondAsync("ゲーム内募集で埋まりとして〆にできる空きポジションがありません。", ephemeral: true);
+            await RespondAsync("事前埋まりとして設定・編集できるポジションがありません。", ephemeral: true);
             return;
         }
 
         await RespondAsync(
-            "ゲーム内募集で埋まったポジションを選択してください。",
+            "事前埋まりを設定・編集するポジションを選択してください。（サーバーメンバー/外部どちらも上書き編集できます）",
             components: BuildExternalFillSelectComponents(messageId, emptyPositions, hasFlexCandidate),
             ephemeral: true);
     }
@@ -3236,7 +3237,8 @@ public sealed class RecruitmentModule : InteractionModuleBase<SocketInteractionC
             return;
         }
 
-        if (!CanSelectPositionForExternalFill(post, slots, target))
+        if (!CanSelectPositionForExternalFill(post, slots, target) &&
+            !CanEditPrefilledPositionAfterCreate(post, target))
         {
             var error = target.UserId.HasValue
                 ? "そのポジションは既に埋まっています。"
@@ -3422,7 +3424,7 @@ public sealed class RecruitmentModule : InteractionModuleBase<SocketInteractionC
                 : string.Join('/', selectedJobs);
 
             await RespondAsync(
-                $"{BuildFlexSelectionLabel(normalizedFlexSpec)} / {selectedJobLabel} で埋まり設定します。このサーバーの人ですか？",
+                $"{BuildFlexSelectionLabel(normalizedFlexSpec)} / {selectedJobLabel} で事前埋まり設定します。このサーバーの人ですか？",
                 components: BuildExternalFillSourceSelectComponents(
                     normalizedFlexJobsSpec,
                     $"FLEX:{normalizedFlexSpec}",
@@ -3450,7 +3452,7 @@ public sealed class RecruitmentModule : InteractionModuleBase<SocketInteractionC
         }
 
         await RespondAsync(
-            $"{normalizedPosition}（{GetRoleLabelByPosition(normalizedPosition)}）/ {matchedJob.Code} で埋まり設定します。このサーバーの人ですか？",
+            $"{normalizedPosition}（{GetRoleLabelByPosition(normalizedPosition)}）/ {matchedJob.Code} で事前埋まり設定します。このサーバーの人ですか？",
             components: BuildExternalFillSourceSelectComponents(matchedJob.Code, normalizedPosition, messageId),
             ephemeral: true);
     }
@@ -3533,7 +3535,8 @@ public sealed class RecruitmentModule : InteractionModuleBase<SocketInteractionC
             return;
         }
 
-        if (!CanSelectPositionForExternalFill(post, slots, target))
+        if (!CanSelectPositionForExternalFill(post, slots, target) &&
+            !CanEditPrefilledPositionAfterCreate(post, target))
         {
             var error = target.UserId.HasValue
                 ? "そのポジションは既に埋まっています。"
@@ -3655,6 +3658,25 @@ public sealed class RecruitmentModule : InteractionModuleBase<SocketInteractionC
         }
 
         await DeferAsync(ephemeral: true);
+
+        var currentTarget = slots.FirstOrDefault(slot => string.Equals(slot.Position, normalizedPosition, StringComparison.OrdinalIgnoreCase));
+        if (currentTarget is not null)
+        {
+            if (currentTarget.UserId.HasValue)
+            {
+                if (currentTarget.UserId.Value == post.CreatorUserId)
+                {
+                    await FollowupAsync("主催枠の事前埋まり編集はできません。", ephemeral: true);
+                    return;
+                }
+
+                await _db.ClearRecruitSlotAsync(post.Id, ToUlong(currentTarget.UserId.Value));
+            }
+            else if (currentTarget.IsClosed)
+            {
+                await _db.UnmarkRecruitSlotIngameFilledAsync(post.Id, normalizedPosition);
+            }
+        }
 
         var status = await _db.MarkRecruitSlotIngameFilledAsync(post.Id, normalizedPosition, matchedJob.Code, post.DisallowDuplicateJobs);
         if (status != RecruitIngameFillStatus.Success)
@@ -3805,6 +3827,24 @@ public sealed class RecruitmentModule : InteractionModuleBase<SocketInteractionC
         }
 
         await DeferAsync(ephemeral: true);
+        var target = slots.FirstOrDefault(slot => string.Equals(slot.Position, normalizedPosition, StringComparison.OrdinalIgnoreCase));
+        if (target is not null)
+        {
+            if (target.UserId.HasValue && target.UserId.Value != ToDbId(userId))
+            {
+                if (target.UserId.Value == post.CreatorUserId)
+                {
+                    await FollowupAsync("主催枠の事前埋まり編集はできません。", ephemeral: true);
+                    return;
+                }
+
+                await _db.ClearRecruitSlotAsync(post.Id, ToUlong(target.UserId.Value));
+            }
+            else if (target.IsClosed && !target.UserId.HasValue)
+            {
+                await _db.UnmarkRecruitSlotIngameFilledAsync(post.Id, normalizedPosition);
+            }
+        }
         var displayName = await ResolveRecruitStoredUserNameAsync(selectedUser);
         var status = await _db.AssignRecruitSlotAsync(post.Id, normalizedPosition, userId, displayName, matchedJob.Code, string.Empty, post.DisallowDuplicateJobs);
         if (status != RecruitAssignStatus.Success)
@@ -10125,7 +10165,7 @@ public sealed class RecruitmentModule : InteractionModuleBase<SocketInteractionC
         if (status is RecruitPostStatus.Open or RecruitPostStatus.Full)
         {
             builder
-                .WithButton("埋まった枠を〆る", $"recruit_manage_tool_fill:{messageId}", ButtonStyle.Danger, row: 0)
+                .WithButton("事前埋まり設定", $"recruit_manage_tool_fill:{messageId}", ButtonStyle.Danger, row: 0)
                 .WithButton("〆解除", $"recruit_manage_tool_unfill:{messageId}", ButtonStyle.Secondary, row: 0);
 
             if (isCreator)
@@ -10710,7 +10750,7 @@ public sealed class RecruitmentModule : InteractionModuleBase<SocketInteractionC
             .WithButton("前へ", $"recruit_external_fill_member_page:{job}|{position}|{messageId}|{currentPage - 1}", ButtonStyle.Secondary, disabled: currentPage <= 0, row: 1)
             .WithButton("次へ", $"recruit_external_fill_member_page:{job}|{position}|{messageId}|{currentPage + 1}", ButtonStyle.Secondary, disabled: currentPage >= totalPages - 1, row: 1)
             .WithButton("ジョブ再選択", $"recruit_external_fill_pos:{position}|{messageId}", ButtonStyle.Secondary, row: 1)
-            .WithButton("外部で〆", $"recruit_external_fill_member_no:{job}|{position}|{messageId}", ButtonStyle.Secondary, row: 1)
+            .WithButton("外部で事前埋まり", $"recruit_external_fill_member_no:{job}|{position}|{messageId}", ButtonStyle.Secondary, row: 1)
             .WithButton("中止", "recruit_external_fill_cancel", ButtonStyle.Secondary, row: 2)
             .Build();
     }
@@ -11017,32 +11057,28 @@ public sealed class RecruitmentModule : InteractionModuleBase<SocketInteractionC
 
         if (hostSlot is not null && !string.IsNullOrWhiteSpace(post.HostFlexSpec))
         {
-            var flexPositions = ResolveFlexCandidatePositions(post.HostFlexSpec, orderedPositions).ToArray();
-            var hostCandidateJobs = hostFlexJobs.Count > 0
-                ? hostFlexJobs
-                : string.IsNullOrWhiteSpace(hostSlot.Job)
-                    ? Array.Empty<string>()
-                    : new[] { hostSlot.Job.Trim().ToUpperInvariant() };
             var hostUserId = hostSlot.UserId ?? post.CreatorUserId;
-            hostDisplayFlexJobs = FilterDisplayAssignableFlexJobs(
+            var hostFlexAnalysis = AnalyzeFlexDisplay(
+                post,
                 slots,
-                flexPositions,
-                hostCandidateJobs,
+                hostSlot,
+                post.HostFlexSpec,
+                post.HostFlexJobsSpec,
+                orderedPositions,
                 hostUserId,
-                post.DisallowDuplicateJobs);
-            var hostAssignableCount = CountDisplayAssignableFlexPositions(
-                slots,
-                flexPositions,
-                hostCandidateJobs,
-                hostUserId,
-                post.DisallowDuplicateJobs);
-            if (flexPositions.Length >= 2 &&
-                flexPositions.Contains(hostSlot.Position, StringComparer.OrdinalIgnoreCase) &&
-                hostAssignableCount >= 2)
+                requireClosedFlexRelocatable: false);
+            if (hostFlexAnalysis is not null)
+            {
+                hostDisplayFlexJobs = hostFlexAnalysis.Value.DisplayJobs.Count > 0
+                    ? hostFlexAnalysis.Value.DisplayJobs
+                    : hostFlexAnalysis.Value.CandidateJobs;
+            }
+
+            if (hostFlexAnalysis is { IsDisplayable: true })
             {
                 var hostJob = string.IsNullOrWhiteSpace(hostSlot.Job) ? "?" : hostSlot.Job!;
                 var participantLabel = $"{BuildRecruitEmbedUserName(hostSlot)} ({BuildHostDisplayedJob(hostJob, hostDisplayFlexJobs)})";
-                flexLines.Add($"[主催] {BuildFlexEmbedPositionLabel(post.HostFlexSpec!, orderedPositions)}: {participantLabel} どちらでもOK");
+                flexLines.Add($"[主催] {BuildFlexEmbedPositionLabel(hostFlexAnalysis.Value.NormalizedFlexSpec, orderedPositions)}: {participantLabel} どちらでもOK");
                 flexOccupiedPositions.Add(hostSlot.Position);
             }
         }
@@ -11055,47 +11091,23 @@ public sealed class RecruitmentModule : InteractionModuleBase<SocketInteractionC
             .ToArray();
         foreach (var slot in participantFlexSlots)
         {
-            var normalizedFlexSpec = NormalizeFlexSpecForDisplay(slot.FlexSpec, orderedPositions);
-            if (string.IsNullOrWhiteSpace(normalizedFlexSpec))
-            {
-                continue;
-            }
-
-            var flexPositions = ResolveFlexCandidatePositions(normalizedFlexSpec, orderedPositions).ToArray();
-            if (flexPositions.Length < 2 ||
-                !flexPositions.Contains(slot.Position, StringComparer.OrdinalIgnoreCase))
-            {
-                continue;
-            }
-
-            var participantJobs = ParseFlexJobCodes(slot.FlexJobsSpec);
-            if (participantJobs.Count == 0 && !string.IsNullOrWhiteSpace(slot.Job))
-            {
-                participantJobs = new[] { slot.Job.Trim().ToUpperInvariant() };
-            }
-            var participantDisplayFlexJobs = FilterDisplayAssignableFlexJobs(
+            var participantFlexAnalysis = AnalyzeFlexDisplay(
+                post,
                 slots,
-                flexPositions,
-                participantJobs,
+                slot,
+                slot.FlexSpec,
+                slot.FlexJobsSpec,
+                orderedPositions,
                 slot.UserId!.Value,
-                post.DisallowDuplicateJobs);
-            var participantDisplayJobs = !string.IsNullOrWhiteSpace(slot.Job)
-                ? new[] { slot.Job.Trim().ToUpperInvariant() }
-                : participantDisplayFlexJobs.Count > 0 ? participantDisplayFlexJobs : participantJobs;
-            var participantAssignableCount = CountDisplayAssignableFlexPositions(
-                slots,
-                flexPositions,
-                participantDisplayJobs,
-                slot.UserId!.Value,
-                post.DisallowDuplicateJobs);
-            if (participantAssignableCount < 2)
+                requireClosedFlexRelocatable: false);
+            if (participantFlexAnalysis is not { IsDisplayable: true })
             {
                 continue;
             }
 
             var job = string.IsNullOrWhiteSpace(slot.Job) ? "?" : slot.Job;
-            var participantLabel = $"{BuildRecruitEmbedUserName(slot)} ({BuildHostDisplayedJob(job, participantDisplayFlexJobs)})";
-            flexLines.Add($"[参加] {BuildFlexEmbedPositionLabel(normalizedFlexSpec, orderedPositions)}: {participantLabel} どちらでもOK");
+            var participantLabel = $"{BuildRecruitEmbedUserName(slot)} ({BuildHostDisplayedJob(job, participantFlexAnalysis.Value.DisplayJobs)})";
+            flexLines.Add($"[参加] {BuildFlexEmbedPositionLabel(participantFlexAnalysis.Value.NormalizedFlexSpec, orderedPositions)}: {participantLabel} どちらでもOK");
             flexOccupiedPositions.Add(slot.Position);
         }
 
@@ -11107,32 +11119,23 @@ public sealed class RecruitmentModule : InteractionModuleBase<SocketInteractionC
             .ToArray();
         foreach (var slot in closedFlexSlots)
         {
-            var normalizedFlexSpec = NormalizeFlexSpecForDisplay(slot.FlexSpec, orderedPositions);
-            if (string.IsNullOrWhiteSpace(normalizedFlexSpec))
+            var closedFlexAnalysis = AnalyzeFlexDisplay(
+                post,
+                slots,
+                slot,
+                slot.FlexSpec,
+                slot.FlexJobsSpec,
+                orderedPositions,
+                long.MinValue,
+                requireClosedFlexRelocatable: true);
+            if (closedFlexAnalysis is not { CanRelocateClosedAnchor: true })
             {
                 continue;
             }
 
-            var flexPositions = ResolveFlexCandidatePositions(normalizedFlexSpec, orderedPositions).ToArray();
-            if (flexPositions.Length < 2 ||
-                !flexPositions.Contains(slot.Position, StringComparer.OrdinalIgnoreCase))
-            {
-                continue;
-            }
-
-            // If the closed FLEX cannot relocate anymore, treat it as fixed at the anchored position.
-            if (!CanJoinByRelocatingClosedFlexAnchor(post, slots, slot, long.MinValue))
-            {
-                continue;
-            }
-
-            var flexJobs = ParseFlexJobCodes(slot.FlexJobsSpec);
-            if (flexJobs.Count == 0 && !string.IsNullOrWhiteSpace(slot.Job))
-            {
-                flexJobs = new[] { slot.Job.Trim().ToUpperInvariant() };
-            }
-            var flexJobLabel = flexJobs.Count == 0 ? "?" : string.Join('/', flexJobs);
-            flexLines.Add($"[〆] {BuildFlexEmbedPositionLabel(normalizedFlexSpec, orderedPositions)}: 外部 ({flexJobLabel})");
+            var closedJob = string.IsNullOrWhiteSpace(slot.Job) ? "?" : slot.Job!;
+            var flexJobLabel = BuildHostDisplayedJob(closedJob, closedFlexAnalysis.Value.DisplayJobs);
+            flexLines.Add($"[〆] {BuildFlexEmbedPositionLabel(closedFlexAnalysis.Value.NormalizedFlexSpec, orderedPositions)}: 外部 ({flexJobLabel})");
             flexOccupiedPositions.Add(slot.Position);
         }
 
@@ -11199,6 +11202,78 @@ public sealed class RecruitmentModule : InteractionModuleBase<SocketInteractionC
 
         lines.AddRange(flexLines);
         return string.Join('\n', lines);
+    }
+
+    private readonly record struct FlexDisplayAnalysis(
+        string NormalizedFlexSpec,
+        IReadOnlyList<string> CandidateJobs,
+        IReadOnlyList<string> DisplayJobs,
+        int AssignablePositionCount,
+        bool CanRelocateClosedAnchor)
+    {
+        public bool IsDisplayable => CanRelocateClosedAnchor && AssignablePositionCount >= 2;
+    }
+
+    private static FlexDisplayAnalysis? AnalyzeFlexDisplay(
+        RecruitPost post,
+        IReadOnlyList<RecruitSlot> slots,
+        RecruitSlot slot,
+        string? flexSpec,
+        string? flexJobsSpec,
+        IReadOnlyList<string> orderedPositions,
+        long userId,
+        bool requireClosedFlexRelocatable)
+    {
+        var normalizedFlexSpec = NormalizeFlexSpecForDisplay(flexSpec, orderedPositions);
+        if (string.IsNullOrWhiteSpace(normalizedFlexSpec))
+        {
+            return null;
+        }
+
+        var flexPositions = ResolveFlexCandidatePositions(normalizedFlexSpec, orderedPositions).ToArray();
+        if (flexPositions.Length < 2 ||
+            !flexPositions.Contains(slot.Position, StringComparer.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        var canRelocateClosedAnchor = !requireClosedFlexRelocatable ||
+            CanJoinByRelocatingClosedFlexAnchor(post, slots, slot, userId);
+        var candidateJobs = ParseFlexJobCodes(flexJobsSpec);
+        if (candidateJobs.Count == 0 && !string.IsNullOrWhiteSpace(slot.Job))
+        {
+            candidateJobs = new[] { slot.Job.Trim().ToUpperInvariant() };
+        }
+
+        if (candidateJobs.Count == 0)
+        {
+            return new FlexDisplayAnalysis(normalizedFlexSpec, Array.Empty<string>(), Array.Empty<string>(), 0, canRelocateClosedAnchor);
+        }
+
+        var displayJobs = FilterDisplayAssignableFlexJobs(
+            slots,
+            flexPositions,
+            candidateJobs,
+            userId,
+            post.DisallowDuplicateJobs,
+            requireClosedFlexRelocatable ? slot.Position : null);
+        var effectiveJobs = displayJobs.Count > 0
+            ? displayJobs
+            : candidateJobs;
+        var assignablePositionCount = CountDisplayAssignableFlexPositions(
+            slots,
+            flexPositions,
+            effectiveJobs,
+            userId,
+            post.DisallowDuplicateJobs,
+            requireClosedFlexRelocatable ? slot.Position : null);
+
+        return new FlexDisplayAnalysis(
+            normalizedFlexSpec,
+            candidateJobs,
+            displayJobs,
+            assignablePositionCount,
+            canRelocateClosedAnchor);
     }
 
     private static string BuildRecruitEmbedCreatorName(RecruitPost post, IReadOnlyList<RecruitSlot> slots)
@@ -11278,7 +11353,8 @@ public sealed class RecruitmentModule : InteractionModuleBase<SocketInteractionC
         IReadOnlyCollection<string> candidatePositions,
         IReadOnlyCollection<string> candidateJobs,
         long userId,
-        bool disallowDuplicateJobs)
+        bool disallowDuplicateJobs,
+        string? relaxClosedAnchorPosition = null)
     {
         if (candidatePositions.Count == 0 || candidateJobs.Count == 0)
         {
@@ -11303,6 +11379,10 @@ public sealed class RecruitmentModule : InteractionModuleBase<SocketInteractionC
             ? slots
                 .Where(slot =>
                     !string.IsNullOrWhiteSpace(slot.Job) &&
+                    !(!string.IsNullOrWhiteSpace(relaxClosedAnchorPosition) &&
+                      slot.IsClosed &&
+                      !slot.UserId.HasValue &&
+                      string.Equals(slot.Position, relaxClosedAnchorPosition, StringComparison.OrdinalIgnoreCase)) &&
                     ((slot.UserId.HasValue && slot.UserId.Value != userId) ||
                      (slot.IsClosed && !slot.UserId.HasValue)))
                 .Select(slot => slot.Job!.Trim().ToUpperInvariant())
@@ -11313,7 +11393,13 @@ public sealed class RecruitmentModule : InteractionModuleBase<SocketInteractionC
         foreach (var candidatePosition in candidatePositions)
         {
             var target = slots.FirstOrDefault(slot => string.Equals(slot.Position, candidatePosition, StringComparison.OrdinalIgnoreCase));
-            if (target is null || target.IsClosed)
+            var treatClosedAnchorAsOpen =
+                target is not null &&
+                !string.IsNullOrWhiteSpace(relaxClosedAnchorPosition) &&
+                target.IsClosed &&
+                !target.UserId.HasValue &&
+                string.Equals(target.Position, relaxClosedAnchorPosition, StringComparison.OrdinalIgnoreCase);
+            if (target is null || (target.IsClosed && !treatClosedAnchorAsOpen))
             {
                 continue;
             }
@@ -11344,7 +11430,8 @@ public sealed class RecruitmentModule : InteractionModuleBase<SocketInteractionC
         IReadOnlyCollection<string> candidatePositions,
         IReadOnlyCollection<string> candidateJobs,
         long userId,
-        bool disallowDuplicateJobs)
+        bool disallowDuplicateJobs,
+        string? relaxClosedAnchorPosition = null)
     {
         if (candidatePositions.Count == 0 || candidateJobs.Count == 0)
         {
@@ -11369,6 +11456,10 @@ public sealed class RecruitmentModule : InteractionModuleBase<SocketInteractionC
             ? slots
                 .Where(slot =>
                     !string.IsNullOrWhiteSpace(slot.Job) &&
+                    !(!string.IsNullOrWhiteSpace(relaxClosedAnchorPosition) &&
+                      slot.IsClosed &&
+                      !slot.UserId.HasValue &&
+                      string.Equals(slot.Position, relaxClosedAnchorPosition, StringComparison.OrdinalIgnoreCase)) &&
                     ((slot.UserId.HasValue && slot.UserId.Value != userId) ||
                      (slot.IsClosed && !slot.UserId.HasValue)))
                 .Select(slot => slot.Job!.Trim().ToUpperInvariant())
@@ -11386,7 +11477,13 @@ public sealed class RecruitmentModule : InteractionModuleBase<SocketInteractionC
             var canAssignSomewhere = candidatePositions.Any(candidatePosition =>
             {
                 var target = slots.FirstOrDefault(slot => string.Equals(slot.Position, candidatePosition, StringComparison.OrdinalIgnoreCase));
-                if (target is null || target.IsClosed)
+                var treatClosedAnchorAsOpen =
+                    target is not null &&
+                    !string.IsNullOrWhiteSpace(relaxClosedAnchorPosition) &&
+                    target.IsClosed &&
+                    !target.UserId.HasValue &&
+                    string.Equals(target.Position, relaxClosedAnchorPosition, StringComparison.OrdinalIgnoreCase);
+                if (target is null || (target.IsClosed && !treatClosedAnchorAsOpen))
                 {
                     return false;
                 }
@@ -11507,6 +11604,17 @@ public sealed class RecruitmentModule : InteractionModuleBase<SocketInteractionC
 
     private static bool CanSelectPositionForExternalFillAsFlexAnchor(RecruitSlot targetSlot)
         => !targetSlot.UserId.HasValue && !targetSlot.IsClosed;
+
+    private static bool CanEditPrefilledPositionAfterCreate(RecruitPost post, RecruitSlot targetSlot)
+    {
+        if (targetSlot.UserId.HasValue)
+        {
+            // 主催枠はこの導線から上書きさせない（主催選択/管理メニュー側の責務）。
+            return targetSlot.UserId.Value != post.CreatorUserId;
+        }
+
+        return targetSlot.IsClosed;
+    }
 
     private static bool TryResolveExternalFillFlexAnchor(
         RecruitPost post,
