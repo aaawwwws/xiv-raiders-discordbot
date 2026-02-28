@@ -394,10 +394,7 @@ public sealed class FfLogsReportWatcherService
         var contentName = fight is not null && !string.IsNullOrWhiteSpace(fight.Name)
             ? fight.Name!
             : zoneName;
-        var time = FromUnixMs(fight?.EndTimeMs) ??
-                   FromUnixMs(fight?.StartTimeMs) ??
-                   item.Report.EndTime ??
-                   item.Report.StartTime;
+        var time = ResolveReportDisplayTime(item.Report, fight);
         var timeLine = time.HasValue
             ? $"🕒 時刻: <t:{time.Value.ToUnixTimeSeconds()}:F> (<t:{time.Value.ToUnixTimeSeconds()}:R>)"
             : "🕒 時刻: 不明";
@@ -432,16 +429,55 @@ public sealed class FfLogsReportWatcherService
     private static string BuildFightDedupeKey(string reportCode, int fightId)
         => $"{reportCode}#fight:{fightId}";
 
-    private static DateTimeOffset? FromUnixMs(long? unixMs)
+    private static DateTimeOffset? ResolveReportDisplayTime(FfLogsClient.RecentReport report, FfLogsClient.ReportFight? fight)
     {
-        if (!unixMs.HasValue || unixMs.Value <= 0)
+        var fightTime = ResolveFightTimeMs(report.StartTime, fight?.EndTimeMs) ??
+                        ResolveFightTimeMs(report.StartTime, fight?.StartTimeMs);
+        return fightTime ?? report.EndTime ?? report.StartTime;
+    }
+
+    private static DateTimeOffset? ResolveFightTimeMs(DateTimeOffset? reportStart, long? rawMs)
+    {
+        if (!rawMs.HasValue || rawMs.Value <= 0)
+        {
+            return null;
+        }
+
+        const long unixMsYear2000 = 946684800000L;
+        const long unixMsYear2100 = 4102444800000L;
+        var value = rawMs.Value;
+
+        // FFLogs fights は Unix ms の場合と report 開始からの offset(ms) の場合がある。
+        if (value >= unixMsYear2000 && value <= unixMsYear2100)
+        {
+            return TryFromUnixMs(value);
+        }
+
+        if (reportStart.HasValue)
+        {
+            try
+            {
+                return reportStart.Value.AddMilliseconds(value);
+            }
+            catch
+            {
+                // Fall through to unix attempt below.
+            }
+        }
+
+        return TryFromUnixMs(value);
+    }
+
+    private static DateTimeOffset? TryFromUnixMs(long unixMs)
+    {
+        if (unixMs <= 0)
         {
             return null;
         }
 
         try
         {
-            return DateTimeOffset.FromUnixTimeMilliseconds(unixMs.Value);
+            return DateTimeOffset.FromUnixTimeMilliseconds(unixMs);
         }
         catch
         {

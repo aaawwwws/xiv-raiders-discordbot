@@ -132,6 +132,8 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
     private static readonly TimeSpan MemberManageContextTimeout = TimeSpan.FromMinutes(15);
     private static readonly TimeSpan MemberManageLookbackPreferenceTimeout = TimeSpan.FromHours(12);
     private static readonly HttpClient VoiceChartImageHttpClient = CreateVoiceChartImageHttpClient();
+    private static readonly FontCollection VoiceChartFontFileCollection = new();
+    private static readonly IReadOnlyList<FontFamily> VoiceChartFileFamilies = LoadVoiceChartFileFamilies();
 
     public AdminControlPanelModule(
         Db db,
@@ -7913,7 +7915,7 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
 
     private static Font ResolveChartFont(float size, FontStyle style)
     {
-        var preferred = new[]
+        var preferredExactJapanese = new[]
         {
             "Yu Gothic UI",
             "Meiryo",
@@ -7925,10 +7927,7 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
             "IPAGothic",
             "TakaoPGothic",
             "Hiragino Sans",
-            "MS Gothic",
-            "Segoe UI",
-            "Arial Unicode MS",
-            "Arial"
+            "MS Gothic"
         };
 
         // CentOS での family 名差分（weight/suffix 付き）にも対応するため、
@@ -7937,6 +7936,8 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
         {
             "Noto Sans CJK JP",
             "Noto Sans JP",
+            "Noto Sans CJ JP",
+            "Noto Sans CJ",
             "Noto Serif CJK JP",
             "Noto Serif JP",
             "Source Han Sans",
@@ -7977,7 +7978,7 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
 
         var tried = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        foreach (var familyName in preferred)
+        foreach (var familyName in preferredExactJapanese)
         {
             if (!SystemFonts.TryGet(familyName, out var family))
             {
@@ -8010,6 +8011,40 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
             }
         }
 
+        foreach (var family in VoiceChartFileFamilies)
+        {
+            if (!tried.Add(family.Name))
+            {
+                continue;
+            }
+
+            if (TryCreate(family, size, style, out var fileFont))
+            {
+                return fileFont;
+            }
+        }
+
+        var preferredGeneric = new[]
+        {
+            "Segoe UI",
+            "Arial Unicode MS",
+            "Arial",
+            "Liberation Sans",
+            "DejaVu Sans"
+        };
+        foreach (var familyName in preferredGeneric)
+        {
+            if (!SystemFonts.TryGet(familyName, out var family) || !tried.Add(family.Name))
+            {
+                continue;
+            }
+
+            if (TryCreate(family, size, style, out var genericFont))
+            {
+                return genericFont;
+            }
+        }
+
         foreach (var family in SystemFonts.Collection.Families)
         {
             if (!tried.Add(family.Name))
@@ -8024,6 +8059,48 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
         }
 
         throw new InvalidOperationException("No usable system fonts available.");
+    }
+
+    private static IReadOnlyList<FontFamily> LoadVoiceChartFileFamilies()
+    {
+        var loaded = new List<FontFamily>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var candidatePaths = new[]
+        {
+            "/usr/share/fonts/google-noto-sans-cjk-vf-fonts/NotoSansCJK-VF.ttc",
+            "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/noto-cjk-vf/NotoSansCJK-VF.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
+            "/usr/share/fonts/opentype/ipaexfont-gothic/ipaexg.ttf",
+            "/usr/share/fonts/ipa-gothic/ipag.ttf",
+            "/usr/share/fonts/vlgothic/VL-Gothic-Regular.ttf"
+        };
+
+        foreach (var path in candidatePaths)
+        {
+            if (!File.Exists(path))
+            {
+                continue;
+            }
+
+            try
+            {
+                var family = VoiceChartFontFileCollection.Add(path);
+                if (seen.Add(family.Name))
+                {
+                    loaded.Add(family);
+                }
+            }
+            catch
+            {
+                // Skip broken/unreadable font files.
+            }
+        }
+
+        return loaded;
     }
 
     private static HttpClient CreateVoiceChartImageHttpClient()
