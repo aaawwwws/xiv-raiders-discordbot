@@ -3745,7 +3745,7 @@ WHERE id = @PostId;";
         {
             await NormalizeParticipantFlexSlotsAsync(conn, tx, slots, recruitPositions, postInfo.CreatorUserId, disallowDuplicateJobs);
 
-            if (ShouldFixHostFlexToCurrentPosition(postInfo, slots, recruitPositions))
+            if (ShouldFixHostFlexToCurrentPosition(postInfo, slots, recruitPositions, disallowDuplicateJobs))
             {
                 await conn.ExecuteAsync(clearHostFlexSql, new { PostId = postId }, transaction: tx);
                 postInfo.HostFlexSpec = null;
@@ -3936,7 +3936,7 @@ WHERE id = @PostId;";
                     {
                         await NormalizeParticipantFlexSlotsAsync(conn, tx, slots, recruitPositions, postInfo.CreatorUserId, disallowDuplicateJobs);
 
-                        if (ShouldFixHostFlexToCurrentPosition(postInfo, slots, recruitPositions))
+                        if (ShouldFixHostFlexToCurrentPosition(postInfo, slots, recruitPositions, disallowDuplicateJobs))
                         {
                             await conn.ExecuteAsync(clearHostFlexSql, new { PostId = postId }, transaction: tx);
                             postInfo.HostFlexSpec = null;
@@ -4143,7 +4143,7 @@ WHERE id = @PostId;";
                     alternate.Comment = previousTargetComment;
                     alternate.IsClosed = false;
 
-                    if (ShouldFixHostFlexToCurrentPosition(postInfo, slots, recruitPositions))
+                    if (ShouldFixHostFlexToCurrentPosition(postInfo, slots, recruitPositions, disallowDuplicateJobs))
                     {
                         await conn.ExecuteAsync(clearHostFlexSql, new { PostId = postId }, transaction: tx);
                         postInfo.HostFlexSpec = null;
@@ -4176,7 +4176,7 @@ WHERE id = @PostId;";
             {
                 await NormalizeParticipantFlexSlotsAsync(conn, tx, slots, recruitPositions, postInfo.CreatorUserId, disallowDuplicateJobs);
 
-                if (ShouldFixHostFlexToCurrentPosition(postInfo, slots, recruitPositions))
+                if (ShouldFixHostFlexToCurrentPosition(postInfo, slots, recruitPositions, disallowDuplicateJobs))
                 {
                     await conn.ExecuteAsync(clearHostFlexSql, new { PostId = postId }, transaction: tx);
                     postInfo.HostFlexSpec = null;
@@ -4224,7 +4224,7 @@ WHERE id = @PostId;";
 
         await NormalizeParticipantFlexSlotsAsync(conn, tx, slots, recruitPositions, postInfo.CreatorUserId, disallowDuplicateJobs);
 
-        if (ShouldFixHostFlexToCurrentPosition(postInfo, slots, recruitPositions))
+        if (ShouldFixHostFlexToCurrentPosition(postInfo, slots, recruitPositions, disallowDuplicateJobs))
         {
             await conn.ExecuteAsync(clearHostFlexSql, new { PostId = postId }, transaction: tx);
             postInfo.HostFlexSpec = null;
@@ -7121,7 +7121,8 @@ WHERE id = @LotteryId
     private static bool ShouldFixHostFlexToCurrentPosition(
         RecruitPostLockInfo postInfo,
         IReadOnlyCollection<RecruitSlot> slots,
-        IReadOnlyCollection<string> recruitPositions)
+        IReadOnlyCollection<string> recruitPositions,
+        bool disallowDuplicateJobs)
     {
         var hostFlexPositions = ParseFlexPositions(postInfo.HostFlexSpec);
         if (hostFlexPositions.Count < 2)
@@ -7153,9 +7154,15 @@ WHERE id = @LotteryId
             return true;
         }
 
-        // Keep host FLEX unless the setting itself is invalid.
-        // Availability can temporarily drop to one due to other joins/closures.
-        return false;
+        // 実運用で割り当て可能な候補が1枠以下なら固定化する。
+        var assignableCount = CountAssignableFlexPositions(
+            slots,
+            recruitPositions,
+            hostFlexPositions,
+            hostJobs,
+            postInfo.CreatorUserId,
+            disallowDuplicateJobs);
+        return assignableCount < 2;
     }
 
     private static async Task NormalizeParticipantFlexSlotsAsync(
@@ -7195,9 +7202,9 @@ WHERE id = @Id;";
 
     private static bool ShouldFixParticipantFlexToCurrentPosition(
         RecruitSlot participantSlot,
-        IReadOnlyCollection<RecruitSlot> _slots,
-        IReadOnlyCollection<string> _recruitPositions,
-        bool _disallowDuplicateJobs)
+        IReadOnlyCollection<RecruitSlot> slots,
+        IReadOnlyCollection<string> recruitPositions,
+        bool disallowDuplicateJobs)
     {
         if (!participantSlot.UserId.HasValue)
         {
@@ -7225,9 +7232,80 @@ WHERE id = @Id;";
             return true;
         }
 
-        // Keep participant FLEX unless the setting itself is invalid.
-        // Availability can temporarily drop to one due to other joins/closures.
-        return false;
+        // 実運用で割り当て可能な候補が1枠以下なら固定化する。
+        var assignableCount = CountAssignableFlexPositions(
+            slots,
+            recruitPositions,
+            flexPositions,
+            participantJobs,
+            participantSlot.UserId.Value,
+            disallowDuplicateJobs);
+        return assignableCount < 2;
+    }
+
+    private static int CountAssignableFlexPositions(
+        IReadOnlyCollection<RecruitSlot> slots,
+        IReadOnlyCollection<string> recruitPositions,
+        IReadOnlyCollection<string> flexPositions,
+        IReadOnlyCollection<string> candidateJobs,
+        long userId,
+        bool disallowDuplicateJobs)
+    {
+        if (flexPositions.Count == 0 || candidateJobs.Count == 0)
+        {
+            return 0;
+        }
+
+        var normalizedJobs = candidateJobs
+            .Where(job => !string.IsNullOrWhiteSpace(job))
+            .Select(job => job.Trim().ToUpperInvariant())
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        if (normalizedJobs.Length == 0)
+        {
+            return 0;
+        }
+
+        var blockedJobs = disallowDuplicateJobs
+            ? slots
+                .Where(slot =>
+                    !string.IsNullOrWhiteSpace(slot.Job) &&
+                    ((slot.UserId.HasValue && slot.UserId.Value != userId) ||
+                     (slot.IsClosed && !slot.UserId.HasValue && ShouldReserveClosedSlotJobForDuplicateCheck(slot))))
+                .Select(slot => slot.Job!.Trim().ToUpperInvariant())
+                .ToHashSet(StringComparer.OrdinalIgnoreCase)
+            : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        var count = 0;
+        foreach (var candidatePosition in flexPositions
+                     .Where(position => !string.IsNullOrWhiteSpace(position))
+                     .Select(position => position.Trim().ToUpperInvariant())
+                     .Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            var target = slots.FirstOrDefault(slot =>
+                string.Equals(slot.Position, candidatePosition, StringComparison.OrdinalIgnoreCase));
+            if (target is null || target.IsClosed)
+            {
+                continue;
+            }
+
+            if (target.UserId.HasValue && target.UserId.Value != userId)
+            {
+                continue;
+            }
+
+            var canAssign = normalizedJobs.Any(job =>
+                (!disallowDuplicateJobs || !blockedJobs.Contains(job)) &&
+                IsJobAllowedForPosition(candidatePosition, job, recruitPositions) &&
+                (string.IsNullOrWhiteSpace(target.RequiredJob) ||
+                 string.Equals(target.RequiredJob, job, StringComparison.OrdinalIgnoreCase)));
+            if (canAssign)
+            {
+                count++;
+            }
+        }
+
+        return count;
     }
 
     private static async Task<bool> TryRebalanceFlexibleAssignmentsAsync(

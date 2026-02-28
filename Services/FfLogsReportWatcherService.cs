@@ -193,7 +193,8 @@ public sealed class FfLogsReportWatcherService
                 continue;
             }
 
-            await PostReportAsync(guild, item, fight: null);
+            var latestFight = await TryGetLatestFightForReportAsync(item.Report.Code, cancellationToken);
+            await PostReportAsync(guild, item, latestFight);
         }
     }
 
@@ -219,28 +220,60 @@ public sealed class FfLogsReportWatcherService
             return false;
         }
 
-        var orderedFights = fights
-            .OrderBy(f => f.EndTimeMs ?? f.StartTimeMs ?? long.MinValue)
-            .ThenBy(f => f.Id)
-            .ToArray();
-
-        foreach (var fight in orderedFights)
+        var latestFight = SelectLatestFight(fights);
+        if (latestFight is null)
         {
-            var dedupeKey = BuildFightDedupeKey(item.Report.Code, fight.Id);
-            var inserted = await _db.TryInsertFfLogsSeenReportAsync(
-                guild.Id,
-                dedupeKey,
-                DateTimeOffset.UtcNow,
-                item.Report.EndTime);
-            if (!inserted)
-            {
-                continue;
-            }
+            return false;
+        }
 
-            await PostReportAsync(guild, item, fight);
+        var dedupeKey = BuildFightDedupeKey(item.Report.Code, latestFight.Id);
+        var inserted = await _db.TryInsertFfLogsSeenReportAsync(
+            guild.Id,
+            dedupeKey,
+            DateTimeOffset.UtcNow,
+            item.Report.EndTime);
+        if (inserted)
+        {
+            await PostReportAsync(guild, item, latestFight);
         }
 
         return true;
+    }
+
+    private async Task<FfLogsClient.ReportFight?> TryGetLatestFightForReportAsync(string reportCode, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(reportCode))
+        {
+            return null;
+        }
+
+        try
+        {
+            var fights = await _fflogs.GetReportFightsAsync(reportCode, cancellationToken);
+            return SelectLatestFight(fights);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "FFLogs latest-fight fetch failed for report {ReportCode}. Falling back to report URL.", reportCode);
+            return null;
+        }
+    }
+
+    private static FfLogsClient.ReportFight? SelectLatestFight(IReadOnlyList<FfLogsClient.ReportFight> fights)
+    {
+        if (fights.Count == 0)
+        {
+            return null;
+        }
+
+        return fights
+            .OrderByDescending(f => f.EndTimeMs ?? f.StartTimeMs ?? long.MinValue)
+            .ThenByDescending(f => f.Id)
+            .FirstOrDefault();
     }
 
     private async Task<Dictionary<string, CharacterTarget>> BuildCharacterTargetsAsync(SocketGuild guild)
@@ -361,7 +394,10 @@ public sealed class FfLogsReportWatcherService
         var contentName = fight is not null && !string.IsNullOrWhiteSpace(fight.Name)
             ? fight.Name!
             : zoneName;
-        var time = item.Report.EndTime ?? item.Report.StartTime;
+        var time = FromUnixMs(fight?.EndTimeMs) ??
+                   FromUnixMs(fight?.StartTimeMs) ??
+                   item.Report.EndTime ??
+                   item.Report.StartTime;
         var timeLine = time.HasValue
             ? $"🕒 時刻: <t:{time.Value.ToUnixTimeSeconds()}:F> (<t:{time.Value.ToUnixTimeSeconds()}:R>)"
             : "🕒 時刻: 不明";
@@ -395,6 +431,23 @@ public sealed class FfLogsReportWatcherService
 
     private static string BuildFightDedupeKey(string reportCode, int fightId)
         => $"{reportCode}#fight:{fightId}";
+
+    private static DateTimeOffset? FromUnixMs(long? unixMs)
+    {
+        if (!unixMs.HasValue || unixMs.Value <= 0)
+        {
+            return null;
+        }
+
+        try
+        {
+            return DateTimeOffset.FromUnixTimeMilliseconds(unixMs.Value);
+        }
+        catch
+        {
+            return null;
+        }
+    }
 
     private async Task WarnMissingConfigurationAsync(SocketGuild guild)
     {

@@ -1458,23 +1458,17 @@ public sealed class RecruitmentModule : InteractionModuleBase<SocketInteractionC
             .Where(position => !string.IsNullOrWhiteSpace(position))
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToArray();
-        if (singleFlexPositions.Length != 2)
+        if (singleFlexPositions.Length < 2)
         {
             return null;
         }
 
         var singleJob = normalizedJobs[0];
-        var isSupportedSingleJobFlexPair =
-            (singleFlexPositions.Contains("D1", StringComparer.OrdinalIgnoreCase) &&
-             singleFlexPositions.Contains("D2", StringComparer.OrdinalIgnoreCase)) ||
-            (singleFlexPositions.Contains("MT", StringComparer.OrdinalIgnoreCase) &&
-             singleFlexPositions.Contains("ST", StringComparer.OrdinalIgnoreCase));
-        if (!isSupportedSingleJobFlexPair)
-        {
-            return null;
-        }
-
-        return singleFlexPositions.All(position => IsJobAllowedForPosition(position, singleJob, recruitPositions))
+        // 単一ジョブ時は、そのジョブで実際に入れる候補が2枠以上ある場合のみFLEXを保持する。
+        // 例: FLEX(H2/ST) + 学 は H2 のみ有効なので固定化する。
+        var assignableCount = singleFlexPositions.Count(position =>
+            IsJobAllowedForPosition(position, singleJob, recruitPositions));
+        return assignableCount >= 2
             ? normalizedFlexSpec
             : null;
     }
@@ -11464,15 +11458,18 @@ public sealed class RecruitmentModule : InteractionModuleBase<SocketInteractionC
         return string.Join('\n', lines);
     }
 
-    private readonly record struct FlexDisplayAnalysis(
-        string DisplayFlexSpec,
-        IReadOnlyList<string> CandidateJobs,
-        IReadOnlyList<string> DisplayJobs,
-        int AssignablePositionCount,
-        bool CanRelocateClosedAnchor)
-    {
-        public bool IsDisplayable => CanRelocateClosedAnchor && AssignablePositionCount >= 2;
-    }
+private readonly record struct FlexDisplayAnalysis(
+    string DisplayFlexSpec,
+    IReadOnlyList<string> CandidateJobs,
+    IReadOnlyList<string> DisplayJobs,
+    int AssignablePositionCount,
+    bool CanRelocateClosedAnchor)
+{
+    public bool IsDisplayable =>
+        CanRelocateClosedAnchor &&
+        (AssignablePositionCount >= 2 ||
+         DisplayFlexSpec.Contains(',', StringComparison.Ordinal));
+}
 
     private readonly record struct ActiveRecruitSlotDisplaySummary(
         string PositionLabel,

@@ -317,6 +317,89 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
     }
 
     [RequireBotAdmin]
+    [ComponentInteraction(AdminControlPanel.OpenMonitoringCategoryCustomId, ignoreGroupNames: true)]
+    public async Task OpenMonitoringCategoryMenuAsync()
+    {
+        if (Context.Guild is null)
+        {
+            await RespondAsync("この操作はサーバー内でのみ使えます。", ephemeral: true);
+            return;
+        }
+
+        await RespondAsync(
+            "監視/統計メニュー",
+            components: AdminControlPanel.BuildMonitoringCategoryComponents(),
+            ephemeral: true);
+    }
+
+    [RequireBotAdmin]
+    [ComponentInteraction(AdminControlPanel.OpenMemberOpsCategoryCustomId, ignoreGroupNames: true)]
+    public async Task OpenMemberOpsCategoryMenuAsync()
+    {
+        if (Context.Guild is null)
+        {
+            await RespondAsync("この操作はサーバー内でのみ使えます。", ephemeral: true);
+            return;
+        }
+
+        await RespondAsync(
+            "メンバー運用メニュー",
+            components: AdminControlPanel.BuildMemberOpsCategoryComponents(),
+            ephemeral: true);
+    }
+
+    [RequireBotAdmin]
+    [ComponentInteraction(AdminControlPanel.OpenSettingsCategoryCustomId, ignoreGroupNames: true)]
+    public async Task OpenSettingsCategoryMenuAsync()
+    {
+        if (Context.Guild is null)
+        {
+            await RespondAsync("この操作はサーバー内でのみ使えます。", ephemeral: true);
+            return;
+        }
+
+        var settings = await _db.GetGuildSettingsAsync(Context.Guild.Id);
+        var approvalRequired = settings?.RegistrationApprovalRequired ?? true;
+        var inactiveAutoKickEnabled = settings?.InactiveAutoKickEnabled ?? _options.InactiveAutoKickEnabled;
+        await RespondAsync(
+            "設定/保守メニュー",
+            components: AdminControlPanel.BuildSettingsCategoryComponents(approvalRequired, inactiveAutoKickEnabled),
+            ephemeral: true);
+    }
+
+    [RequireBotAdmin]
+    [ComponentInteraction(AdminControlPanel.OpenMaintenanceCategoryCustomId, ignoreGroupNames: true)]
+    public async Task OpenMaintenanceCategoryMenuAsync()
+    {
+        if (Context.Guild is null)
+        {
+            await RespondAsync("この操作はサーバー内でのみ使えます。", ephemeral: true);
+            return;
+        }
+
+        await RespondAsync(
+            "補助/エクスポートメニュー",
+            components: AdminControlPanel.BuildMaintenanceCategoryComponents(),
+            ephemeral: true);
+    }
+
+    [RequireBotAdmin]
+    [ComponentInteraction(AdminControlPanel.OpenSpecialCategoryCustomId, ignoreGroupNames: true)]
+    public async Task OpenSpecialCategoryMenuAsync()
+    {
+        if (Context.Guild is null)
+        {
+            await RespondAsync("この操作はサーバー内でのみ使えます。", ephemeral: true);
+            return;
+        }
+
+        await RespondAsync(
+            "管理機能メニュー",
+            components: AdminControlPanel.BuildSpecialCategoryComponents(),
+            ephemeral: true);
+    }
+
+    [RequireBotAdmin]
     [ComponentInteraction(AdminControlPanel.HealthCheckCustomId, ignoreGroupNames: true)]
     public async Task HealthByButtonAsync()
     {
@@ -3046,10 +3129,13 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
         var refreshedSettings = await _db.GetGuildSettingsAsync(Context.Guild.Id);
         var approvalRequired = refreshedSettings?.RegistrationApprovalRequired ?? true;
         var inactiveAutoKickEnabled = refreshedSettings?.InactiveAutoKickEnabled ?? _options.InactiveAutoKickEnabled;
-        if (Context.Interaction is SocketMessageComponent component && component.Message is IUserMessage message)
+        if (Context.Interaction is SocketMessageComponent component &&
+            component.Message is IUserMessage message &&
+            LooksLikeAdminControlPanelMessage(message))
         {
             await ApplyAdminControlPanelStateAsync(message, approvalRequired, inactiveAutoKickEnabled);
         }
+        await RefreshStoredAdminControlPanelStateAsync(approvalRequired, inactiveAutoKickEnabled);
 
         await FollowupAsync(
             approvalRequired
@@ -3097,10 +3183,13 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
         var refreshedSettings = await _db.GetGuildSettingsAsync(Context.Guild.Id);
         var approvalRequired = refreshedSettings?.RegistrationApprovalRequired ?? true;
         var inactiveAutoKickEnabled = refreshedSettings?.InactiveAutoKickEnabled ?? _options.InactiveAutoKickEnabled;
-        if (Context.Interaction is SocketMessageComponent component && component.Message is IUserMessage message)
+        if (Context.Interaction is SocketMessageComponent component &&
+            component.Message is IUserMessage message &&
+            LooksLikeAdminControlPanelMessage(message))
         {
             await ApplyAdminControlPanelStateAsync(message, approvalRequired, inactiveAutoKickEnabled);
         }
+        await RefreshStoredAdminControlPanelStateAsync(approvalRequired, inactiveAutoKickEnabled);
 
         await FollowupAsync(
             inactiveAutoKickEnabled
@@ -5682,6 +5771,53 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
         });
     }
 
+    private async Task RefreshStoredAdminControlPanelStateAsync(bool approvalRequired, bool inactiveAutoKickEnabled)
+    {
+        if (Context.Guild is null)
+        {
+            return;
+        }
+
+        var panel = await _db.GetGuildAdminControlPanelAsync(Context.Guild.Id);
+        if (panel is null || panel.ChannelId == 0 || panel.MessageId == 0)
+        {
+            return;
+        }
+
+        var channel = Context.Guild.GetTextChannel(ToUlong(panel.ChannelId));
+        if (channel is null)
+        {
+            return;
+        }
+
+        try
+        {
+            var message = await channel.GetMessageAsync(ToUlong(panel.MessageId)) as IUserMessage;
+            if (message is null)
+            {
+                return;
+            }
+
+            await ApplyAdminControlPanelStateAsync(message, approvalRequired, inactiveAutoKickEnabled);
+        }
+        catch
+        {
+        }
+    }
+
+    private static bool LooksLikeAdminControlPanelMessage(IUserMessage message)
+    {
+        foreach (var embed in message.Embeds)
+        {
+            if (string.Equals(embed.Title, "ADMIN設定パネル", StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     private static Embed BuildAdminStatusEmbed(bool approvalRequired, bool inactiveAutoKickEnabled)
         => AdminControlPanel.BuildStatusEmbed(approvalRequired, inactiveAutoKickEnabled);
 
@@ -7795,6 +7931,52 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
             "Arial"
         };
 
+        // CentOS での family 名差分（weight/suffix 付き）にも対応するため、
+        // まず厳密一致、次に部分一致で日本語向けフォントを優先的に探す。
+        var preferredContains = new[]
+        {
+            "Noto Sans CJK JP",
+            "Noto Sans JP",
+            "Noto Serif CJK JP",
+            "Noto Serif JP",
+            "Source Han Sans",
+            "Source Han Serif",
+            "IPAexGothic",
+            "IPAGothic",
+            "Takao",
+            "VL Gothic",
+            "WenQuanYi",
+            "Droid Sans Fallback",
+            "Yu Gothic",
+            "Meiryo",
+            "Hiragino",
+            "MS Gothic"
+        };
+
+        static bool TryCreate(FontFamily family, float targetSize, FontStyle targetStyle, out Font font)
+        {
+            try
+            {
+                font = family.CreateFont(targetSize, targetStyle);
+                return true;
+            }
+            catch
+            {
+                try
+                {
+                    font = family.CreateFont(targetSize, FontStyle.Regular);
+                    return true;
+                }
+                catch
+                {
+                    font = default!;
+                    return false;
+                }
+            }
+        }
+
+        var tried = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
         foreach (var familyName in preferred)
         {
             if (!SystemFonts.TryGet(familyName, out var family))
@@ -7802,39 +7984,42 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
                 continue;
             }
 
-            try
+            if (!tried.Add(family.Name))
             {
-                return family.CreateFont(size, style);
+                continue;
             }
-            catch
+
+            if (TryCreate(family, size, style, out var preferredFont))
             {
-                try
-                {
-                    return family.CreateFont(size, FontStyle.Regular);
-                }
-                catch
-                {
-                    // Try next family.
-                }
+                return preferredFont;
+            }
+        }
+
+        foreach (var pattern in preferredContains)
+        {
+            var family = SystemFonts.Collection.Families.FirstOrDefault(candidate =>
+                candidate.Name.Contains(pattern, StringComparison.OrdinalIgnoreCase));
+            if (string.IsNullOrWhiteSpace(family.Name) || !tried.Add(family.Name))
+            {
+                continue;
+            }
+
+            if (TryCreate(family, size, style, out var containsFont))
+            {
+                return containsFont;
             }
         }
 
         foreach (var family in SystemFonts.Collection.Families)
         {
-            try
+            if (!tried.Add(family.Name))
             {
-                return family.CreateFont(size, style);
+                continue;
             }
-            catch
+
+            if (TryCreate(family, size, style, out var fallbackFont))
             {
-                try
-                {
-                    return family.CreateFont(size, FontStyle.Regular);
-                }
-                catch
-                {
-                    // Try next family.
-                }
+                return fallbackFont;
             }
         }
 
