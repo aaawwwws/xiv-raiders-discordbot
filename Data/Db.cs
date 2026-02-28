@@ -7154,6 +7154,12 @@ WHERE id = @LotteryId
             return true;
         }
 
+        // 複数ジョブFLEXは、他メンバーの一時的なジョブ重複状態でも将来的に再配置可能なため維持する。
+        if (hostJobs.Count >= 2)
+        {
+            return false;
+        }
+
         // 実運用で割り当て可能な候補が1枠以下なら固定化する。
         var assignableCount = CountAssignableFlexPositions(
             slots,
@@ -7230,6 +7236,12 @@ WHERE id = @Id;";
         if (participantJobs.Count == 0)
         {
             return true;
+        }
+
+        // 複数ジョブFLEXは、他メンバーの一時的なジョブ重複状態でも将来的に再配置可能なため維持する。
+        if (participantJobs.Count >= 2)
+        {
+            return false;
         }
 
         // 実運用で割り当て可能な候補が1枠以下なら固定化する。
