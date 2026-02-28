@@ -1,6 +1,7 @@
 using Discord;
 using Discord.WebSocket;
 using System.Globalization;
+using Microsoft.Extensions.Logging;
 using RaidDcBot.Data;
 using RaidDcBot.Models;
 
@@ -8,9 +9,13 @@ namespace RaidDcBot.Services;
 
 public sealed class VoiceStatsService {
     private readonly Db _db;
+    private readonly ILogger<VoiceStatsService> _logger;
+    public const string RankingMetricVoiceDuration = "voice_duration";
+    public const string RankingMetricMessageCount = "message_count";
 
-    public VoiceStatsService(Db db) {
+    public VoiceStatsService(Db db, ILogger<VoiceStatsService> logger) {
         _db = db;
+        _logger = logger;
     }
 
     public async Task<Embed> BuildWeeklyRankingEmbedAsync(SocketGuild guild, DateTimeOffset nowUtc, int rangeDays, int topCount) {
@@ -23,7 +28,8 @@ public sealed class VoiceStatsService {
         DateTimeOffset fromUtc,
         DateTimeOffset toUtc,
         int topCount,
-        string title) {
+        string title,
+        bool recordAwards = true) {
         if (toUtc <= fromUtc) {
             toUtc = fromUtc.AddMinutes(1);
         }
@@ -50,6 +56,10 @@ public sealed class VoiceStatsService {
             }
 
             if (!IsAdminCategoryChannel(guild, guildChannel)) {
+                if (IsVoiceTextMessageChannel(guild, channelId)) {
+                    continue;
+                }
+
                 nonAdminMessageCounts[userId] = nonAdminMessageCounts.TryGetValue(userId, out var prev)
                     ? prev + row.MessageCount
                     : row.MessageCount;
@@ -132,12 +142,74 @@ public sealed class VoiceStatsService {
             .ThenBy(x => x.Key)
             .Take(reactionReceivedTopLimit)
             .ToList();
+        var bestRanksByUser = new Dictionary<ulong, int>();
+        for (var i = 0; i < vcTop.Count; i++)
+        {
+            UpdateBestRank(bestRanksByUser, unchecked((ulong)vcTop[i].UserId), i + 1);
+        }
+        for (var i = 0; i < messageTop.Count; i++)
+        {
+            UpdateBestRank(bestRanksByUser, messageTop[i].Key, i + 1);
+        }
+        for (var i = 0; i < reactionGivenTop.Count; i++)
+        {
+            UpdateBestRank(bestRanksByUser, reactionGivenTop[i].Key, i + 1);
+        }
+        for (var i = 0; i < reactionReceivedTop.Count; i++)
+        {
+            UpdateBestRank(bestRanksByUser, reactionReceivedTop[i].Key, i + 1);
+        }
         var totalMessages = Math.Max(0, nonAdminMessageCounts.Values.Sum());
         var reactorUserCount = nonAdminReactionGivenCounts.Count;
         var reactedUserCount = nonAdminReactionReceivedCounts.Count;
 
         var fromJst = fromUtc.ToOffset(TimeSpan.FromHours(9));
         var toJst = toUtc.ToOffset(TimeSpan.FromHours(9));
+        var rankingAwardKey = ResolveRankingAwardKey(title, fromJst, toJst);
+        if (recordAwards && !string.IsNullOrWhiteSpace(rankingAwardKey))
+        {
+            try
+            {
+                var rankedUserIds = bestRanksByUser.Keys.ToArray();
+                if (rankedUserIds.Length > 0)
+                {
+                    await _db.RecordActivityRankingAwardsAsync(guild.Id, rankingAwardKey, rankedUserIds, bestRanksByUser);
+                }
+
+                var vcRankedUserIds = vcTop
+                    .Select(row => unchecked((ulong)row.UserId))
+                    .Where(id => id != 0)
+                    .Distinct()
+                    .ToArray();
+                if (vcRankedUserIds.Length > 0)
+                {
+                    await _db.RecordActivityRankingMetricAwardsAsync(
+                        guild.Id,
+                        rankingAwardKey,
+                        RankingMetricVoiceDuration,
+                        vcRankedUserIds);
+                }
+
+                var messageRankedUserIds = messageTop
+                    .Select(row => row.Key)
+                    .Where(id => id != 0)
+                    .Distinct()
+                    .ToArray();
+                if (messageRankedUserIds.Length > 0)
+                {
+                    await _db.RecordActivityRankingMetricAwardsAsync(
+                        guild.Id,
+                        rankingAwardKey,
+                        RankingMetricMessageCount,
+                        messageRankedUserIds);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to record activity ranking awards. GuildId={GuildId}, Key={RankingAwardKey}", guild.Id, rankingAwardKey);
+            }
+        }
+
         var period = $"{fromJst:MM/dd HH:mm} - {toJst:MM/dd HH:mm} (JST)";
         var embedTitle = ResolveRankingTitle(title, fromJst, toJst);
         var color = ResolveRankingColor(title);
@@ -255,6 +327,21 @@ public sealed class VoiceStatsService {
         return BuildThemedTitle(rawTitle);
     }
 
+    private static string? ResolveRankingAwardKey(string rawTitle, DateTimeOffset fromJst, DateTimeOffset toJst)
+    {
+        if (rawTitle.Contains("今日", StringComparison.Ordinal))
+        {
+            return $"daily:{toJst:yyyyMMdd}";
+        }
+
+        if (rawTitle.Contains("週", StringComparison.Ordinal))
+        {
+            return $"weekly:{fromJst:yyyyMMdd}-{toJst:yyyyMMdd}";
+        }
+
+        return null;
+    }
+
     private static Color ResolveRankingColor(string title)
     {
         if (title.Contains("今日", StringComparison.Ordinal))
@@ -285,6 +372,22 @@ public sealed class VoiceStatsService {
 
     private static string BuildMessageLink(ulong guildId, ulong channelId, ulong messageId)
         => $"https://discord.com/channels/{guildId}/{channelId}/{messageId}";
+
+    private static void UpdateBestRank(IDictionary<ulong, int> bestRanksByUser, ulong userId, int rank)
+    {
+        if (userId == 0 || rank <= 0)
+        {
+            return;
+        }
+
+        if (bestRanksByUser.TryGetValue(userId, out var current))
+        {
+            bestRanksByUser[userId] = Math.Min(current, rank);
+            return;
+        }
+
+        bestRanksByUser[userId] = rank;
+    }
 
     private static string JoinLinesWithinLimit(IReadOnlyList<string> lines, int maxLength = 1024)
     {
@@ -367,5 +470,26 @@ public sealed class VoiceStatsService {
 
         return categoryName.Contains("admin", StringComparison.OrdinalIgnoreCase) ||
                categoryName.Contains("管理", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsVoiceTextMessageChannel(SocketGuild guild, ulong channelId)
+    {
+        var channel = guild.GetChannel(channelId);
+        if (channel is null)
+        {
+            return false;
+        }
+
+        if (channel is SocketVoiceChannel)
+        {
+            return true;
+        }
+
+        if (channel is SocketThreadChannel thread && thread.ParentChannel is SocketVoiceChannel)
+        {
+            return true;
+        }
+
+        return false;
     }
 }

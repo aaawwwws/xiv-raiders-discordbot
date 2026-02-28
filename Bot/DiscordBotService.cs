@@ -33,6 +33,7 @@ public sealed class DiscordBotService : IHostedService
     private readonly RuntimeTuningService _runtimeTuning;
     private readonly StatsEmbedService _stats;
     private readonly VoiceStatsService _voiceStats;
+    private readonly FfLogsReportWatcherService _fflogsWatcher;
     private readonly string? _attachmentArchiveRootPath;
     private readonly ConcurrentDictionary<ulong, byte> _tempVoiceChannelIds = new();
     private readonly ConcurrentDictionary<ulong, CancellationTokenSource> _tempVoiceDeleteTokens = new();
@@ -53,6 +54,8 @@ public sealed class DiscordBotService : IHostedService
     private Task? _recruitScheduleTask;
     private CancellationTokenSource? _activityRoleSyncCts;
     private Task? _activityRoleSyncTask;
+    private CancellationTokenSource? _fflogsPollingCts;
+    private Task? _fflogsPollingTask;
 
     public DiscordBotService(
         DiscordSocketClient client,
@@ -68,7 +71,8 @@ public sealed class DiscordBotService : IHostedService
         RuntimeDiagnosticsService runtimeDiagnostics,
         RuntimeTuningService runtimeTuning,
         StatsEmbedService stats,
-        VoiceStatsService voiceStats)
+        VoiceStatsService voiceStats,
+        FfLogsReportWatcherService fflogsWatcher)
     {
         _client = client;
         _interactions = interactions;
@@ -84,6 +88,7 @@ public sealed class DiscordBotService : IHostedService
         _runtimeTuning = runtimeTuning;
         _stats = stats;
         _voiceStats = voiceStats;
+        _fflogsWatcher = fflogsWatcher;
         _attachmentArchiveRootPath = ResolveAttachmentArchiveRootPath(_options);
     }
 
@@ -105,6 +110,7 @@ public sealed class DiscordBotService : IHostedService
         await _db.BackfillRecruitSlotFlexJobsSpecAsync();
         await _db.EnsureDiscordUserProfileCharacterColumnsAsync();
         await _db.EnsureDiscordUserVoiceNotificationColumnAsync();
+        await _db.EnsureDiscordUserVoiceTextAutoDeleteColumnsAsync();
         await _db.EnsureGuildLodestonePanelTableAsync();
         await _db.EnsureLodestoneCharacterExtrasCacheColumnsAsync();
         await _db.EnsureGuildAdminControlPanelTableAsync();
@@ -112,7 +118,13 @@ public sealed class DiscordBotService : IHostedService
         await _db.EnsureGuildStatsPanelTableAsync();
         await _db.EnsureGuildDailyActivityPanelTableAsync();
         await _db.EnsureGuildWeeklyActivityPanelTableAsync();
+        await _db.EnsureActivityRankingAwardsTableAsync();
+        await _db.EnsureActivityRankingMetricAwardsTableAsync();
+        await _db.EnsureAdminMemberNotesTableAsync();
+        await _db.EnsureAdminMemberModerationActionsTableAsync();
         await _db.EnsureInquiryTicketsTableAsync();
+        await _db.EnsureFfLogsSeenReportsTableAsync();
+        await _db.EnsureSsAlbumFavoritesTableAsync();
         await _db.EnsureLotteryTablesAsync();
         await _db.EnsureGuildSettingsColumnsAsync();
         await _db.EnsureRecruitTemplatesTableAsync();
@@ -142,6 +154,8 @@ public sealed class DiscordBotService : IHostedService
         _recruitScheduleTask = Task.Run(() => RecruitScheduleLoopAsync(_recruitScheduleCts.Token), _recruitScheduleCts.Token);
         _activityRoleSyncCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         _activityRoleSyncTask = Task.Run(() => ActivityRoleSyncLoopAsync(_activityRoleSyncCts.Token), _activityRoleSyncCts.Token);
+        _fflogsPollingCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        _fflogsPollingTask = Task.Run(() => FfLogsPollingLoopAsync(_fflogsPollingCts.Token), _fflogsPollingCts.Token);
 
         await _client.LoginAsync(TokenType.Bot, _options.Token);
         await _client.StartAsync();
@@ -150,6 +164,7 @@ public sealed class DiscordBotService : IHostedService
     private async Task RestoreRuntimeTuningAsync()
     {
         var persisted = await _db.GetLatestGuildRuntimeTuningAsync();
+        var current = _runtimeTuning.GetSnapshot();
         if (persisted is null ||
             !persisted.RuntimeCleanupIntervalMinutes.HasValue ||
             !persisted.RuntimeRecruitClosedRetentionHours.HasValue ||
@@ -161,14 +176,20 @@ public sealed class DiscordBotService : IHostedService
         var updated = _runtimeTuning.Update(
             persisted.RuntimeCleanupIntervalMinutes.Value,
             persisted.RuntimeRecruitClosedRetentionHours.Value,
-            persisted.RuntimeRecruitCanceledRetentionHours.Value);
+            persisted.RuntimeRecruitCanceledRetentionHours.Value,
+            persisted.RuntimeMessageLogRetentionDays ?? current.MessageLogRetentionDays,
+            persisted.RuntimeVoiceSessionRetentionDays ?? current.VoiceSessionRetentionDays,
+            persisted.RuntimeReactionLogRetentionDays ?? current.ReactionLogRetentionDays);
 
         _logger.LogInformation(
-            "Restored runtime tuning from DB. GuildId={GuildId}, CleanupIntervalMinutes={CleanupIntervalMinutes}, RecruitClosedRetentionHours={RecruitClosedRetentionHours}, RecruitCanceledRetentionHours={RecruitCanceledRetentionHours}, RuntimeTuningUpdatedAt={RuntimeTuningUpdatedAt}",
+            "Restored runtime tuning from DB. GuildId={GuildId}, CleanupIntervalMinutes={CleanupIntervalMinutes}, RecruitClosedRetentionHours={RecruitClosedRetentionHours}, RecruitCanceledRetentionHours={RecruitCanceledRetentionHours}, MessageLogRetentionDays={MessageLogRetentionDays}, VoiceSessionRetentionDays={VoiceSessionRetentionDays}, ReactionLogRetentionDays={ReactionLogRetentionDays}, RuntimeTuningUpdatedAt={RuntimeTuningUpdatedAt}",
             persisted.GuildId,
             updated.CleanupIntervalMinutes,
             updated.RecruitClosedRetentionHours,
             updated.RecruitCanceledRetentionHours,
+            updated.MessageLogRetentionDays,
+            updated.VoiceSessionRetentionDays,
+            updated.ReactionLogRetentionDays,
             persisted.RuntimeTuningUpdatedAt);
 
         _runtimeDiagnostics.Mark(
@@ -221,6 +242,22 @@ public sealed class DiscordBotService : IHostedService
             try
             {
                 await _activityRoleSyncTask;
+            }
+            catch (OperationCanceledException)
+            {
+            }
+        }
+
+        if (_fflogsPollingCts is not null)
+        {
+            _fflogsPollingCts.Cancel();
+        }
+
+        if (_fflogsPollingTask is not null)
+        {
+            try
+            {
+                await _fflogsPollingTask;
             }
             catch (OperationCanceledException)
             {
@@ -387,8 +424,34 @@ public sealed class DiscordBotService : IHostedService
             _ => LogLevel.Information
         };
 
+        if (IsIgnorableGatewayUnknownChannelWarning(message))
+        {
+            level = LogLevel.Debug;
+        }
+
         _logger.Log(level, message.Exception, "{Source}: {Message}", message.Source, message.Message);
         return Task.CompletedTask;
+    }
+
+    private static bool IsIgnorableGatewayUnknownChannelWarning(LogMessage message)
+    {
+        if (message.Severity != LogSeverity.Warning)
+        {
+            return false;
+        }
+
+        if (!string.Equals(message.Source, "Gateway", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var text = message.Message ?? string.Empty;
+        if (!text.StartsWith("Unknown Channel", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        return text.Contains("THREAD_MEMBERS_UPDATE", StringComparison.OrdinalIgnoreCase);
     }
 
     private async Task LogCommandExecutionAsync(SocketInteractionContext context, IResult result)
@@ -543,17 +606,19 @@ public sealed class DiscordBotService : IHostedService
 
     private async Task RunCleanupAsync()
     {
+        var tuning = _runtimeTuning.GetSnapshot();
+
         try
         {
-            if (_options.MessageLogRetentionDays > 0)
+            if (tuning.MessageLogRetentionDays > 0)
             {
-                var deleted = await _db.CleanupMessageLogsAsync(_options.MessageLogRetentionDays);
+                var deleted = await _db.CleanupMessageLogsAsync(tuning.MessageLogRetentionDays);
                 if (deleted > 0)
                 {
                     _logger.LogInformation("Cleaned up {Count} message logs.", deleted);
                 }
 
-                var removedFiles = CleanupArchivedAttachmentFiles(_options.MessageLogRetentionDays);
+                var removedFiles = CleanupArchivedAttachmentFiles(tuning.MessageLogRetentionDays);
                 if (removedFiles > 0)
                 {
                     _logger.LogInformation("Cleaned up {Count} archived attachment files.", removedFiles);
@@ -567,9 +632,9 @@ public sealed class DiscordBotService : IHostedService
 
         try
         {
-            if (_options.VoiceSessionRetentionDays > 0)
+            if (tuning.VoiceSessionRetentionDays > 0)
             {
-                var deleted = await _db.CleanupVoiceSessionsAsync(_options.VoiceSessionRetentionDays);
+                var deleted = await _db.CleanupVoiceSessionsAsync(tuning.VoiceSessionRetentionDays);
                 if (deleted > 0)
                 {
                     _logger.LogInformation("Cleaned up {Count} voice sessions.", deleted);
@@ -583,13 +648,9 @@ public sealed class DiscordBotService : IHostedService
 
         try
         {
-            var reactionRetentionDays = _options.MessageLogRetentionDays > 0
-                ? Math.Max(_options.MessageLogRetentionDays, Math.Max(0, _options.InactiveAutoKickDays))
-                : 0;
-
-            if (reactionRetentionDays > 0)
+            if (tuning.ReactionLogRetentionDays > 0)
             {
-                var deleted = await _db.CleanupReactionLogsAsync(reactionRetentionDays);
+                var deleted = await _db.CleanupReactionLogsAsync(tuning.ReactionLogRetentionDays);
                 if (deleted > 0)
                 {
                     _logger.LogInformation("Cleaned up {Count} reaction logs.", deleted);
@@ -675,6 +736,42 @@ public sealed class DiscordBotService : IHostedService
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Failed to sync activity roles in periodic loop.");
+        }
+    }
+
+    private async Task FfLogsPollingLoopAsync(CancellationToken token)
+    {
+        var interval = TimeSpan.FromSeconds(_fflogsWatcher.GetPollIntervalSeconds());
+
+        while (!token.IsCancellationRequested)
+        {
+            try
+            {
+                await _fflogsWatcher.RunTickAsync(_client.Guilds, token);
+                _runtimeDiagnostics.Mark("loop.fflogs_polling", success: true, note: $"interval={interval.TotalSeconds:0}s");
+            }
+            catch (TaskCanceledException)
+            {
+                return;
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed in FFLogs polling loop.");
+                _runtimeDiagnostics.Mark("loop.fflogs_polling", success: false, note: ex.GetType().Name);
+            }
+
+            try
+            {
+                await Task.Delay(interval, token);
+            }
+            catch (TaskCanceledException)
+            {
+                return;
+            }
         }
     }
 
@@ -3189,26 +3286,7 @@ public sealed class DiscordBotService : IHostedService
         };
 
     private static Embed BuildAdminPanelStatusEmbed(bool approvalRequired, bool inactiveAutoKickEnabled)
-    {
-        var stateText = approvalRequired ? "必要" : "不要";
-        var note = approvalRequired
-            ? "申請は登録確認チャンネルで管理者が許可/拒否します。"
-            : "申請送信時に即時でメンバーロールを付与します。";
-        var autoKickText = inactiveAutoKickEnabled ? "ON" : "OFF";
-        var autoKickNote = inactiveAutoKickEnabled
-            ? "毎日 00:00 (JST) に30日非アクティブのユーザーを判定して自動キックします。(メッセージ / VC / リアクション)"
-            : "30日非アクティブ自動キックは無効です。";
-
-        return new EmbedBuilder()
-            .WithTitle("ADMIN設定")
-            .WithColor(inactiveAutoKickEnabled ? Color.Orange : Color.Green)
-            .WithCurrentTimestamp()
-            .AddField("登録確認フロー", stateText, true)
-            .AddField("動作", note, false)
-            .AddField("30日非アクティブ自動キック", autoKickText, true)
-            .AddField("キック動作", autoKickNote, false)
-            .Build();
-    }
+        => AdminControlPanel.BuildStatusEmbed(approvalRequired, inactiveAutoKickEnabled, includeReactionLabelInAutoKickNote: true);
 
     private async Task EnsureVisibilityAsync(
         SocketGuild guild,
@@ -3436,7 +3514,7 @@ public sealed class DiscordBotService : IHostedService
 
         if (afterChannel is not null && _options.VoiceProfileEmbedEnabled)
         {
-            await SendVoiceJoinEmbedAsync(afterChannel, user, now);
+            await SendVoiceJoinEmbedAsync(afterChannel, user);
         }
 
         if (beforeChannel is null && afterChannel is not null)
@@ -3678,6 +3756,237 @@ public sealed class DiscordBotService : IHostedService
             userMessage.Timestamp);
         await _db.TouchInquiryTicketActivityAsync(guildChannel.Id, userMessage.Timestamp);
         await MarkUserActiveNowAsync(guildChannel.Guild, userMessage.Author.Id);
+        await TryScheduleVoiceTextAutoDeleteAsync(guildChannel, userMessage);
+    }
+
+    private async Task TryScheduleVoiceTextAutoDeleteAsync(SocketGuildChannel guildChannel, SocketUserMessage message)
+    {
+        if (!IsVoiceTextMessageChannel(guildChannel))
+        {
+            return;
+        }
+
+        if (message.Author.IsBot)
+        {
+            return;
+        }
+
+        VoiceTextAutoDeletePolicy policy;
+        try
+        {
+            policy = await _db.GetVoiceTextAutoDeletePolicyAsync(message.Author.Id);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to load VC text auto-delete policy. GuildId={GuildId}, UserId={UserId}", guildChannel.Guild.Id, message.Author.Id);
+            return;
+        }
+
+        if (!policy.Enabled)
+        {
+            return;
+        }
+
+        var retentionHours = Math.Clamp(policy.RetentionHours <= 0 ? 6 : policy.RetentionHours, 1, 168);
+        var dueAt = message.Timestamp.ToUniversalTime().AddHours(retentionHours);
+        var delay = dueAt - DateTimeOffset.UtcNow;
+        if (delay < TimeSpan.FromSeconds(1))
+        {
+            delay = TimeSpan.FromSeconds(1);
+        }
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await Task.Delay(delay);
+                await TryExecuteVoiceTextAutoDeleteAsync(guildChannel.Guild.Id, guildChannel.Id, message.Id, message.Author.Id);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "VC text auto-delete task failed. GuildId={GuildId}, ChannelId={ChannelId}, MessageId={MessageId}",
+                    guildChannel.Guild.Id, guildChannel.Id, message.Id);
+            }
+        });
+    }
+
+    private async Task TryExecuteVoiceTextAutoDeleteAsync(ulong guildId, ulong channelId, ulong messageId, ulong authorUserId)
+    {
+        var guild = _client.GetGuild(guildId);
+        if (guild is null)
+        {
+            return;
+        }
+
+        var channel = guild.GetChannel(channelId) as IMessageChannel;
+        if (channel is null)
+        {
+            return;
+        }
+
+        IUserMessage? targetMessage;
+        try
+        {
+            targetMessage = await channel.GetMessageAsync(messageId) as IUserMessage;
+        }
+        catch (Discord.Net.HttpException ex) when (ex.DiscordCode is DiscordErrorCode.UnknownMessage or DiscordErrorCode.UnknownChannel)
+        {
+            return;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to fetch VC text message before auto-delete. GuildId={GuildId}, ChannelId={ChannelId}, MessageId={MessageId}",
+                guildId, channelId, messageId);
+            return;
+        }
+
+        if (targetMessage is null || targetMessage.Author.IsBot)
+        {
+            return;
+        }
+
+        if (authorUserId != 0 && targetMessage.Author.Id != authorUserId)
+        {
+            return;
+        }
+
+        try
+        {
+            await channel.DeleteMessageAsync(messageId);
+        }
+        catch (Discord.Net.HttpException ex) when (ex.DiscordCode is DiscordErrorCode.UnknownMessage or DiscordErrorCode.UnknownChannel)
+        {
+            return;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to auto-delete VC text message. GuildId={GuildId}, ChannelId={ChannelId}, MessageId={MessageId}",
+                guildId, channelId, messageId);
+            return;
+        }
+
+        await TrySendVoiceTextAutoDeleteCsvLogAsync(guild, channelId, targetMessage);
+    }
+
+    private async Task TrySendVoiceTextAutoDeleteCsvLogAsync(SocketGuild guild, ulong channelId, IUserMessage deletedMessage)
+    {
+        IMessageChannel? logChannel;
+        try
+        {
+            logChannel = await ResolveLogChannelAsync(guild);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to resolve log channel for VC text auto-delete CSV. GuildId={GuildId}", guild.Id);
+            return;
+        }
+
+        if (logChannel is null)
+        {
+            return;
+        }
+
+        MessageLog? fromDb = null;
+        try
+        {
+            fromDb = await _db.GetMessageAsync(deletedMessage.Id);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to load message log for VC text auto-delete CSV. MessageId={MessageId}", deletedMessage.Id);
+        }
+
+        var deletedAt = DateTimeOffset.UtcNow;
+        var csv = BuildVoiceTextAutoDeleteCsv(fromDb, deletedMessage, guild.Id, channelId, deletedAt);
+        await using var stream = new MemoryStream(System.Text.Encoding.UTF8.GetBytes(csv), writable: false);
+        var fileName = $"vc_text_autodelete_{guild.Id}_{channelId}_{deletedMessage.Id}.csv";
+        var text = $"VC内テキストを自動削除しました。対象: <@{deletedMessage.Author.Id}> / <#{channelId}> / message: {deletedMessage.Id}";
+
+        try
+        {
+            await logChannel.SendFileAsync(stream, fileName, text: text, flags: MessageFlags.SuppressNotification);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to send VC text auto-delete CSV log. GuildId={GuildId}, MessageId={MessageId}", guild.Id, deletedMessage.Id);
+        }
+    }
+
+    private static string BuildVoiceTextAutoDeleteCsv(
+        MessageLog? fromDb,
+        IUserMessage deletedMessage,
+        ulong guildId,
+        ulong channelId,
+        DateTimeOffset deletedAt)
+    {
+        var createdAt = fromDb?.CreatedAt ?? deletedMessage.Timestamp;
+        var authorId = fromDb is null ? deletedMessage.Author.Id : ToUlong(fromDb.AuthorId);
+        var authorName = fromDb?.AuthorName ?? deletedMessage.Author.ToString();
+        var authorDisplayName = fromDb?.AuthorDisplayName;
+        var content = fromDb?.Content ?? deletedMessage.Content ?? string.Empty;
+        var attachmentCount = fromDb?.AttachmentCount ?? deletedMessage.Attachments.Count;
+        var embedCount = fromDb?.EmbedCount ?? deletedMessage.Embeds.Count;
+        var attachmentsJson = fromDb?.AttachmentsJson ?? BuildDeletedMessageAttachmentJson(deletedMessage);
+        var embedsJson = fromDb?.EmbedsJson;
+
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine("deleted_at_utc,created_at_utc,guild_id,channel_id,message_id,author_id,author_name,author_display_name,content,attachment_count,embed_count,attachments_json,embeds_json");
+        sb.Append(ToCsvCell(deletedAt.ToUniversalTime().ToString("O"))).Append(',')
+          .Append(ToCsvCell(createdAt.ToUniversalTime().ToString("O"))).Append(',')
+          .Append(ToCsvCell(guildId.ToString())).Append(',')
+          .Append(ToCsvCell(channelId.ToString())).Append(',')
+          .Append(ToCsvCell(deletedMessage.Id.ToString())).Append(',')
+          .Append(ToCsvCell(authorId.ToString())).Append(',')
+          .Append(ToCsvCell(authorName)).Append(',')
+          .Append(ToCsvCell(authorDisplayName)).Append(',')
+          .Append(ToCsvCell(content)).Append(',')
+          .Append(ToCsvCell(attachmentCount.ToString())).Append(',')
+          .Append(ToCsvCell(embedCount.ToString())).Append(',')
+          .Append(ToCsvCell(attachmentsJson)).Append(',')
+          .Append(ToCsvCell(embedsJson));
+        return sb.ToString();
+    }
+
+    private static string BuildDeletedMessageAttachmentJson(IUserMessage deletedMessage)
+    {
+        if (deletedMessage.Attachments.Count == 0)
+        {
+            return "[]";
+        }
+
+        var snapshots = deletedMessage.Attachments
+            .Select(attachment => new
+            {
+                attachment.Id,
+                Url = attachment.Url,
+                ProxyUrl = attachment.ProxyUrl,
+                Filename = attachment.Filename,
+                attachment.Size,
+                ContentType = attachment.ContentType,
+                attachment.Height,
+                attachment.Width,
+                IsSpoiler = attachment.IsSpoiler()
+            })
+            .ToList();
+        return JsonSerializer.Serialize(snapshots);
+    }
+
+    private static string ToCsvCell(string? value)
+    {
+        value ??= string.Empty;
+        var escaped = value.Replace("\"", "\"\"");
+        var needsQuote = value.Contains(',') || value.Contains('"') || value.Contains('\n') || value.Contains('\r');
+        return needsQuote ? $"\"{escaped}\"" : escaped;
+    }
+
+    private static bool IsVoiceTextMessageChannel(SocketGuildChannel guildChannel)
+    {
+        if (guildChannel is SocketVoiceChannel)
+        {
+            return true;
+        }
+
+        return guildChannel.Guild.GetVoiceChannel(guildChannel.Id) is not null;
     }
 
     private async Task TryRefreshRecruitListRealtimeAsync(SocketGuildChannel guildChannel, ulong authorUserId)
@@ -5004,7 +5313,7 @@ public sealed class DiscordBotService : IHostedService
         return $"{MentionUser(user.Id)} ({display})";
     }
 
-    private async Task SendVoiceJoinEmbedAsync(SocketVoiceChannel channel, SocketUser user, DateTimeOffset joinedAt)
+    private async Task SendVoiceJoinEmbedAsync(SocketVoiceChannel channel, SocketUser user)
     {
         var textChannel = await ResolveVoiceTextChannelAsync(channel);
         if (textChannel is null)
@@ -5012,9 +5321,45 @@ public sealed class DiscordBotService : IHostedService
             return;
         }
 
-        var embed = await _profileEmbeds.BuildProfileEmbedAsync(user, channel.Guild, "VC参加", Color.Blue);
+        var vcPodiumCounts = new ActivityRankingPodiumCount();
+        var messagePodiumCounts = new ActivityRankingPodiumCount();
+        try
+        {
+            vcPodiumCounts = await _db.GetActivityRankingMetricPodiumCountsByUserAsync(
+                channel.Guild.Id,
+                user.Id,
+                VoiceStatsService.RankingMetricVoiceDuration);
+            messagePodiumCounts = await _db.GetActivityRankingMetricPodiumCountsByUserAsync(
+                channel.Guild.Id,
+                user.Id,
+                VoiceStatsService.RankingMetricMessageCount);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to load ranking podium counts. GuildId={GuildId}, UserId={UserId}", channel.Guild.Id, user.Id);
+        }
+
+        var embed = await _profileEmbeds.BuildProfileEmbedAsync(
+            user,
+            channel.Guild,
+            "VC参加",
+            Color.Blue,
+            configure: builder =>
+            {
+                builder.AddField(
+                    "🎙️ VC滞在 TOP3回数",
+                    FormatPodiumCounts(vcPodiumCounts),
+                    true);
+                builder.AddField(
+                    "💬 発言数 TOP3回数",
+                    FormatPodiumCounts(messagePodiumCounts),
+                    true);
+            });
         await textChannel.SendMessageAsync(embed: embed);
     }
+
+    private static string FormatPodiumCounts(ActivityRankingPodiumCount counts)
+        => $"🥇 1位: `{Math.Max(0, counts.FirstCount)}回`\n🥈 2位: `{Math.Max(0, counts.SecondCount)}回`\n🥉 3位: `{Math.Max(0, counts.ThirdCount)}回`";
 
     private async Task<IMessageChannel?> ResolveVoiceTextChannelAsync(SocketVoiceChannel channel)
     {

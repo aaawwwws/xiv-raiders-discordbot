@@ -133,6 +133,17 @@ ADD COLUMN IF NOT EXISTS voice_notification_enabled BOOLEAN NOT NULL DEFAULT TRU
         await conn.ExecuteAsync(sql);
     }
 
+    public async Task EnsureDiscordUserVoiceTextAutoDeleteColumnsAsync()
+    {
+        const string sql = @"
+ALTER TABLE IF EXISTS discord_users
+ADD COLUMN IF NOT EXISTS vc_text_auto_delete_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+ADD COLUMN IF NOT EXISTS vc_text_auto_delete_hours INTEGER NOT NULL DEFAULT 6;";
+
+        await using var conn = CreateConnection();
+        await conn.ExecuteAsync(sql);
+    }
+
     public async Task EnsureGuildLodestonePanelTableAsync()
     {
         const string sql = @"
@@ -241,6 +252,51 @@ CREATE TABLE IF NOT EXISTS guild_weekly_activity_panels (
         await conn.ExecuteAsync(sql);
     }
 
+    public async Task EnsureActivityRankingAwardsTableAsync()
+    {
+        const string sql = @"
+CREATE TABLE IF NOT EXISTS activity_ranking_awards (
+    id SERIAL PRIMARY KEY,
+    guild_id BIGINT NOT NULL,
+    ranking_key TEXT NOT NULL,
+    user_id BIGINT NOT NULL,
+    best_rank SMALLINT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT ux_activity_ranking_awards UNIQUE (guild_id, ranking_key, user_id)
+);
+
+ALTER TABLE IF EXISTS activity_ranking_awards
+ADD COLUMN IF NOT EXISTS best_rank SMALLINT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_activity_ranking_awards_guild_user
+ON activity_ranking_awards (guild_id, user_id);";
+
+        await using var conn = CreateConnection();
+        await conn.ExecuteAsync(sql);
+    }
+
+    public async Task EnsureActivityRankingMetricAwardsTableAsync()
+    {
+        const string sql = @"
+CREATE TABLE IF NOT EXISTS activity_ranking_metric_awards (
+    id SERIAL PRIMARY KEY,
+    guild_id BIGINT NOT NULL,
+    ranking_key TEXT NOT NULL,
+    metric_key TEXT NOT NULL,
+    user_id BIGINT NOT NULL,
+    rank SMALLINT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT ux_activity_ranking_metric_awards UNIQUE (guild_id, ranking_key, metric_key, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_activity_ranking_metric_awards_guild_user_metric
+ON activity_ranking_metric_awards (guild_id, user_id, metric_key);";
+
+        await using var conn = CreateConnection();
+        await conn.ExecuteAsync(sql);
+    }
+
     public async Task EnsureGuildDailyReactionPostPanelTableAsync()
     {
         const string sql = @"
@@ -285,6 +341,9 @@ ADD COLUMN IF NOT EXISTS control_channel_id BIGINT NOT NULL DEFAULT 0,
 ADD COLUMN IF NOT EXISTS runtime_cleanup_interval_minutes INTEGER NULL,
 ADD COLUMN IF NOT EXISTS runtime_recruit_closed_retention_hours INTEGER NULL,
 ADD COLUMN IF NOT EXISTS runtime_recruit_canceled_retention_hours INTEGER NULL,
+ADD COLUMN IF NOT EXISTS runtime_message_log_retention_days INTEGER NULL,
+ADD COLUMN IF NOT EXISTS runtime_voice_session_retention_days INTEGER NULL,
+ADD COLUMN IF NOT EXISTS runtime_reaction_log_retention_days INTEGER NULL,
 ADD COLUMN IF NOT EXISTS runtime_tuning_updated_at TIMESTAMPTZ NULL;";
 
         await using var conn = CreateConnection();
@@ -379,6 +438,99 @@ WHERE status <> 'CLOSED';
 CREATE UNIQUE INDEX IF NOT EXISTS ux_inquiry_tickets_open_requester
 ON public.inquiry_tickets (guild_id, requester_user_id)
 WHERE status <> 'CLOSED';";
+
+        await using var conn = CreateConnection();
+        await conn.ExecuteAsync(sql);
+    }
+
+    public async Task EnsureAdminMemberNotesTableAsync()
+    {
+        const string sql = @"
+CREATE TABLE IF NOT EXISTS public.admin_member_notes (
+    id SERIAL PRIMARY KEY,
+    guild_id BIGINT NOT NULL,
+    target_user_id BIGINT NOT NULL,
+    author_user_id BIGINT NOT NULL,
+    author_name TEXT NOT NULL,
+    note TEXT NOT NULL,
+    is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_admin_member_notes_target
+ON public.admin_member_notes (guild_id, target_user_id, created_at DESC);";
+
+        await using var conn = CreateConnection();
+        await conn.ExecuteAsync(sql);
+    }
+
+    public async Task EnsureAdminMemberModerationActionsTableAsync()
+    {
+        const string sql = @"
+CREATE TABLE IF NOT EXISTS public.admin_member_moderation_actions (
+    id SERIAL PRIMARY KEY,
+    guild_id BIGINT NOT NULL,
+    target_user_id BIGINT NOT NULL,
+    actor_user_id BIGINT NOT NULL,
+    actor_name TEXT NOT NULL,
+    action_type TEXT NOT NULL,
+    reason TEXT NULL,
+    detail TEXT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_admin_member_moderation_actions_target
+ON public.admin_member_moderation_actions (guild_id, target_user_id, created_at DESC);";
+
+        await using var conn = CreateConnection();
+        await conn.ExecuteAsync(sql);
+    }
+
+    public async Task EnsureFfLogsSeenReportsTableAsync()
+    {
+        const string sql = @"
+CREATE TABLE IF NOT EXISTS public.fflogs_seen_reports (
+    guild_id BIGINT NOT NULL,
+    report_code TEXT NOT NULL,
+    detected_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    report_end_at TIMESTAMPTZ NULL,
+    PRIMARY KEY (guild_id, report_code)
+);
+
+CREATE INDEX IF NOT EXISTS idx_fflogs_seen_reports_detected_at
+ON public.fflogs_seen_reports (detected_at DESC);";
+
+        await using var conn = CreateConnection();
+        await conn.ExecuteAsync(sql);
+    }
+
+    public async Task EnsureSsAlbumFavoritesTableAsync()
+    {
+        const string sql = @"
+CREATE TABLE IF NOT EXISTS public.ss_album_favorites (
+    id SERIAL PRIMARY KEY,
+    guild_id BIGINT NOT NULL,
+    viewer_user_id BIGINT NOT NULL,
+    target_user_id BIGINT NOT NULL,
+    message_id BIGINT NOT NULL,
+    attachment_id BIGINT NOT NULL,
+    channel_id BIGINT NOT NULL,
+    image_url TEXT NOT NULL,
+    file_name TEXT NULL,
+    message_content TEXT NULL,
+    local_path TEXT NULL,
+    posted_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT ux_ss_album_favorites UNIQUE (guild_id, viewer_user_id, message_id, attachment_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ss_album_favorites_viewer
+ON public.ss_album_favorites (guild_id, viewer_user_id, posted_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_ss_album_favorites_target
+ON public.ss_album_favorites (guild_id, viewer_user_id, target_user_id, posted_at DESC);";
 
         await using var conn = CreateConnection();
         await conn.ExecuteAsync(sql);
@@ -582,6 +734,80 @@ RETURNING voice_notification_enabled;";
 
         await using var conn = CreateConnection();
         return await conn.ExecuteScalarAsync<bool>(sql, new { UserId = ToDbId(userId) });
+    }
+
+    public async Task<bool> SetVoiceNotificationEnabledAsync(ulong userId, bool enabled)
+    {
+        const string sql = @"
+INSERT INTO discord_users (discord_user_id, voice_notification_enabled)
+VALUES (@UserId, @Enabled)
+ON CONFLICT (discord_user_id) DO UPDATE
+SET voice_notification_enabled = @Enabled,
+    updated_at = NOW()
+RETURNING voice_notification_enabled;";
+
+        await using var conn = CreateConnection();
+        return await conn.ExecuteScalarAsync<bool>(sql, new
+        {
+            UserId = ToDbId(userId),
+            Enabled = enabled
+        });
+    }
+
+    public async Task<VoiceTextAutoDeletePolicy> GetVoiceTextAutoDeletePolicyAsync(ulong userId)
+    {
+        const string sql = @"
+SELECT vc_text_auto_delete_enabled AS Enabled,
+       vc_text_auto_delete_hours AS RetentionHours
+FROM discord_users
+WHERE discord_user_id = @UserId
+LIMIT 1;";
+
+        await using var conn = CreateConnection();
+        var policy = await conn.QuerySingleOrDefaultAsync<VoiceTextAutoDeletePolicy>(sql, new { UserId = ToDbId(userId) });
+        if (policy is null)
+        {
+            return new VoiceTextAutoDeletePolicy
+            {
+                Enabled = false,
+                RetentionHours = 6
+            };
+        }
+
+        var retentionHours = Math.Clamp(policy.RetentionHours <= 0 ? 6 : policy.RetentionHours, 1, 168);
+        return new VoiceTextAutoDeletePolicy
+        {
+            Enabled = policy.Enabled,
+            RetentionHours = retentionHours
+        };
+    }
+
+    public async Task<VoiceTextAutoDeletePolicy> SetVoiceTextAutoDeletePolicyAsync(ulong userId, bool enabled, int retentionHours)
+    {
+        const string sql = @"
+INSERT INTO discord_users (discord_user_id, vc_text_auto_delete_enabled, vc_text_auto_delete_hours)
+VALUES (@UserId, @Enabled, @RetentionHours)
+ON CONFLICT (discord_user_id) DO UPDATE
+SET vc_text_auto_delete_enabled = @Enabled,
+    vc_text_auto_delete_hours = @RetentionHours,
+    updated_at = NOW()
+RETURNING vc_text_auto_delete_enabled AS Enabled,
+          vc_text_auto_delete_hours AS RetentionHours;";
+
+        var clampedRetentionHours = Math.Clamp(retentionHours <= 0 ? 6 : retentionHours, 1, 168);
+        await using var conn = CreateConnection();
+        var updated = await conn.QuerySingleAsync<VoiceTextAutoDeletePolicy>(sql, new
+        {
+            UserId = ToDbId(userId),
+            Enabled = enabled,
+            RetentionHours = clampedRetentionHours
+        });
+
+        return new VoiceTextAutoDeletePolicy
+        {
+            Enabled = updated.Enabled,
+            RetentionHours = Math.Clamp(updated.RetentionHours <= 0 ? 6 : updated.RetentionHours, 1, 168)
+        };
     }
 
     public async Task<DiscordUserProfile?> GetDiscordUserProfileAsync(ulong userId)
@@ -1019,6 +1245,246 @@ ORDER BY joined_at ASC;";
         return rows.ToList();
     }
 
+    public async Task<int> AddAdminMemberNoteAsync(
+        ulong guildId,
+        ulong targetUserId,
+        ulong authorUserId,
+        string authorName,
+        string note)
+    {
+        if (guildId == 0 || targetUserId == 0 || authorUserId == 0 || string.IsNullOrWhiteSpace(note))
+        {
+            return 0;
+        }
+
+        const string sql = @"
+INSERT INTO public.admin_member_notes (
+    guild_id,
+    target_user_id,
+    author_user_id,
+    author_name,
+    note,
+    is_deleted,
+    created_at,
+    updated_at)
+VALUES (
+    @GuildId,
+    @TargetUserId,
+    @AuthorUserId,
+    @AuthorName,
+    @Note,
+    FALSE,
+    NOW(),
+    NOW())
+RETURNING id;";
+
+        await using var conn = CreateConnection();
+        return await conn.ExecuteScalarAsync<int>(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            TargetUserId = ToDbId(targetUserId),
+            AuthorUserId = ToDbId(authorUserId),
+            AuthorName = NullIfBlank(authorName) ?? authorUserId.ToString(),
+            Note = note.Trim()
+        });
+    }
+
+    public async Task<IReadOnlyList<AdminMemberNote>> ListAdminMemberNotesAsync(
+        ulong guildId,
+        ulong targetUserId,
+        int maxRows = 10)
+    {
+        if (guildId == 0 || targetUserId == 0)
+        {
+            return Array.Empty<AdminMemberNote>();
+        }
+
+        const string sql = @"
+SELECT id AS Id,
+       guild_id AS GuildId,
+       target_user_id AS TargetUserId,
+       author_user_id AS AuthorUserId,
+       author_name AS AuthorName,
+       note AS Note,
+       is_deleted AS IsDeleted,
+       created_at AS CreatedAt,
+       updated_at AS UpdatedAt
+FROM public.admin_member_notes
+WHERE guild_id = @GuildId
+  AND target_user_id = @TargetUserId
+  AND is_deleted = FALSE
+ORDER BY created_at DESC, id DESC
+LIMIT @MaxRows;";
+
+        await using var conn = CreateConnection();
+        var rows = await conn.QueryAsync<AdminMemberNote>(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            TargetUserId = ToDbId(targetUserId),
+            MaxRows = Math.Clamp(maxRows, 1, 50)
+        });
+        return rows.ToList();
+    }
+
+    public async Task<int> AddAdminMemberModerationActionAsync(
+        ulong guildId,
+        ulong targetUserId,
+        ulong actorUserId,
+        string actorName,
+        string actionType,
+        string? reason = null,
+        string? detail = null)
+    {
+        if (guildId == 0 || targetUserId == 0 || actorUserId == 0 || string.IsNullOrWhiteSpace(actionType))
+        {
+            return 0;
+        }
+
+        const string sql = @"
+INSERT INTO public.admin_member_moderation_actions (
+    guild_id,
+    target_user_id,
+    actor_user_id,
+    actor_name,
+    action_type,
+    reason,
+    detail,
+    created_at)
+VALUES (
+    @GuildId,
+    @TargetUserId,
+    @ActorUserId,
+    @ActorName,
+    @ActionType,
+    @Reason,
+    @Detail,
+    NOW())
+RETURNING id;";
+
+        await using var conn = CreateConnection();
+        return await conn.ExecuteScalarAsync<int>(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            TargetUserId = ToDbId(targetUserId),
+            ActorUserId = ToDbId(actorUserId),
+            ActorName = NullIfBlank(actorName) ?? actorUserId.ToString(),
+            ActionType = actionType.Trim(),
+            Reason = NullIfBlank(reason),
+            Detail = NullIfBlank(detail)
+        });
+    }
+
+    public async Task<IReadOnlyList<AdminMemberModerationAction>> ListAdminMemberModerationActionsAsync(
+        ulong guildId,
+        ulong targetUserId,
+        int maxRows = 20)
+    {
+        if (guildId == 0 || targetUserId == 0)
+        {
+            return Array.Empty<AdminMemberModerationAction>();
+        }
+
+        const string sql = @"
+SELECT id AS Id,
+       guild_id AS GuildId,
+       target_user_id AS TargetUserId,
+       actor_user_id AS ActorUserId,
+       actor_name AS ActorName,
+       action_type AS ActionType,
+       reason AS Reason,
+       detail AS Detail,
+       created_at AS CreatedAt
+FROM public.admin_member_moderation_actions
+WHERE guild_id = @GuildId
+  AND target_user_id = @TargetUserId
+ORDER BY created_at DESC, id DESC
+LIMIT @MaxRows;";
+
+        await using var conn = CreateConnection();
+        var rows = await conn.QueryAsync<AdminMemberModerationAction>(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            TargetUserId = ToDbId(targetUserId),
+            MaxRows = Math.Clamp(maxRows, 1, 100)
+        });
+        return rows.ToList();
+    }
+
+    public async Task<IReadOnlyList<AdminModerationTimelineEntry>> ListAdminModerationTimelineAsync(
+        ulong guildId,
+        int offsetRows,
+        int maxRows = 20)
+    {
+        if (guildId == 0)
+        {
+            return Array.Empty<AdminModerationTimelineEntry>();
+        }
+
+        const string sql = @"
+SELECT entry_id AS EntryId,
+       target_user_id AS TargetUserId,
+       actor_user_id AS ActorUserId,
+       actor_name AS ActorName,
+       action_type AS ActionType,
+       reason AS Reason,
+       detail AS Detail,
+       created_at AS CreatedAt
+FROM (
+    SELECT id AS entry_id,
+           target_user_id,
+           actor_user_id,
+           actor_name,
+           action_type,
+           reason,
+           detail,
+           created_at
+    FROM public.admin_member_moderation_actions
+    WHERE guild_id = @GuildId
+    UNION ALL
+    SELECT id AS entry_id,
+           target_user_id,
+           author_user_id AS actor_user_id,
+           author_name AS actor_name,
+           'admin_note' AS action_type,
+           NULL::TEXT AS reason,
+           note AS detail,
+           created_at
+    FROM public.admin_member_notes
+    WHERE guild_id = @GuildId
+      AND is_deleted = FALSE
+) t
+ORDER BY created_at DESC, entry_id DESC
+LIMIT @MaxRows
+OFFSET @OffsetRows;";
+
+        await using var conn = CreateConnection();
+        var rows = await conn.QueryAsync<AdminModerationTimelineEntry>(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            OffsetRows = Math.Max(0, offsetRows),
+            MaxRows = Math.Clamp(maxRows, 1, 100)
+        });
+        return rows.ToList();
+    }
+
+    public async Task<int> CountAdminModerationTimelineEntriesAsync(ulong guildId)
+    {
+        if (guildId == 0)
+        {
+            return 0;
+        }
+
+        const string sql = @"
+SELECT (
+    COALESCE((SELECT COUNT(1) FROM public.admin_member_moderation_actions WHERE guild_id = @GuildId), 0)
+    +
+    COALESCE((SELECT COUNT(1) FROM public.admin_member_notes WHERE guild_id = @GuildId AND is_deleted = FALSE), 0)
+)::INT;";
+
+        await using var conn = CreateConnection();
+        return await conn.ExecuteScalarAsync<int>(sql, new { GuildId = ToDbId(guildId) });
+    }
+
     public async Task<int> CleanupVoiceSessionsAsync(int retentionDays)
     {
         if (retentionDays <= 0)
@@ -1148,6 +1614,325 @@ LIMIT @TopCount;";
         return rows.ToList();
     }
 
+    public async Task<IReadOnlyList<VoiceChannelDurationSummary>> ListVoiceChannelDurationSummaryAsync(
+        ulong guildId,
+        DateTimeOffset fromUtcInclusive,
+        DateTimeOffset toUtcExclusive,
+        int topCount)
+    {
+        const string sql = @"
+SELECT channel_id AS ChannelId,
+       SUM(
+           GREATEST(
+               0,
+               EXTRACT(EPOCH FROM (LEAST(COALESCE(left_at, @ToUtcExclusive), @ToUtcExclusive) - GREATEST(joined_at, @FromUtcInclusive)))
+           )
+       )::BIGINT AS DurationSeconds
+FROM voice_sessions
+WHERE guild_id = @GuildId
+  AND COALESCE(left_at, @ToUtcExclusive) > @FromUtcInclusive
+  AND joined_at < @ToUtcExclusive
+GROUP BY channel_id
+HAVING SUM(
+           GREATEST(
+               0,
+               EXTRACT(EPOCH FROM (LEAST(COALESCE(left_at, @ToUtcExclusive), @ToUtcExclusive) - GREATEST(joined_at, @FromUtcInclusive)))
+           )
+       ) > 0
+ORDER BY DurationSeconds DESC, channel_id ASC
+LIMIT @TopCount;";
+
+        await using var conn = CreateConnection();
+        var rows = await conn.QueryAsync<VoiceChannelDurationSummary>(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            FromUtcInclusive = fromUtcInclusive,
+            ToUtcExclusive = toUtcExclusive,
+            TopCount = Math.Clamp(topCount, 1, 50)
+        });
+        return rows.ToList();
+    }
+
+    public async Task<IReadOnlyList<UserActivityTimeline>> ListUserActivityTimelinesAsync(
+        ulong guildId,
+        IReadOnlyCollection<ulong> userIds)
+    {
+        if (userIds.Count == 0)
+        {
+            return Array.Empty<UserActivityTimeline>();
+        }
+
+        var normalizedUserIds = userIds
+            .Select(ToDbId)
+            .Distinct()
+            .ToArray();
+        if (normalizedUserIds.Length == 0)
+        {
+            return Array.Empty<UserActivityTimeline>();
+        }
+
+        const string sql = @"
+WITH target_users AS (
+    SELECT UNNEST(@UserIds::BIGINT[]) AS user_id
+),
+message_edges AS (
+    SELECT author_id AS user_id,
+           MIN(created_at) AS first_message_at,
+           MAX(created_at) AS last_message_at
+    FROM message_logs
+    WHERE guild_id = @GuildId
+      AND deleted_at IS NULL
+      AND author_id = ANY(@UserIds)
+    GROUP BY author_id
+),
+voice_edges AS (
+    SELECT user_id,
+           MIN(joined_at) AS first_voice_at,
+           MAX(joined_at) AS last_voice_joined_at,
+           MAX(COALESCE(left_at, joined_at)) AS last_voice_at
+    FROM voice_sessions
+    WHERE guild_id = @GuildId
+      AND user_id = ANY(@UserIds)
+    GROUP BY user_id
+),
+reaction_edges AS (
+    SELECT user_id,
+           MIN(reacted_at) AS first_reaction_at,
+           MAX(reacted_at) AS last_reaction_at
+    FROM public.user_reaction_logs
+    WHERE guild_id = @GuildId
+      AND user_id = ANY(@UserIds)
+    GROUP BY user_id
+)
+SELECT t.user_id AS UserId,
+       m.first_message_at AS FirstMessageAt,
+       v.first_voice_at AS FirstVoiceAt,
+       r.first_reaction_at AS FirstReactionAt,
+       m.last_message_at AS LastMessageAt,
+       v.last_voice_at AS LastVoiceAt,
+       v.last_voice_joined_at AS LastVoiceJoinedAt,
+       r.last_reaction_at AS LastReactionAt,
+       CASE
+           WHEN m.last_message_at IS NULL
+            AND v.last_voice_at IS NULL
+            AND r.last_reaction_at IS NULL
+               THEN NULL
+           ELSE GREATEST(
+                COALESCE(m.last_message_at, 'epoch'::timestamptz),
+                COALESCE(v.last_voice_at, 'epoch'::timestamptz),
+                COALESCE(r.last_reaction_at, 'epoch'::timestamptz))
+       END AS LastActivityAt
+FROM target_users t
+LEFT JOIN message_edges m ON m.user_id = t.user_id
+LEFT JOIN voice_edges v ON v.user_id = t.user_id
+LEFT JOIN reaction_edges r ON r.user_id = t.user_id
+ORDER BY t.user_id ASC;";
+
+        await using var conn = CreateConnection();
+        var rows = await conn.QueryAsync<UserActivityTimeline>(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            UserIds = normalizedUserIds
+        });
+        return rows.ToList();
+    }
+
+    public async Task<IReadOnlyList<VoiceHourlyActivity>> ListVoiceHourlyActivityAsync(
+        ulong guildId,
+        DateTimeOffset fromUtcInclusive,
+        DateTimeOffset toUtcExclusive)
+    {
+        if (toUtcExclusive <= fromUtcInclusive)
+        {
+            return Array.Empty<VoiceHourlyActivity>();
+        }
+
+        const string sql = @"
+WITH bounded AS (
+    SELECT id,
+           user_id,
+           GREATEST(joined_at, @FromUtcInclusive) AS start_utc,
+           LEAST(COALESCE(left_at, @ToUtcExclusive), @ToUtcExclusive) AS end_utc
+    FROM voice_sessions
+    WHERE guild_id = @GuildId
+      AND COALESCE(left_at, @ToUtcExclusive) > @FromUtcInclusive
+      AND joined_at < @ToUtcExclusive
+),
+expanded AS (
+    SELECT b.id,
+           b.user_id,
+           gs.bucket_start,
+           (b.start_utc AT TIME ZONE 'Asia/Tokyo') AS start_jst,
+           (b.end_utc AT TIME ZONE 'Asia/Tokyo') AS end_jst
+    FROM bounded b
+    CROSS JOIN LATERAL generate_series(
+        date_trunc('hour', b.start_utc AT TIME ZONE 'Asia/Tokyo'),
+        date_trunc('hour', (b.end_utc AT TIME ZONE 'Asia/Tokyo') - INTERVAL '1 second'),
+        INTERVAL '1 hour'
+    ) AS gs(bucket_start)
+)
+SELECT EXTRACT(HOUR FROM bucket_start)::INT AS Hour,
+       COALESCE(SUM(
+           GREATEST(
+               0,
+               EXTRACT(EPOCH FROM (
+                   LEAST(end_jst, bucket_start + INTERVAL '1 hour')
+                   - GREATEST(start_jst, bucket_start)
+               ))
+           )
+       ), 0)::BIGINT AS TotalSeconds,
+       COUNT(DISTINCT id)::INT AS SessionCount,
+       COUNT(DISTINCT user_id)::INT AS ActiveUsers
+FROM expanded
+GROUP BY Hour
+ORDER BY Hour ASC;";
+
+        await using var conn = CreateConnection();
+        var rows = await conn.QueryAsync<VoiceHourlyActivity>(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            FromUtcInclusive = fromUtcInclusive,
+            ToUtcExclusive = toUtcExclusive
+        });
+        return rows.ToList();
+    }
+
+    public async Task<IReadOnlyList<VoiceWeekdayHourlyActivity>> ListVoiceWeekdayHourlyActivityAsync(
+        ulong guildId,
+        DateTimeOffset fromUtcInclusive,
+        DateTimeOffset toUtcExclusive)
+    {
+        if (toUtcExclusive <= fromUtcInclusive)
+        {
+            return Array.Empty<VoiceWeekdayHourlyActivity>();
+        }
+
+        const string sql = @"
+WITH bounded AS (
+    SELECT id,
+           user_id,
+           GREATEST(joined_at, @FromUtcInclusive) AS start_utc,
+           LEAST(COALESCE(left_at, @ToUtcExclusive), @ToUtcExclusive) AS end_utc
+    FROM voice_sessions
+    WHERE guild_id = @GuildId
+      AND COALESCE(left_at, @ToUtcExclusive) > @FromUtcInclusive
+      AND joined_at < @ToUtcExclusive
+),
+expanded AS (
+    SELECT b.id,
+           b.user_id,
+           gs.bucket_start,
+           (b.start_utc AT TIME ZONE 'Asia/Tokyo') AS start_jst,
+           (b.end_utc AT TIME ZONE 'Asia/Tokyo') AS end_jst
+    FROM bounded b
+    CROSS JOIN LATERAL generate_series(
+        date_trunc('hour', b.start_utc AT TIME ZONE 'Asia/Tokyo'),
+        date_trunc('hour', (b.end_utc AT TIME ZONE 'Asia/Tokyo') - INTERVAL '1 second'),
+        INTERVAL '1 hour'
+    ) AS gs(bucket_start)
+)
+SELECT ((EXTRACT(ISODOW FROM bucket_start)::INT + 6) % 7) AS Weekday,
+       EXTRACT(HOUR FROM bucket_start)::INT AS Hour,
+       COALESCE(SUM(
+           GREATEST(
+               0,
+               EXTRACT(EPOCH FROM (
+                   LEAST(end_jst, bucket_start + INTERVAL '1 hour')
+                   - GREATEST(start_jst, bucket_start)
+               ))
+           )
+       ), 0)::BIGINT AS TotalSeconds,
+       COUNT(DISTINCT id)::INT AS SessionCount,
+       COUNT(DISTINCT user_id)::INT AS ActiveUsers
+FROM expanded
+GROUP BY Weekday, Hour
+ORDER BY Weekday ASC, Hour ASC;";
+
+        await using var conn = CreateConnection();
+        var rows = await conn.QueryAsync<VoiceWeekdayHourlyActivity>(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            FromUtcInclusive = fromUtcInclusive,
+            ToUtcExclusive = toUtcExclusive
+        });
+        return rows.ToList();
+    }
+
+    public async Task<IReadOnlyList<VoiceUserHourSummary>> ListVoiceTopUsersByHourAsync(
+        ulong guildId,
+        DateTimeOffset fromUtcInclusive,
+        DateTimeOffset toUtcExclusive,
+        int hourJst,
+        int topCount)
+    {
+        if (toUtcExclusive <= fromUtcInclusive)
+        {
+            return Array.Empty<VoiceUserHourSummary>();
+        }
+
+        var normalizedHour = Math.Clamp(hourJst, 0, 23);
+        var normalizedTopCount = Math.Clamp(topCount, 1, 20);
+
+        const string sql = @"
+WITH bounded AS (
+    SELECT id,
+           user_id,
+           GREATEST(joined_at, @FromUtcInclusive) AS start_utc,
+           LEAST(COALESCE(left_at, @ToUtcExclusive), @ToUtcExclusive) AS end_utc
+    FROM voice_sessions
+    WHERE guild_id = @GuildId
+      AND COALESCE(left_at, @ToUtcExclusive) > @FromUtcInclusive
+      AND joined_at < @ToUtcExclusive
+),
+expanded AS (
+    SELECT b.user_id,
+           gs.bucket_start,
+           (b.start_utc AT TIME ZONE 'Asia/Tokyo') AS start_jst,
+           (b.end_utc AT TIME ZONE 'Asia/Tokyo') AS end_jst
+    FROM bounded b
+    CROSS JOIN LATERAL generate_series(
+        date_trunc('hour', b.start_utc AT TIME ZONE 'Asia/Tokyo'),
+        date_trunc('hour', (b.end_utc AT TIME ZONE 'Asia/Tokyo') - INTERVAL '1 second'),
+        INTERVAL '1 hour'
+    ) AS gs(bucket_start)
+)
+SELECT user_id AS UserId,
+       COALESCE(SUM(
+           GREATEST(
+               0,
+               EXTRACT(EPOCH FROM (
+                   LEAST(end_jst, bucket_start + INTERVAL '1 hour')
+                   - GREATEST(start_jst, bucket_start)
+               ))
+           )
+       ), 0)::BIGINT AS DurationSeconds
+FROM expanded
+WHERE EXTRACT(HOUR FROM bucket_start)::INT = @HourJst
+GROUP BY user_id
+HAVING COALESCE(SUM(
+           GREATEST(
+               0,
+               EXTRACT(EPOCH FROM (
+                   LEAST(end_jst, bucket_start + INTERVAL '1 hour')
+                   - GREATEST(start_jst, bucket_start)
+               ))
+           )
+       ), 0) > 0
+ORDER BY DurationSeconds DESC, user_id ASC
+LIMIT @TopCount;";
+
+        await using var conn = CreateConnection();
+        var rows = await conn.QueryAsync<VoiceUserHourSummary>(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            FromUtcInclusive = fromUtcInclusive,
+            ToUtcExclusive = toUtcExclusive,
+            HourJst = normalizedHour,
+            TopCount = normalizedTopCount
+        });
+        return rows.ToList();
+    }
+
     public async Task<IReadOnlyCollection<ulong>> ListActiveUserIdsSinceAsync(ulong guildId, DateTimeOffset sinceUtc)
     {
         const string sql = @"
@@ -1210,6 +1995,219 @@ GROUP BY channel_id, author_id;";
             ToUtcExclusive = toUtcExclusive
         });
         return rows.ToList();
+    }
+
+    public async Task<IReadOnlyList<MessageWeekdayHourlyActivity>> ListMessageWeekdayHourlyActivityAsync(
+        ulong guildId,
+        DateTimeOffset fromUtcInclusive,
+        DateTimeOffset toUtcExclusive)
+    {
+        if (toUtcExclusive <= fromUtcInclusive)
+        {
+            return Array.Empty<MessageWeekdayHourlyActivity>();
+        }
+
+        const string sql = @"
+SELECT ((EXTRACT(ISODOW FROM created_at AT TIME ZONE 'Asia/Tokyo')::INT + 6) % 7) AS Weekday,
+       EXTRACT(HOUR FROM created_at AT TIME ZONE 'Asia/Tokyo')::INT AS Hour,
+       COUNT(1)::BIGINT AS MessageCount,
+       COUNT(DISTINCT author_id)::INT AS ActiveUsers
+FROM message_logs
+WHERE guild_id = @GuildId
+  AND deleted_at IS NULL
+  AND created_at >= @FromUtcInclusive
+  AND created_at < @ToUtcExclusive
+GROUP BY Weekday, Hour
+ORDER BY Weekday ASC, Hour ASC;";
+
+        await using var conn = CreateConnection();
+        var rows = await conn.QueryAsync<MessageWeekdayHourlyActivity>(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            FromUtcInclusive = fromUtcInclusive,
+            ToUtcExclusive = toUtcExclusive
+        });
+        return rows.ToList();
+    }
+
+    public async Task RecordActivityRankingAwardsAsync(
+        ulong guildId,
+        string rankingKey,
+        IReadOnlyCollection<ulong> userIds,
+        IReadOnlyDictionary<ulong, int>? bestRanksByUser = null)
+    {
+        if (string.IsNullOrWhiteSpace(rankingKey) || userIds.Count == 0)
+        {
+            return;
+        }
+
+        var normalized = userIds
+            .Where(id => id != 0)
+            .Select(ToDbId)
+            .Distinct()
+            .ToArray();
+        if (normalized.Length == 0)
+        {
+            return;
+        }
+
+        var normalizedRankingKey = rankingKey.Trim();
+        var guildDbId = ToDbId(guildId);
+        var rows = normalized.Select(dbUserId =>
+        {
+            var userId = ToUlong(dbUserId);
+            int? bestRank = null;
+            if (bestRanksByUser is not null &&
+                bestRanksByUser.TryGetValue(userId, out var rank) &&
+                rank > 0)
+            {
+                bestRank = Math.Clamp(rank, 1, 99);
+            }
+
+            return new
+            {
+                GuildId = guildDbId,
+                RankingKey = normalizedRankingKey,
+                UserId = dbUserId,
+                BestRank = bestRank
+            };
+        }).ToArray();
+
+        const string sql = @"
+INSERT INTO activity_ranking_awards (guild_id, ranking_key, user_id, best_rank)
+VALUES (@GuildId, @RankingKey, @UserId, @BestRank)
+ON CONFLICT (guild_id, ranking_key, user_id) DO UPDATE
+SET best_rank = CASE
+    WHEN activity_ranking_awards.best_rank IS NULL THEN EXCLUDED.best_rank
+    WHEN EXCLUDED.best_rank IS NULL THEN activity_ranking_awards.best_rank
+    ELSE LEAST(activity_ranking_awards.best_rank, EXCLUDED.best_rank)
+END;";
+
+        await using var conn = CreateConnection();
+        await conn.ExecuteAsync(sql, rows);
+    }
+
+    public async Task<int> CountActivityRankingAwardsByUserAsync(ulong guildId, ulong userId)
+    {
+        if (guildId == 0 || userId == 0)
+        {
+            return 0;
+        }
+
+        const string sql = @"
+SELECT COUNT(1)::INT
+FROM activity_ranking_awards
+WHERE guild_id = @GuildId
+  AND user_id = @UserId;";
+
+        await using var conn = CreateConnection();
+        var count = await conn.ExecuteScalarAsync<int>(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            UserId = ToDbId(userId)
+        });
+        return Math.Max(0, count);
+    }
+
+    public async Task<ActivityRankingPodiumCount> GetActivityRankingPodiumCountsByUserAsync(ulong guildId, ulong userId)
+    {
+        if (guildId == 0 || userId == 0)
+        {
+            return new ActivityRankingPodiumCount();
+        }
+
+        const string sql = @"
+SELECT COALESCE(SUM(CASE WHEN best_rank = 1 THEN 1 ELSE 0 END), 0)::INT AS FirstCount,
+       COALESCE(SUM(CASE WHEN best_rank = 2 THEN 1 ELSE 0 END), 0)::INT AS SecondCount,
+       COALESCE(SUM(CASE WHEN best_rank = 3 THEN 1 ELSE 0 END), 0)::INT AS ThirdCount
+FROM activity_ranking_awards
+WHERE guild_id = @GuildId
+  AND user_id = @UserId;";
+
+        await using var conn = CreateConnection();
+        var row = await conn.QuerySingleAsync<ActivityRankingPodiumCount>(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            UserId = ToDbId(userId)
+        });
+        return row ?? new ActivityRankingPodiumCount();
+    }
+
+    public async Task RecordActivityRankingMetricAwardsAsync(
+        ulong guildId,
+        string rankingKey,
+        string metricKey,
+        IReadOnlyList<ulong> rankedUserIds)
+    {
+        if (guildId == 0 ||
+            string.IsNullOrWhiteSpace(rankingKey) ||
+            string.IsNullOrWhiteSpace(metricKey) ||
+            rankedUserIds.Count == 0)
+        {
+            return;
+        }
+
+        var normalizedUsers = rankedUserIds
+            .Where(id => id != 0)
+            .Distinct()
+            .Take(50)
+            .Select(ToDbId)
+            .ToArray();
+        if (normalizedUsers.Length == 0)
+        {
+            return;
+        }
+
+        const string sql = @"
+WITH ranked AS (
+    SELECT uid AS user_id,
+           ord::INT AS rank
+    FROM UNNEST(@UserIds::BIGINT[]) WITH ORDINALITY AS x(uid, ord)
+)
+INSERT INTO activity_ranking_metric_awards (guild_id, ranking_key, metric_key, user_id, rank)
+SELECT @GuildId, @RankingKey, @MetricKey, user_id, rank
+FROM ranked
+ON CONFLICT (guild_id, ranking_key, metric_key, user_id) DO UPDATE
+SET rank = LEAST(activity_ranking_metric_awards.rank, EXCLUDED.rank),
+    updated_at = NOW();";
+
+        await using var conn = CreateConnection();
+        await conn.ExecuteAsync(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            RankingKey = rankingKey.Trim(),
+            MetricKey = metricKey.Trim(),
+            UserIds = normalizedUsers
+        });
+    }
+
+    public async Task<ActivityRankingPodiumCount> GetActivityRankingMetricPodiumCountsByUserAsync(
+        ulong guildId,
+        ulong userId,
+        string metricKey)
+    {
+        if (guildId == 0 || userId == 0 || string.IsNullOrWhiteSpace(metricKey))
+        {
+            return new ActivityRankingPodiumCount();
+        }
+
+        const string sql = @"
+SELECT COALESCE(SUM(CASE WHEN rank = 1 THEN 1 ELSE 0 END), 0)::INT AS FirstCount,
+       COALESCE(SUM(CASE WHEN rank = 2 THEN 1 ELSE 0 END), 0)::INT AS SecondCount,
+       COALESCE(SUM(CASE WHEN rank = 3 THEN 1 ELSE 0 END), 0)::INT AS ThirdCount
+FROM activity_ranking_metric_awards
+WHERE guild_id = @GuildId
+  AND user_id = @UserId
+  AND metric_key = @MetricKey;";
+
+        await using var conn = CreateConnection();
+        var row = await conn.QuerySingleAsync<ActivityRankingPodiumCount>(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            UserId = ToDbId(userId),
+            MetricKey = metricKey.Trim()
+        });
+        return row ?? new ActivityRankingPodiumCount();
     }
 
     public async Task<IReadOnlyList<ReactionCountByChannel>> ListReactionCountsByChannelAsync(
@@ -1452,6 +2450,321 @@ LIMIT @MaxRows;";
         return rows.ToList();
     }
 
+    public async Task<IReadOnlyList<MessageLog>> ListRecentMessageLogsByChannelAsync(
+        ulong guildId,
+        ulong channelId,
+        ulong? userId = null,
+        int maxRows = 1000,
+        bool includeDeleted = false)
+    {
+        const string sql = @"
+SELECT message_id AS MessageId,
+       guild_id AS GuildId,
+       channel_id AS ChannelId,
+       author_id AS AuthorId,
+       author_name AS AuthorName,
+       author_display_name AS AuthorDisplayName,
+       content AS Content,
+       attachment_count AS AttachmentCount,
+       embed_count AS EmbedCount,
+       attachments_json::text AS AttachmentsJson,
+       embeds_json::text AS EmbedsJson,
+       created_at AS CreatedAt,
+       edited_at AS EditedAt,
+       deleted_at AS DeletedAt
+FROM message_logs
+WHERE guild_id = @GuildId
+  AND channel_id = @ChannelId
+  AND (@UserId IS NULL OR author_id = @UserId)
+  AND (@IncludeDeleted OR deleted_at IS NULL)
+ORDER BY created_at DESC, message_id DESC
+LIMIT @MaxRows;";
+
+        await using var conn = CreateConnection();
+        long? userDbId = userId.HasValue ? ToDbId(userId.Value) : null;
+        var rows = await conn.QueryAsync<MessageLog>(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            ChannelId = ToDbId(channelId),
+            UserId = userDbId,
+            IncludeDeleted = includeDeleted,
+            MaxRows = Math.Clamp(maxRows, 1, 5000)
+        });
+        return rows.ToList();
+    }
+
+    public async Task<bool> ExistsSsAlbumFavoriteAsync(
+        ulong guildId,
+        ulong viewerUserId,
+        ulong messageId,
+        ulong attachmentId)
+    {
+        if (guildId == 0 || viewerUserId == 0 || messageId == 0 || attachmentId == 0)
+        {
+            return false;
+        }
+
+        const string sql = @"
+SELECT EXISTS (
+    SELECT 1
+    FROM public.ss_album_favorites
+    WHERE guild_id = @GuildId
+      AND viewer_user_id = @ViewerUserId
+      AND message_id = @MessageId
+      AND attachment_id = @AttachmentId
+);";
+
+        await using var conn = CreateConnection();
+        return await conn.ExecuteScalarAsync<bool>(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            ViewerUserId = ToDbId(viewerUserId),
+            MessageId = ToDbId(messageId),
+            AttachmentId = ToDbId(attachmentId)
+        });
+    }
+
+    public async Task UpsertSsAlbumFavoriteAsync(
+        ulong guildId,
+        ulong viewerUserId,
+        ulong targetUserId,
+        ulong messageId,
+        ulong attachmentId,
+        ulong channelId,
+        string imageUrl,
+        string? fileName,
+        string? messageContent,
+        string? localPath,
+        DateTimeOffset postedAt)
+    {
+        if (guildId == 0 || viewerUserId == 0 || targetUserId == 0 || messageId == 0 || attachmentId == 0 || channelId == 0 ||
+            string.IsNullOrWhiteSpace(imageUrl))
+        {
+            return;
+        }
+
+        const string sql = @"
+INSERT INTO public.ss_album_favorites (
+    guild_id,
+    viewer_user_id,
+    target_user_id,
+    message_id,
+    attachment_id,
+    channel_id,
+    image_url,
+    file_name,
+    message_content,
+    local_path,
+    posted_at)
+VALUES (
+    @GuildId,
+    @ViewerUserId,
+    @TargetUserId,
+    @MessageId,
+    @AttachmentId,
+    @ChannelId,
+    @ImageUrl,
+    @FileName,
+    @MessageContent,
+    @LocalPath,
+    @PostedAt)
+ON CONFLICT (guild_id, viewer_user_id, message_id, attachment_id) DO UPDATE
+SET target_user_id = EXCLUDED.target_user_id,
+    channel_id = EXCLUDED.channel_id,
+    image_url = EXCLUDED.image_url,
+    file_name = EXCLUDED.file_name,
+    message_content = EXCLUDED.message_content,
+    local_path = EXCLUDED.local_path,
+    posted_at = EXCLUDED.posted_at,
+    updated_at = NOW();";
+
+        await using var conn = CreateConnection();
+        await conn.ExecuteAsync(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            ViewerUserId = ToDbId(viewerUserId),
+            TargetUserId = ToDbId(targetUserId),
+            MessageId = ToDbId(messageId),
+            AttachmentId = ToDbId(attachmentId),
+            ChannelId = ToDbId(channelId),
+            ImageUrl = imageUrl,
+            FileName = NullIfBlank(fileName),
+            MessageContent = NullIfBlank(messageContent),
+            LocalPath = NullIfBlank(localPath),
+            PostedAt = postedAt
+        });
+    }
+
+    public async Task<bool> DeleteSsAlbumFavoriteAsync(
+        ulong guildId,
+        ulong viewerUserId,
+        ulong messageId,
+        ulong attachmentId)
+    {
+        if (guildId == 0 || viewerUserId == 0 || messageId == 0 || attachmentId == 0)
+        {
+            return false;
+        }
+
+        const string sql = @"
+DELETE FROM public.ss_album_favorites
+WHERE guild_id = @GuildId
+  AND viewer_user_id = @ViewerUserId
+  AND message_id = @MessageId
+  AND attachment_id = @AttachmentId;";
+
+        await using var conn = CreateConnection();
+        var affected = await conn.ExecuteAsync(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            ViewerUserId = ToDbId(viewerUserId),
+            MessageId = ToDbId(messageId),
+            AttachmentId = ToDbId(attachmentId)
+        });
+        return affected > 0;
+    }
+
+    public async Task<IReadOnlyList<SsAlbumFavorite>> ListSsAlbumFavoritesAsync(
+        ulong guildId,
+        ulong viewerUserId,
+        ulong? targetUserId = null,
+        int maxRows = 2000)
+    {
+        if (guildId == 0 || viewerUserId == 0)
+        {
+            return Array.Empty<SsAlbumFavorite>();
+        }
+
+        const string sql = @"
+SELECT id AS Id,
+       guild_id AS GuildId,
+       viewer_user_id AS ViewerUserId,
+       target_user_id AS TargetUserId,
+       message_id AS MessageId,
+       attachment_id AS AttachmentId,
+       channel_id AS ChannelId,
+       image_url AS ImageUrl,
+       file_name AS FileName,
+       message_content AS MessageContent,
+       local_path AS LocalPath,
+       posted_at AS PostedAt,
+       created_at AS CreatedAt,
+       updated_at AS UpdatedAt
+FROM public.ss_album_favorites
+WHERE guild_id = @GuildId
+  AND viewer_user_id = @ViewerUserId
+  AND (@TargetUserId IS NULL OR target_user_id = @TargetUserId)
+ORDER BY posted_at DESC, id DESC
+LIMIT @MaxRows;";
+
+        await using var conn = CreateConnection();
+        long? targetUserDbId = targetUserId.HasValue ? ToDbId(targetUserId.Value) : null;
+        var rows = await conn.QueryAsync<SsAlbumFavorite>(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            ViewerUserId = ToDbId(viewerUserId),
+            TargetUserId = targetUserDbId,
+            MaxRows = Math.Clamp(maxRows, 1, 5000)
+        });
+        return rows.ToList();
+    }
+
+    public async Task<IReadOnlyList<SsAlbumFavoriteKey>> ListSsAlbumFavoriteKeysAsync(
+        ulong guildId,
+        ulong viewerUserId,
+        ulong? targetUserId = null,
+        int maxRows = 5000)
+    {
+        if (guildId == 0 || viewerUserId == 0)
+        {
+            return Array.Empty<SsAlbumFavoriteKey>();
+        }
+
+        const string sql = @"
+SELECT message_id AS MessageId,
+       attachment_id AS AttachmentId
+FROM public.ss_album_favorites
+WHERE guild_id = @GuildId
+  AND viewer_user_id = @ViewerUserId
+  AND (@TargetUserId IS NULL OR target_user_id = @TargetUserId)
+ORDER BY posted_at DESC, id DESC
+LIMIT @MaxRows;";
+
+        await using var conn = CreateConnection();
+        long? targetUserDbId = targetUserId.HasValue ? ToDbId(targetUserId.Value) : null;
+        var rows = await conn.QueryAsync<SsAlbumFavoriteKey>(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            ViewerUserId = ToDbId(viewerUserId),
+            TargetUserId = targetUserDbId,
+            MaxRows = Math.Clamp(maxRows, 1, 10000)
+        });
+        return rows.ToList();
+    }
+
+    public async Task<int> CountMessagesByUserAsync(
+        ulong guildId,
+        ulong userId,
+        DateTimeOffset fromUtcInclusive,
+        DateTimeOffset toUtcExclusive,
+        bool includeDeleted = false)
+    {
+        if (guildId == 0 || userId == 0 || toUtcExclusive <= fromUtcInclusive)
+        {
+            return 0;
+        }
+
+        const string sql = @"
+SELECT COUNT(1)::INT
+FROM message_logs
+WHERE guild_id = @GuildId
+  AND author_id = @UserId
+  AND created_at >= @FromUtcInclusive
+  AND created_at < @ToUtcExclusive
+  AND (@IncludeDeleted OR deleted_at IS NULL);";
+
+        await using var conn = CreateConnection();
+        var count = await conn.ExecuteScalarAsync<int>(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            UserId = ToDbId(userId),
+            FromUtcInclusive = fromUtcInclusive,
+            ToUtcExclusive = toUtcExclusive,
+            IncludeDeleted = includeDeleted
+        });
+        return Math.Max(0, count);
+    }
+
+    public async Task<int> CountReactionsByUserAsync(
+        ulong guildId,
+        ulong userId,
+        DateTimeOffset fromUtcInclusive,
+        DateTimeOffset toUtcExclusive)
+    {
+        if (guildId == 0 || userId == 0 || toUtcExclusive <= fromUtcInclusive)
+        {
+            return 0;
+        }
+
+        const string sql = @"
+SELECT COUNT(1)::INT
+FROM public.user_reaction_logs
+WHERE guild_id = @GuildId
+  AND user_id = @UserId
+  AND reacted_at >= @FromUtcInclusive
+  AND reacted_at < @ToUtcExclusive;";
+
+        await using var conn = CreateConnection();
+        var count = await conn.ExecuteScalarAsync<int>(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            UserId = ToDbId(userId),
+            FromUtcInclusive = fromUtcInclusive,
+            ToUtcExclusive = toUtcExclusive
+        });
+        return Math.Max(0, count);
+    }
+
     public async Task<IReadOnlyList<VoiceSession>> ListRecentVoiceSessionsAsync(
         ulong guildId,
         DateTimeOffset fromUtcInclusive,
@@ -1493,6 +2806,146 @@ LIMIT @MaxRows;";
             ToUtcExclusive = toUtcExclusive,
             UserId = userDbId,
             MaxRows = Math.Clamp(maxRows, 1, 200)
+        });
+        return rows.ToList();
+    }
+
+    public async Task<(int SessionCount, long TotalDurationSeconds)> SummarizeVoiceByUserAsync(
+        ulong guildId,
+        ulong userId,
+        DateTimeOffset fromUtcInclusive,
+        DateTimeOffset toUtcExclusive)
+    {
+        if (guildId == 0 || userId == 0 || toUtcExclusive <= fromUtcInclusive)
+        {
+            return (0, 0L);
+        }
+
+        const string sql = @"
+SELECT COUNT(1)::INT AS SessionCount,
+       COALESCE(SUM(
+           GREATEST(
+               0,
+               EXTRACT(
+                   EPOCH FROM (
+                       LEAST(COALESCE(left_at, @ToUtcExclusive), @ToUtcExclusive)
+                       - GREATEST(joined_at, @FromUtcInclusive)
+                   )
+               )
+           )
+       ), 0)::BIGINT AS TotalDurationSeconds
+FROM voice_sessions
+WHERE guild_id = @GuildId
+  AND user_id = @UserId
+  AND COALESCE(left_at, @ToUtcExclusive) > @FromUtcInclusive
+  AND joined_at < @ToUtcExclusive;";
+
+        await using var conn = CreateConnection();
+        var row = await conn.QuerySingleAsync<VoiceUserSummaryAggregate>(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            UserId = ToDbId(userId),
+            FromUtcInclusive = fromUtcInclusive,
+            ToUtcExclusive = toUtcExclusive
+        });
+        return (Math.Max(0, row.SessionCount), Math.Max(0L, row.TotalDurationSeconds));
+    }
+
+    public async Task<IReadOnlyList<MessageLog>> ListMessageLogsForUserExportAsync(
+        ulong guildId,
+        ulong userId,
+        DateTimeOffset fromUtcInclusive,
+        DateTimeOffset toUtcExclusive,
+        int maxRows = 5000,
+        bool includeDeleted = true)
+    {
+        if (guildId == 0 || userId == 0)
+        {
+            return Array.Empty<MessageLog>();
+        }
+
+        const string sql = @"
+SELECT message_id AS MessageId,
+       guild_id AS GuildId,
+       channel_id AS ChannelId,
+       author_id AS AuthorId,
+       author_name AS AuthorName,
+       author_display_name AS AuthorDisplayName,
+       content AS Content,
+       attachment_count AS AttachmentCount,
+       embed_count AS EmbedCount,
+       attachments_json::text AS AttachmentsJson,
+       embeds_json::text AS EmbedsJson,
+       created_at AS CreatedAt,
+       edited_at AS EditedAt,
+       deleted_at AS DeletedAt
+FROM message_logs
+WHERE guild_id = @GuildId
+  AND author_id = @UserId
+  AND created_at >= @FromUtcInclusive
+  AND created_at < @ToUtcExclusive
+  AND (@IncludeDeleted OR deleted_at IS NULL)
+ORDER BY created_at DESC, message_id DESC
+LIMIT @MaxRows;";
+
+        await using var conn = CreateConnection();
+        var rows = await conn.QueryAsync<MessageLog>(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            UserId = ToDbId(userId),
+            FromUtcInclusive = fromUtcInclusive,
+            ToUtcExclusive = toUtcExclusive,
+            IncludeDeleted = includeDeleted,
+            MaxRows = Math.Clamp(maxRows, 1, 50000)
+        });
+        return rows.ToList();
+    }
+
+    public async Task<IReadOnlyList<VoiceSession>> ListVoiceSessionsForUserExportAsync(
+        ulong guildId,
+        ulong userId,
+        DateTimeOffset fromUtcInclusive,
+        DateTimeOffset toUtcExclusive,
+        int maxRows = 5000)
+    {
+        if (guildId == 0 || userId == 0)
+        {
+            return Array.Empty<VoiceSession>();
+        }
+
+        const string sql = @"
+SELECT id AS Id,
+       guild_id AS GuildId,
+       channel_id AS ChannelId,
+       user_id AS UserId,
+       user_name AS UserName,
+       joined_at AS JoinedAt,
+       left_at AS LeftAt,
+       GREATEST(
+           0,
+           EXTRACT(
+               EPOCH FROM (
+                   LEAST(COALESCE(left_at, @ToUtcExclusive), @ToUtcExclusive)
+                   - GREATEST(joined_at, @FromUtcInclusive)
+               )
+           )::INT
+       ) AS DurationSeconds
+FROM voice_sessions
+WHERE guild_id = @GuildId
+  AND user_id = @UserId
+  AND COALESCE(left_at, @ToUtcExclusive) > @FromUtcInclusive
+  AND joined_at < @ToUtcExclusive
+ORDER BY joined_at DESC, id DESC
+LIMIT @MaxRows;";
+
+        await using var conn = CreateConnection();
+        var rows = await conn.QueryAsync<VoiceSession>(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            UserId = ToDbId(userId),
+            FromUtcInclusive = fromUtcInclusive,
+            ToUtcExclusive = toUtcExclusive,
+            MaxRows = Math.Clamp(maxRows, 1, 50000)
         });
         return rows.ToList();
     }
@@ -1575,6 +3028,54 @@ LIMIT 1;";
 
         await using var conn = CreateConnection();
         return await conn.QuerySingleOrDefaultAsync<LinkedCharacter>(sql, new { DiscordUserId = ToDbId(userId) });
+    }
+
+    public async Task<IReadOnlyList<GuildMemberMainCharacter>> ListMainLinkedCharactersForUsersAsync(IReadOnlyCollection<ulong> userIds)
+    {
+        if (userIds.Count == 0)
+        {
+            return Array.Empty<GuildMemberMainCharacter>();
+        }
+
+        const string sql = @"
+SELECT duc.discord_user_id AS DiscordUserId,
+       c.lodestone_id AS LodestoneId,
+       c.name AS Name,
+       c.world AS World,
+       c.data_center AS DataCenter,
+       c.lodestone_url AS LodestoneUrl
+FROM discord_user_characters duc
+JOIN lodestone_characters c ON c.lodestone_id = duc.lodestone_id
+WHERE duc.discord_user_id = ANY(@DiscordUserIds)
+  AND duc.is_main = TRUE;";
+
+        var ids = userIds.Select(ToDbId).ToArray();
+        await using var conn = CreateConnection();
+        var rows = await conn.QueryAsync<GuildMemberMainCharacter>(sql, new { DiscordUserIds = ids });
+        return rows.ToList();
+    }
+
+    public async Task<bool> TryInsertFfLogsSeenReportAsync(ulong guildId, string reportCode, DateTimeOffset detectedAt, DateTimeOffset? reportEndAt = null)
+    {
+        if (string.IsNullOrWhiteSpace(reportCode))
+        {
+            return false;
+        }
+
+        const string sql = @"
+INSERT INTO public.fflogs_seen_reports (guild_id, report_code, detected_at, report_end_at)
+VALUES (@GuildId, @ReportCode, @DetectedAt, @ReportEndAt)
+ON CONFLICT (guild_id, report_code) DO NOTHING;";
+
+        await using var conn = CreateConnection();
+        var affected = await conn.ExecuteAsync(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            ReportCode = reportCode.Trim(),
+            DetectedAt = detectedAt,
+            ReportEndAt = reportEndAt
+        });
+        return affected > 0;
     }
 
     public async Task UpdateCharacterPortraitAsync(long lodestoneId, string portraitUrl)
@@ -3546,6 +5047,9 @@ SELECT guild_id AS GuildId,
        runtime_cleanup_interval_minutes AS RuntimeCleanupIntervalMinutes,
        runtime_recruit_closed_retention_hours AS RuntimeRecruitClosedRetentionHours,
        runtime_recruit_canceled_retention_hours AS RuntimeRecruitCanceledRetentionHours,
+       runtime_message_log_retention_days AS RuntimeMessageLogRetentionDays,
+       runtime_voice_session_retention_days AS RuntimeVoiceSessionRetentionDays,
+       runtime_reaction_log_retention_days AS RuntimeReactionLogRetentionDays,
        runtime_tuning_updated_at AS RuntimeTuningUpdatedAt,
        updated_at AS UpdatedAt
 FROM guild_settings
@@ -3629,7 +5133,10 @@ WHERE guild_id = @GuildId;";
         ulong guildId,
         int cleanupIntervalMinutes,
         int recruitClosedRetentionHours,
-        int recruitCanceledRetentionHours)
+        int recruitCanceledRetentionHours,
+        int messageLogRetentionDays,
+        int voiceSessionRetentionDays,
+        int reactionLogRetentionDays)
     {
         const string sql = @"
 INSERT INTO guild_settings (
@@ -3646,6 +5153,9 @@ INSERT INTO guild_settings (
     runtime_cleanup_interval_minutes,
     runtime_recruit_closed_retention_hours,
     runtime_recruit_canceled_retention_hours,
+    runtime_message_log_retention_days,
+    runtime_voice_session_retention_days,
+    runtime_reaction_log_retention_days,
     runtime_tuning_updated_at)
 VALUES (
     @GuildId,
@@ -3661,11 +5171,17 @@ VALUES (
     @CleanupIntervalMinutes,
     @RecruitClosedRetentionHours,
     @RecruitCanceledRetentionHours,
+    @MessageLogRetentionDays,
+    @VoiceSessionRetentionDays,
+    @ReactionLogRetentionDays,
     NOW())
 ON CONFLICT (guild_id) DO UPDATE
 SET runtime_cleanup_interval_minutes = EXCLUDED.runtime_cleanup_interval_minutes,
     runtime_recruit_closed_retention_hours = EXCLUDED.runtime_recruit_closed_retention_hours,
     runtime_recruit_canceled_retention_hours = EXCLUDED.runtime_recruit_canceled_retention_hours,
+    runtime_message_log_retention_days = EXCLUDED.runtime_message_log_retention_days,
+    runtime_voice_session_retention_days = EXCLUDED.runtime_voice_session_retention_days,
+    runtime_reaction_log_retention_days = EXCLUDED.runtime_reaction_log_retention_days,
     runtime_tuning_updated_at = NOW(),
     updated_at = NOW();";
 
@@ -3675,7 +5191,10 @@ SET runtime_cleanup_interval_minutes = EXCLUDED.runtime_cleanup_interval_minutes
             GuildId = ToDbId(guildId),
             CleanupIntervalMinutes = cleanupIntervalMinutes,
             RecruitClosedRetentionHours = recruitClosedRetentionHours,
-            RecruitCanceledRetentionHours = recruitCanceledRetentionHours
+            RecruitCanceledRetentionHours = recruitCanceledRetentionHours,
+            MessageLogRetentionDays = messageLogRetentionDays,
+            VoiceSessionRetentionDays = voiceSessionRetentionDays,
+            ReactionLogRetentionDays = reactionLogRetentionDays
         });
     }
 
@@ -3695,6 +5214,9 @@ SELECT guild_id AS GuildId,
        runtime_cleanup_interval_minutes AS RuntimeCleanupIntervalMinutes,
        runtime_recruit_closed_retention_hours AS RuntimeRecruitClosedRetentionHours,
        runtime_recruit_canceled_retention_hours AS RuntimeRecruitCanceledRetentionHours,
+       runtime_message_log_retention_days AS RuntimeMessageLogRetentionDays,
+       runtime_voice_session_retention_days AS RuntimeVoiceSessionRetentionDays,
+       runtime_reaction_log_retention_days AS RuntimeReactionLogRetentionDays,
        runtime_tuning_updated_at AS RuntimeTuningUpdatedAt,
        updated_at AS UpdatedAt
 FROM guild_settings
@@ -5742,9 +7264,11 @@ WHERE id = @Id;";
         }
 
         var actorsByUser = new Dictionary<long, RebalanceActor>();
-        foreach (var slot in slots.Where(slot => slot.UserId.HasValue))
+        foreach (var group in slots
+                     .Where(slot => slot.UserId.HasValue)
+                     .GroupBy(slot => slot.UserId!.Value))
         {
-            var actor = BuildRebalanceActorForExistingSlot(slot, postInfo, slotByPosition);
+            var actor = BuildRebalanceActorForExistingUserSlots(group.ToArray(), postInfo, slotByPosition);
             if (actor is null)
             {
                 return false;
@@ -6044,6 +7568,91 @@ WHERE id = @Id;";
             AllowedJobs: allowedJobs,
             PreferredPosition: currentPosition,
             PreferredJob: currentJob);
+    }
+
+    private static RebalanceActor? BuildRebalanceActorForExistingUserSlots(
+        IReadOnlyList<RecruitSlot> userSlots,
+        RecruitPostLockInfo postInfo,
+        IReadOnlyDictionary<string, RecruitSlot> slotByPosition)
+    {
+        if (userSlots.Count == 0)
+        {
+            return null;
+        }
+
+        RebalanceActor? bestActor = null;
+        var bestScore = int.MinValue;
+        var bestUpdatedAt = DateTimeOffset.MinValue;
+        var bestSlotId = int.MinValue;
+
+        foreach (var slot in userSlots)
+        {
+            var candidate = BuildRebalanceActorForExistingSlot(slot, postInfo, slotByPosition);
+            if (candidate is null)
+            {
+                continue;
+            }
+
+            var score = ScoreRebalancePrimarySlot(slot, postInfo);
+            var isBetter = score > bestScore ||
+                           (score == bestScore && slot.UpdatedAt > bestUpdatedAt) ||
+                           (score == bestScore && slot.UpdatedAt == bestUpdatedAt && slot.Id > bestSlotId);
+            if (!isBetter)
+            {
+                continue;
+            }
+
+            bestActor = candidate;
+            bestScore = score;
+            bestUpdatedAt = slot.UpdatedAt;
+            bestSlotId = slot.Id;
+        }
+
+        return bestActor;
+    }
+
+    private static int ScoreRebalancePrimarySlot(RecruitSlot slot, RecruitPostLockInfo postInfo)
+    {
+        var currentPosition = slot.Position?.Trim().ToUpperInvariant();
+        if (string.IsNullOrWhiteSpace(currentPosition))
+        {
+            return int.MinValue;
+        }
+
+        var isHost = slot.UserId.HasValue && slot.UserId.Value == postInfo.CreatorUserId;
+        var rawPositions = isHost
+            ? ParseFlexPositions(postInfo.HostFlexSpec)
+            : ParseFlexPositions(slot.FlexSpec);
+        var hasFlexiblePositions = rawPositions.Count >= 2;
+        var includesCurrentPosition = hasFlexiblePositions &&
+                                      rawPositions.Contains(currentPosition, StringComparer.OrdinalIgnoreCase);
+
+        var score = 0;
+        if (includesCurrentPosition)
+        {
+            score += 200;
+        }
+        else if (hasFlexiblePositions)
+        {
+            score -= 200;
+        }
+
+        if (!slot.IsClosed)
+        {
+            score += 20;
+        }
+
+        if (!string.IsNullOrWhiteSpace(slot.Job))
+        {
+            score += 10;
+        }
+
+        if (!string.IsNullOrWhiteSpace(slot.UserName))
+        {
+            score += 5;
+        }
+
+        return score;
     }
 
     private sealed record RebalanceActor(

@@ -15,6 +15,9 @@ public sealed class GuildSettings
     public int? RuntimeCleanupIntervalMinutes { get; init; }
     public int? RuntimeRecruitClosedRetentionHours { get; init; }
     public int? RuntimeRecruitCanceledRetentionHours { get; init; }
+    public int? RuntimeMessageLogRetentionDays { get; init; }
+    public int? RuntimeVoiceSessionRetentionDays { get; init; }
+    public int? RuntimeReactionLogRetentionDays { get; init; }
     public DateTimeOffset? RuntimeTuningUpdatedAt { get; init; }
     public DateTimeOffset UpdatedAt { get; init; }
 }

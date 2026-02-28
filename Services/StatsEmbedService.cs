@@ -38,10 +38,19 @@ public sealed class StatsEmbedService
 
     private static readonly string[] PreferredChartFonts =
     [
-        "Segoe UI",
         "Yu Gothic UI",
         "Meiryo",
+        "BIZ UDPGothic",
         "Noto Sans CJK JP",
+        "Noto Sans JP",
+        "Source Han Sans JP",
+        "IPAexGothic",
+        "IPAGothic",
+        "TakaoPGothic",
+        "Hiragino Sans",
+        "MS Gothic",
+        "Segoe UI",
+        "Arial Unicode MS",
         "Arial"
     ];
 
@@ -860,16 +869,44 @@ public sealed class StatsEmbedService
         {
             if (SystemFonts.TryGet(name, out var family))
             {
-                return family.CreateFont(size, style);
+                try
+                {
+                    return family.CreateFont(size, style);
+                }
+                catch
+                {
+                    try
+                    {
+                        return family.CreateFont(size, FontStyle.Regular);
+                    }
+                    catch
+                    {
+                        // Try next family.
+                    }
+                }
             }
         }
 
-        if (SystemFonts.Collection.Families.Any())
+        foreach (var family in SystemFonts.Collection.Families)
         {
-            return SystemFonts.Collection.Families.First().CreateFont(size, style);
+            try
+            {
+                return family.CreateFont(size, style);
+            }
+            catch
+            {
+                try
+                {
+                    return family.CreateFont(size, FontStyle.Regular);
+                }
+                catch
+                {
+                    // Try next family.
+                }
+            }
         }
 
-        throw new InvalidOperationException("No system fonts available.");
+        throw new InvalidOperationException("No usable system fonts available.");
     }
 
     private static FontRectangle MeasureTextSmooth(string text, Font font)

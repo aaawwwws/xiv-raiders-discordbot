@@ -25,8 +25,25 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
     private const string MemberProfileEditModalCustomId = "member_profile_edit_modal";
     private const string MemberRegistrationApprovePrefix = "member_registration_review_approve";
     private const string MemberRegistrationRejectPrefix = "member_registration_review_reject";
+    private const string MemberRegistrationPendingPrefix = "member_registration_review_pending";
+    private const string MemberRegistrationKickPrefix = "member_registration_review_kick";
+    private const string MemberRegistrationBanPrefix = "member_registration_review_ban";
+    private const string MemberRegistrationDangerConfirmPrefix = "member_registration_review_danger_confirm";
+    private const string MemberRegistrationDangerCancelPrefix = "member_registration_review_danger_cancel";
+    private const string MemberRegistrationViewNotesPrefix = "member_registration_review_view_notes";
+    private const string MemberRegistrationAddNotePrefix = "member_registration_review_add_note";
+    private const string MemberRegistrationAddNoteModalPrefix = "member_registration_review_add_note_modal";
     private const string CwlsChannelName = "cwls";
     private static readonly TimeSpan MemberRegistrationDraftTimeout = TimeSpan.FromMinutes(15);
+
+    private enum MemberRegistrationReviewAction
+    {
+        Approve,
+        Reject,
+        Pending,
+        Kick,
+        Ban
+    }
 
     private readonly Db _db;
     private readonly LodestoneClient _lodestone;
@@ -888,14 +905,126 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
     [RequireBotAdmin]
     [ComponentInteraction("member_registration_review_approve:*", ignoreGroupNames: true)]
     public Task ApproveMemberRegistrationAsync(string userIdToken)
-        => HandleMemberRegistrationReviewAsync(userIdToken, approved: true);
+        => HandleMemberRegistrationReviewAsync(userIdToken, MemberRegistrationReviewAction.Approve);
 
     [RequireBotAdmin]
     [ComponentInteraction("member_registration_review_reject:*", ignoreGroupNames: true)]
     public Task RejectMemberRegistrationAsync(string userIdToken)
-        => HandleMemberRegistrationReviewAsync(userIdToken, approved: false);
+        => HandleMemberRegistrationReviewAsync(userIdToken, MemberRegistrationReviewAction.Reject);
 
-    private async Task HandleMemberRegistrationReviewAsync(string userIdToken, bool approved)
+    [RequireBotAdmin]
+    [ComponentInteraction("member_registration_review_pending:*", ignoreGroupNames: true)]
+    public Task PendingMemberRegistrationAsync(string userIdToken)
+        => HandleMemberRegistrationReviewAsync(userIdToken, MemberRegistrationReviewAction.Pending);
+
+    [RequireBotAdmin]
+    [ComponentInteraction("member_registration_review_kick:*", ignoreGroupNames: true)]
+    public Task KickMemberRegistrationAsync(string userIdToken)
+        => HandleMemberRegistrationReviewAsync(userIdToken, MemberRegistrationReviewAction.Kick);
+
+    [RequireBotAdmin]
+    [ComponentInteraction("member_registration_review_ban:*", ignoreGroupNames: true)]
+    public Task BanMemberRegistrationAsync(string userIdToken)
+        => HandleMemberRegistrationReviewAsync(userIdToken, MemberRegistrationReviewAction.Ban);
+
+    [RequireBotAdmin]
+    [ComponentInteraction("member_registration_review_danger_confirm:*:*", ignoreGroupNames: true)]
+    public Task ConfirmMemberRegistrationDangerActionAsync(string actionToken, string userIdToken)
+    {
+        if (!TryParseMemberRegistrationDangerAction(actionToken, out var action))
+        {
+            return RespondAsync("操作種別が不正です。", ephemeral: true);
+        }
+
+        return HandleMemberRegistrationReviewAsync(userIdToken, action, skipDangerConfirmation: true);
+    }
+
+    [RequireBotAdmin]
+    [ComponentInteraction("member_registration_review_danger_cancel:*", ignoreGroupNames: true)]
+    public Task CancelMemberRegistrationDangerActionAsync(string _)
+        => RespondAsync("操作をキャンセルしました。", ephemeral: true);
+
+    [RequireBotAdmin]
+    [ComponentInteraction(MemberRegistrationViewNotesPrefix + ":*", ignoreGroupNames: true)]
+    public async Task ViewMemberRegistrationAdminNotesAsync(string userIdToken)
+    {
+        if (Context.Guild is null)
+        {
+            await RespondAsync("この操作はサーバー内でのみ使えます。", ephemeral: true);
+            return;
+        }
+
+        if (!ulong.TryParse(userIdToken, out var targetUserId) || targetUserId == 0)
+        {
+            await RespondAsync("対象ユーザーを判定できませんでした。", ephemeral: true);
+            return;
+        }
+
+        var notes = await _db.ListAdminMemberNotesAsync(Context.Guild.Id, targetUserId, maxRows: 5);
+        var target = Context.Guild.GetUser(targetUserId);
+        var targetLabel = target is null ? $"<@{targetUserId}>" : FormatUser(target);
+        var embed = new EmbedBuilder()
+            .WithTitle("登録確認: 管理者メモ")
+            .WithColor(Color.DarkBlue)
+            .WithCurrentTimestamp()
+            .AddField("対象", targetLabel, false)
+            .AddField("最新5件", BuildRegistrationAdminNotesSummary(notes), false)
+            .Build();
+        await RespondAsync(embed: embed, ephemeral: true);
+    }
+
+    [RequireBotAdmin]
+    [ComponentInteraction(MemberRegistrationAddNotePrefix + ":*", ignoreGroupNames: true)]
+    public async Task OpenMemberRegistrationAdminNoteModalAsync(string userIdToken)
+    {
+        if (!ulong.TryParse(userIdToken, out var targetUserId) || targetUserId == 0)
+        {
+            await RespondAsync("対象ユーザーを判定できませんでした。", ephemeral: true);
+            return;
+        }
+
+        await RespondWithModalAsync<MemberManageNoteModal>($"{MemberRegistrationAddNoteModalPrefix}:{targetUserId}");
+    }
+
+    [RequireBotAdmin]
+    [ModalInteraction(MemberRegistrationAddNoteModalPrefix + ":*", ignoreGroupNames: true)]
+    public async Task HandleMemberRegistrationAdminNoteModalAsync(string userIdToken, MemberManageNoteModal modal)
+    {
+        if (Context.Guild is null)
+        {
+            await RespondAsync("この操作はサーバー内でのみ使えます。", ephemeral: true);
+            return;
+        }
+
+        if (!ulong.TryParse(userIdToken, out var targetUserId) || targetUserId == 0)
+        {
+            await RespondAsync("対象ユーザーを判定できませんでした。", ephemeral: true);
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(modal.Note))
+        {
+            await RespondAsync("管理者メモを入力してください。", ephemeral: true);
+            return;
+        }
+
+        var note = modal.Note.Trim();
+        await _db.AddAdminMemberNoteAsync(
+            Context.Guild.Id,
+            targetUserId,
+            Context.User.Id,
+            Context.User.ToString(),
+            note);
+
+        await TryRefreshMemberRegistrationReviewEmbedAsync(targetUserId);
+        await LogMemberRegistrationAdminNoteAddedAsync(targetUserId, note);
+        await RespondAsync($"管理者メモを追加しました。\n{TruncateForLog(note, 120)}", ephemeral: true);
+    }
+
+    private async Task HandleMemberRegistrationReviewAsync(
+        string userIdToken,
+        MemberRegistrationReviewAction action,
+        bool skipDangerConfirmation = false)
     {
         if (Context.Guild is null)
         {
@@ -906,6 +1035,12 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
         if (!ulong.TryParse(userIdToken, out var targetUserId))
         {
             await RespondAsync("対象ユーザーを判定できませんでした。", ephemeral: true);
+            return;
+        }
+
+        if ((action is MemberRegistrationReviewAction.Kick or MemberRegistrationReviewAction.Ban) && !skipDangerConfirmation)
+        {
+            await ShowMemberRegistrationDangerConfirmAsync(targetUserId, action);
             return;
         }
 
@@ -920,11 +1055,24 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
 
         if (targetUser is null)
         {
-            await FinalizeMemberRegistrationReviewMessageAsync(
-                approved,
+            await UpdateMemberRegistrationReviewMessageAsync(
+                action,
                 $"対象ユーザー ({targetUserId}) がサーバー内で見つかりませんでした。",
-                markError: true);
+                markError: true,
+                targetUserId: targetUserId);
             await FollowupAsync("対象ユーザーが見つかりませんでした。", ephemeral: true);
+            return;
+        }
+
+        if (action == MemberRegistrationReviewAction.Pending)
+        {
+            await LogMemberRegistrationPendingAsync(targetUser);
+            await UpdateMemberRegistrationReviewMessageAsync(
+                action,
+                $"対応: {GetMemberRegistrationActionLabel(action)}\n対象: {FormatUser(targetUser)}\n対応者: {FormatUser(Context.User)}",
+                markError: false,
+                targetUserId: targetUserId);
+            await FollowupAsync($"登録申請を保留にしました: {targetUser.Mention}", ephemeral: true);
             return;
         }
 
@@ -933,15 +1081,31 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
         var provisionalRole = ResolveProvisionalRole(Context.Guild, settings);
         var profile = await _db.GetDiscordUserProfileAsync(targetUser.Id);
 
-        if (approved && memberRole is null)
+        if (action == MemberRegistrationReviewAction.Approve && memberRole is null)
         {
             await FollowupAsync("メンバーロールを取得できませんでした。", ephemeral: true);
             return;
         }
 
+        if (action == MemberRegistrationReviewAction.Kick &&
+            !TryValidateKickOperation(Context.Guild, targetUser, out var kickValidationReason))
+        {
+            await FollowupAsync($"キックできません: {kickValidationReason}", ephemeral: true);
+            return;
+        }
+
+        if (action == MemberRegistrationReviewAction.Ban &&
+            !TryValidateBanOperation(Context.Guild, targetUser, out var banValidationReason))
+        {
+            await FollowupAsync($"BANできません: {banValidationReason}", ephemeral: true);
+            return;
+        }
+
         try
         {
-            if (provisionalRole is not null && targetUser.Roles.Any(role => role.Id == provisionalRole.Id))
+            if (action is MemberRegistrationReviewAction.Approve or MemberRegistrationReviewAction.Reject &&
+                provisionalRole is not null &&
+                targetUser.Roles.Any(role => role.Id == provisionalRole.Id))
             {
                 if (!TryValidateRoleOperation(Context.Guild, targetUser, provisionalRole, out var reason))
                 {
@@ -958,7 +1122,9 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
                 await targetUser.RemoveRoleAsync(provisionalRole);
             }
 
-            if (approved && memberRole is not null && targetUser.Roles.All(role => role.Id != memberRole.Id))
+            if (action == MemberRegistrationReviewAction.Approve &&
+                memberRole is not null &&
+                targetUser.Roles.All(role => role.Id != memberRole.Id))
             {
                 if (!TryValidateRoleOperation(Context.Guild, targetUser, memberRole, out var reason))
                 {
@@ -975,44 +1141,134 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
                 await targetUser.AddRoleAsync(memberRole);
             }
 
-            if (approved && profile is not null)
+            if (action == MemberRegistrationReviewAction.Approve && profile is not null)
             {
                 await GrantDcRoleAsync(targetUser, profile.FfxivDataCenter);
                 await UpdateNicknameAsync(targetUser, profile.FfxivName ?? string.Empty, profile.FfxivWorld ?? string.Empty);
             }
+
+            if (action == MemberRegistrationReviewAction.Kick)
+            {
+                await targetUser.KickAsync($"member_registration_review by {Context.User.Username} ({Context.User.Id})");
+            }
+
+            if (action == MemberRegistrationReviewAction.Ban)
+            {
+                await Context.Guild.AddBanAsync(targetUser.Id, pruneDays: 0, reason: $"member_registration_review by {Context.User.Username} ({Context.User.Id})");
+            }
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Failed to process member registration review. GuildId={GuildId}, UserId={UserId}, Approved={Approved}", Context.Guild.Id, targetUser.Id, approved);
-            await FollowupAsync("ロール付与処理に失敗しました。Botの権限を確認してください。", ephemeral: true);
+            _logger.LogWarning(
+                ex,
+                "Failed to process member registration review. GuildId={GuildId}, UserId={UserId}, Action={Action}",
+                Context.Guild.Id,
+                targetUser.Id,
+                action);
+            await FollowupAsync("登録申請レビュー処理に失敗しました。Botの権限を確認してください。", ephemeral: true);
             return;
         }
 
-        if (approved)
+        string followupMessage;
+        switch (action)
         {
-            await LogMemberRegistrationCompletedAsync(
-                targetUser,
-                profile?.FfxivName ?? "(unknown)",
-                profile?.FfxivWorld ?? "(unknown)",
-                profile?.FfxivDataCenter ?? "(unknown)",
-                profile?.XHandle,
-                profile?.BlueskyHandle);
-            _ = _stats.RefreshIfConfiguredAsync(Context.Guild);
-        }
-        else
-        {
-            await LogMemberRegistrationRejectedAsync(targetUser);
+            case MemberRegistrationReviewAction.Approve:
+                await LogMemberRegistrationCompletedAsync(
+                    targetUser,
+                    profile?.FfxivName ?? "(unknown)",
+                    profile?.FfxivWorld ?? "(unknown)",
+                    profile?.FfxivDataCenter ?? "(unknown)",
+                    profile?.XHandle,
+                    profile?.BlueskyHandle);
+                _ = _stats.RefreshIfConfiguredAsync(Context.Guild);
+                followupMessage = $"登録申請を許可しました: {targetUser.Mention}";
+                break;
+            case MemberRegistrationReviewAction.Reject:
+                await LogMemberRegistrationRejectedAsync(targetUser);
+                followupMessage = $"登録申請を拒否しました: {targetUser.Mention}";
+                break;
+            case MemberRegistrationReviewAction.Kick:
+                await LogMemberRegistrationKickedAsync(targetUser);
+                followupMessage = $"登録申請ユーザーをキックしました: {targetUser.Mention}";
+                break;
+            case MemberRegistrationReviewAction.Ban:
+                await LogMemberRegistrationBannedAsync(targetUser);
+                followupMessage = $"登録申請ユーザーをBANしました: {targetUser.Mention}";
+                break;
+            default:
+                followupMessage = "登録申請レビューを処理しました。";
+                break;
         }
 
-        var status = approved ? "許可" : "拒否";
-        await FinalizeMemberRegistrationReviewMessageAsync(
-            approved,
-            $"対応: {status}\n対象: {FormatUser(targetUser)}\n対応者: {FormatUser(Context.User)}",
-            markError: false);
+        await UpdateMemberRegistrationReviewMessageAsync(
+            action,
+            $"対応: {GetMemberRegistrationActionLabel(action)}\n対象: {FormatUser(targetUser)}\n対応者: {FormatUser(Context.User)}",
+            markError: false,
+            targetUserId: targetUserId);
 
-        await FollowupAsync(
-            approved ? $"登録申請を許可しました: {targetUser.Mention}" : $"登録申請を拒否しました: {targetUser.Mention}",
-            ephemeral: true);
+        await FollowupAsync(followupMessage, ephemeral: true);
+    }
+
+    private async Task ShowMemberRegistrationDangerConfirmAsync(ulong targetUserId, MemberRegistrationReviewAction action)
+    {
+        if (Context.Guild is null)
+        {
+            await RespondAsync("この操作はサーバー内でのみ使えます。", ephemeral: true);
+            return;
+        }
+
+        if (action is not MemberRegistrationReviewAction.Kick and not MemberRegistrationReviewAction.Ban)
+        {
+            await RespondAsync("この操作は確認対象ではありません。", ephemeral: true);
+            return;
+        }
+
+        var actionToken = action == MemberRegistrationReviewAction.Ban ? "ban" : "kick";
+        var actionLabel = GetMemberRegistrationActionLabel(action);
+        var target = Context.Guild.GetUser(targetUserId);
+        var targetText = target is null ? $"<@{targetUserId}>" : $"{target.Mention} ({target})";
+
+        var embed = new EmbedBuilder()
+            .WithTitle($"登録申請レビュー: {actionLabel}確認")
+            .WithColor(Color.Red)
+            .WithCurrentTimestamp()
+            .WithDescription($"{targetText} を `{actionLabel}` します。\nこの操作は取り消せません。")
+            .Build();
+        var components = new ComponentBuilder()
+            .WithButton(
+                $"はい、{actionLabel}します",
+                $"{MemberRegistrationDangerConfirmPrefix}:{actionToken}:{targetUserId}",
+                ButtonStyle.Danger,
+                row: 0)
+            .WithButton(
+                "キャンセル",
+                $"{MemberRegistrationDangerCancelPrefix}:{targetUserId}",
+                ButtonStyle.Secondary,
+                row: 0)
+            .Build();
+
+        await RespondAsync(embed: embed, components: components, ephemeral: true);
+    }
+
+    private static bool TryParseMemberRegistrationDangerAction(string raw, out MemberRegistrationReviewAction action)
+    {
+        action = MemberRegistrationReviewAction.Pending;
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return false;
+        }
+
+        switch (raw.Trim().ToLowerInvariant())
+        {
+            case "kick":
+                action = MemberRegistrationReviewAction.Kick;
+                return true;
+            case "ban":
+                action = MemberRegistrationReviewAction.Ban;
+                return true;
+            default:
+                return false;
+        }
     }
 
     private static MessageComponent BuildMemberRegistrationStartComponents()
@@ -1123,8 +1379,13 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
 
     private static MessageComponent BuildMemberRegistrationReviewComponents(ulong userId)
         => new ComponentBuilder()
-            .WithButton("許可", $"{MemberRegistrationApprovePrefix}:{userId}", ButtonStyle.Success)
-            .WithButton("拒否", $"{MemberRegistrationRejectPrefix}:{userId}", ButtonStyle.Danger)
+            .WithButton("許可", $"{MemberRegistrationApprovePrefix}:{userId}", ButtonStyle.Success, row: 0)
+            .WithButton("拒否", $"{MemberRegistrationRejectPrefix}:{userId}", ButtonStyle.Danger, row: 0)
+            .WithButton("保留", $"{MemberRegistrationPendingPrefix}:{userId}", ButtonStyle.Secondary, row: 0)
+            .WithButton("キック", $"{MemberRegistrationKickPrefix}:{userId}", ButtonStyle.Danger, row: 1)
+            .WithButton("BAN", $"{MemberRegistrationBanPrefix}:{userId}", ButtonStyle.Danger, row: 1)
+            .WithButton("メモ閲覧", $"{MemberRegistrationViewNotesPrefix}:{userId}", ButtonStyle.Secondary, row: 1)
+            .WithButton("メモ追加", $"{MemberRegistrationAddNotePrefix}:{userId}", ButtonStyle.Secondary, row: 1)
             .Build();
 
     private static MessageComponent BuildDataCenterSelectComponents(string prefix)
@@ -1421,6 +1682,12 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
             .AddField("一言", bio, false)
             .AddField("コンテンツロール", selectedRoleText, false);
 
+        if (includeDiscordDateFields)
+        {
+            var notes = await _db.ListAdminMemberNotesAsync(guild.Id, guildUser.Id, maxRows: 5);
+            embed.AddField("管理者メモ(最新5件)", BuildRegistrationAdminNotesSummary(notes), false);
+        }
+
         if (!string.IsNullOrWhiteSpace(avatar))
         {
             embed.WithThumbnailUrl(avatar);
@@ -1447,22 +1714,44 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
         return TruncateForLog(text, 900);
     }
 
-    private async Task FinalizeMemberRegistrationReviewMessageAsync(bool approved, string summary, bool markError)
+    private async Task UpdateMemberRegistrationReviewMessageAsync(
+        MemberRegistrationReviewAction action,
+        string summary,
+        bool markError,
+        ulong targetUserId = 0)
     {
         if (Context.Interaction is not SocketMessageComponent component || component.Message is not IUserMessage message)
         {
             return;
         }
 
-        var state = markError ? "処理失敗" : approved ? "承認済み" : "拒否済み";
+        var state = markError
+            ? "処理失敗"
+            : action switch
+            {
+                MemberRegistrationReviewAction.Approve => "承認済み",
+                MemberRegistrationReviewAction.Reject => "拒否済み",
+                MemberRegistrationReviewAction.Pending => "保留中",
+                MemberRegistrationReviewAction.Kick => "キック済み",
+                MemberRegistrationReviewAction.Ban => "BAN済み",
+                _ => "処理済み"
+            };
         var content = $"[{state}]\n{summary}";
+        var keepActions = !markError && action == MemberRegistrationReviewAction.Pending;
 
         try
         {
             await message.ModifyAsync(props =>
             {
                 props.Content = content;
-                props.Components = new ComponentBuilder().Build();
+                if (!keepActions)
+                {
+                    props.Components = new ComponentBuilder().Build();
+                }
+                else if (targetUserId != 0)
+                {
+                    props.Components = BuildMemberRegistrationReviewComponents(targetUserId);
+                }
             });
         }
         catch (Exception ex)
@@ -1470,6 +1759,53 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
             _logger.LogWarning(ex, "Failed to finalize member registration review message. GuildId={GuildId}", Context.Guild?.Id);
         }
     }
+
+    private async Task TryRefreshMemberRegistrationReviewEmbedAsync(ulong targetUserId)
+    {
+        if (Context.Guild is null || targetUserId == 0)
+        {
+            return;
+        }
+
+        if (Context.Interaction is not SocketModal modal || modal.Message is not IUserMessage sourceMessage)
+        {
+            return;
+        }
+
+        var targetUser = Context.Guild.GetUser(targetUserId);
+        if (targetUser is null)
+        {
+            return;
+        }
+
+        var profile = await _db.GetDiscordUserProfileAsync(targetUserId);
+        if (profile is null)
+        {
+            return;
+        }
+
+        try
+        {
+            var refreshedEmbed = await BuildMemberRegistrationReviewEmbedAsync(targetUser, profile);
+            await sourceMessage.ModifyAsync(props => { props.Embed = refreshedEmbed; });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to refresh registration review embed after admin note update. GuildId={GuildId}, UserId={UserId}",
+                Context.Guild.Id, targetUserId);
+        }
+    }
+
+    private static string GetMemberRegistrationActionLabel(MemberRegistrationReviewAction action)
+        => action switch
+        {
+            MemberRegistrationReviewAction.Approve => "許可",
+            MemberRegistrationReviewAction.Reject => "拒否",
+            MemberRegistrationReviewAction.Pending => "保留",
+            MemberRegistrationReviewAction.Kick => "キック",
+            MemberRegistrationReviewAction.Ban => "BAN",
+            _ => "不明"
+        };
 
     private async Task GrantDcRoleAsync(SocketGuildUser guildUser, string? dataCenter)
     {
@@ -1657,6 +1993,92 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
         });
 
         await _audit.SendAsync(Context.Guild, "メンバー登録拒否", description, Color.DarkRed, targetUser);
+    }
+
+    private async Task LogMemberRegistrationPendingAsync(IUser targetUser)
+    {
+        if (Context.Guild is null)
+        {
+            return;
+        }
+
+        var description = string.Join('\n', new[]
+        {
+            $"👤 対象ユーザー: {FormatUser(targetUser)}",
+            $"🕒 対応者: {FormatUser(Context.User)}"
+        });
+
+        await _audit.SendAsync(Context.Guild, "メンバー登録保留", description, Color.Orange, targetUser);
+    }
+
+    private async Task LogMemberRegistrationKickedAsync(IUser targetUser)
+    {
+        if (Context.Guild is null)
+        {
+            return;
+        }
+
+        var description = string.Join('\n', new[]
+        {
+            $"👤 対象ユーザー: {FormatUser(targetUser)}",
+            $"👢 対応者: {FormatUser(Context.User)}"
+        });
+
+        await _audit.SendAsync(Context.Guild, "メンバー登録キック", description, Color.DarkOrange, targetUser);
+    }
+
+    private async Task LogMemberRegistrationBannedAsync(IUser targetUser)
+    {
+        if (Context.Guild is null)
+        {
+            return;
+        }
+
+        var description = string.Join('\n', new[]
+        {
+            $"👤 対象ユーザー: {FormatUser(targetUser)}",
+            $"🔨 対応者: {FormatUser(Context.User)}"
+        });
+
+        await _audit.SendAsync(Context.Guild, "メンバー登録BAN", description, Color.DarkRed, targetUser);
+    }
+
+    private async Task LogMemberRegistrationAdminNoteAddedAsync(ulong targetUserId, string note)
+    {
+        if (Context.Guild is null)
+        {
+            return;
+        }
+
+        var target = Context.Guild.GetUser(targetUserId);
+        var targetText = target is null ? $"<@{targetUserId}>" : FormatUser(target);
+        var description = string.Join('\n', new[]
+        {
+            $"👤 対象ユーザー: {targetText}",
+            $"📝 対応者: {FormatUser(Context.User)}",
+            $"📌 メモ: {TruncateForLog(note, 240)}"
+        });
+        await _audit.SendAsync(Context.Guild, "登録確認メモ追加", description, Color.Blue, Context.User);
+    }
+
+    private static string BuildRegistrationAdminNotesSummary(IReadOnlyList<AdminMemberNote> notes)
+    {
+        if (notes.Count == 0)
+        {
+            return "なし";
+        }
+
+        var lines = notes
+            .Take(5)
+            .Select(note =>
+            {
+                var author = string.IsNullOrWhiteSpace(note.AuthorName)
+                    ? $"User:{ToUlong(note.AuthorUserId)}"
+                    : note.AuthorName;
+                var body = TruncateForLog(note.Note.Replace('\r', ' ').Replace('\n', ' ').Trim(), 120);
+                return $"<t:{note.CreatedAt.ToUnixTimeSeconds()}:f> {author}\n{body}";
+            });
+        return string.Join("\n\n", lines);
     }
 
     private Task LogRateLimitAsync(string title, int waitSeconds)
@@ -1868,6 +2290,80 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
         }
 
         if (targetUser.Id != botUser.Id && targetUser.Hierarchy >= botUser.Hierarchy)
+        {
+            reason = "対象ユーザーのロール階層がBot以上です。";
+            return false;
+        }
+
+        reason = string.Empty;
+        return true;
+    }
+
+    private static bool TryValidateKickOperation(SocketGuild guild, SocketGuildUser targetUser, out string reason)
+    {
+        var botUser = guild.CurrentUser;
+        if (botUser is null)
+        {
+            reason = "Botユーザーを取得できませんでした。";
+            return false;
+        }
+
+        if (!botUser.GuildPermissions.KickMembers)
+        {
+            reason = "Botに「メンバーのキック」権限がありません。";
+            return false;
+        }
+
+        if (targetUser.Id == guild.OwnerId)
+        {
+            reason = "サーバーオーナーはキックできません。";
+            return false;
+        }
+
+        if (targetUser.Id == botUser.Id)
+        {
+            reason = "Bot自身はキックできません。";
+            return false;
+        }
+
+        if (targetUser.Hierarchy >= botUser.Hierarchy)
+        {
+            reason = "対象ユーザーのロール階層がBot以上です。";
+            return false;
+        }
+
+        reason = string.Empty;
+        return true;
+    }
+
+    private static bool TryValidateBanOperation(SocketGuild guild, SocketGuildUser targetUser, out string reason)
+    {
+        var botUser = guild.CurrentUser;
+        if (botUser is null)
+        {
+            reason = "Botユーザーを取得できませんでした。";
+            return false;
+        }
+
+        if (!botUser.GuildPermissions.BanMembers)
+        {
+            reason = "Botに「メンバーのBAN」権限がありません。";
+            return false;
+        }
+
+        if (targetUser.Id == guild.OwnerId)
+        {
+            reason = "サーバーオーナーはBANできません。";
+            return false;
+        }
+
+        if (targetUser.Id == botUser.Id)
+        {
+            reason = "Bot自身はBANできません。";
+            return false;
+        }
+
+        if (targetUser.Hierarchy >= botUser.Hierarchy)
         {
             reason = "対象ユーザーのロール階層がBot以上です。";
             return false;

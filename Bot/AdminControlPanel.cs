@@ -10,29 +10,71 @@ public static class AdminControlPanel
     public const string HealthCheckCustomId = "admin_health_check";
     public const string IntegrityCheckCustomId = "admin_integrity_check";
     public const string RuntimeTuningCustomId = "admin_runtime_tuning";
+    public const string VoiceHourlyStatsCustomId = "admin_voice_hourly_stats";
+    public const string OpsKpiCustomId = "admin_ops_kpi";
+    public const string OpsKpiCohortHourlyCustomId = "admin_ops_kpi_cohort_hourly";
+    public const string ModerationTimelineCustomId = "admin_moderation_timeline";
+    public const string RecruitKpiCustomId = "admin_recruit_kpi";
+    public const string MemberManageCustomId = "admin_member_manage";
     public const string LotteryCustomId = "admin_lottery";
     public const string InquiryDashboardCustomId = "admin_inquiry_dashboard";
+    public const string RegistrationPendingListCustomId = "admin_registration_pending_list";
     public const string ToggleRegistrationApprovalCustomId = "admin_toggle_registration_approval";
     public const string ToggleInactiveAutoKickCustomId = "admin_toggle_inactive_auto_kick";
     public const string ResyncPanelsCustomId = "settings_panels_resync";
 
     public static MessageComponent BuildComponents(bool registrationApprovalRequired, bool inactiveAutoKickEnabled)
     {
-        var statusLabel = registrationApprovalRequired ? "登録確認: 必要" : "登録確認: 不要";
-        var statusStyle = registrationApprovalRequired ? ButtonStyle.Success : ButtonStyle.Secondary;
-        var autoKickLabel = inactiveAutoKickEnabled ? "自動キック: ON" : "自動キック: OFF";
-        var autoKickStyle = inactiveAutoKickEnabled ? ButtonStyle.Danger : ButtonStyle.Secondary;
+        var approvalToggleLabel = registrationApprovalRequired ? "登録確認をOFF" : "登録確認をON";
+        var approvalToggleStyle = registrationApprovalRequired ? ButtonStyle.Danger : ButtonStyle.Success;
+        var autoKickToggleLabel = inactiveAutoKickEnabled ? "自動キックをOFF" : "自動キックをON";
+        var autoKickToggleStyle = inactiveAutoKickEnabled ? ButtonStyle.Danger : ButtonStyle.Success;
 
         return new ComponentBuilder()
-            .WithButton("メッセージCSV(全期間)", ExportMessageCsvCustomId, ButtonStyle.Secondary, row: 0)
-            .WithButton("自動キック候補", PreviewInactiveKickCustomId, ButtonStyle.Primary, row: 0)
             .WithButton("ヘルスチェック", HealthCheckCustomId, ButtonStyle.Secondary, row: 0)
             .WithButton("整合性チェック", IntegrityCheckCustomId, ButtonStyle.Secondary, row: 0)
-            .WithButton("抽選管理", LotteryCustomId, ButtonStyle.Success, row: 0)
-            .WithButton(statusLabel, ToggleRegistrationApprovalCustomId, statusStyle, row: 1)
-            .WithButton(autoKickLabel, ToggleInactiveAutoKickCustomId, autoKickStyle, row: 1)
-            .WithButton("運用設定", RuntimeTuningCustomId, ButtonStyle.Secondary, row: 1)
-            .WithButton("パネル再同期", ResyncPanelsCustomId, ButtonStyle.Secondary, row: 1)
+            .WithButton("運用KPI", OpsKpiCustomId, ButtonStyle.Secondary, row: 0)
+            .WithButton("募集KPI", RecruitKpiCustomId, ButtonStyle.Secondary, row: 0)
+            .WithButton("VC時間帯統計", VoiceHourlyStatsCustomId, ButtonStyle.Secondary, row: 0)
+            .WithButton("メンバー管理", MemberManageCustomId, ButtonStyle.Primary, row: 1)
+            .WithButton("登録保留リスト", RegistrationPendingListCustomId, ButtonStyle.Secondary, row: 1)
+            .WithButton("自動キック候補", PreviewInactiveKickCustomId, ButtonStyle.Primary, row: 1)
+            .WithButton(approvalToggleLabel, ToggleRegistrationApprovalCustomId, approvalToggleStyle, row: 1)
+            .WithButton(autoKickToggleLabel, ToggleInactiveAutoKickCustomId, autoKickToggleStyle, row: 1)
+            .WithButton("抽選管理", LotteryCustomId, ButtonStyle.Success, row: 2)
+            .WithButton("問い合わせ管理", InquiryDashboardCustomId, ButtonStyle.Secondary, row: 2)
+            .WithButton("CSV出力", ExportMessageCsvCustomId, ButtonStyle.Secondary, row: 2)
+            .WithButton("運用設定編集", RuntimeTuningCustomId, ButtonStyle.Secondary, row: 2)
+            .WithButton("パネル再同期", ResyncPanelsCustomId, ButtonStyle.Secondary, row: 2)
+            .WithButton("新規定着コホート/時間帯", OpsKpiCohortHourlyCustomId, ButtonStyle.Primary, row: 3)
+            .WithButton("モデレーション時系列", ModerationTimelineCustomId, ButtonStyle.Secondary, row: 3)
+            .Build();
+    }
+
+    public static Embed BuildStatusEmbed(bool approvalRequired, bool inactiveAutoKickEnabled, bool includeReactionLabelInAutoKickNote = false)
+    {
+        var approvalState = approvalRequired ? "ON（管理者確認あり）" : "OFF（即時付与）";
+        var approvalDetail = approvalRequired
+            ? "登録申請は確認チャンネルで管理者が許可/拒否します。"
+            : "登録申請時にメンバーロールを即時で付与します。";
+        var autoKickState = inactiveAutoKickEnabled ? "ON" : "OFF";
+        var autoKickDetail = inactiveAutoKickEnabled
+            ? includeReactionLabelInAutoKickNote
+                ? "毎日 00:00 (JST) に30日非アクティブを判定して自動キックします。（判定対象: メッセージ / VC / リアクション）"
+                : "毎日 00:00 (JST) に30日非アクティブを判定して自動キックします。"
+            : "30日非アクティブ自動キックは無効です。";
+
+        return new EmbedBuilder()
+            .WithTitle("ADMIN設定パネル")
+            .WithDescription("状態確認はこのEmbed、実行は下のカテゴリ別ボタンから行います。")
+            .WithColor(inactiveAutoKickEnabled ? Color.Orange : Color.Green)
+            .WithCurrentTimestamp()
+            .AddField("登録確認フロー", approvalState, true)
+            .AddField("30日非アクティブ自動キック", autoKickState, true)
+            .AddField("登録確認の動作", approvalDetail, false)
+            .AddField("自動キックの動作", autoKickDetail, false)
+            .AddField("メニュー分類", "1段目: 監視/統計  |  2段目: メンバー運用  |  3段目: 管理機能/保守  |  4段目: 追加KPI/監査", false)
+            .AddField("ボタン色の意味", "緑: 有効化/開始  |  赤: 無効化/停止  |  灰: 設定/診断/補助", false)
             .Build();
     }
 }

@@ -354,6 +354,7 @@ public sealed class UserProfileEmbedService
         return value[..maxLength];
     }
 
+
     private static string FormatLodestoneCount(LodestoneCountSnapshot snapshot)
     {
         return snapshot.Status switch

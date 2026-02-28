@@ -21,6 +21,7 @@ builder.Configuration
 builder.Services.Configure<DiscordOptions>(builder.Configuration.GetSection("Discord"));
 builder.Services.Configure<DatabaseOptions>(builder.Configuration.GetSection("Database"));
 builder.Services.Configure<LodestoneOptions>(builder.Configuration.GetSection("Lodestone"));
+builder.Services.Configure<FfLogsOptions>(builder.Configuration.GetSection("FFLogs"));
 
 builder.Services.AddSingleton(sp => {
     var lodestone = sp.GetRequiredService<IConfiguration>().GetSection("Lodestone").Get<LodestoneOptions>() ?? new LodestoneOptions();
@@ -45,12 +46,14 @@ builder.Services.AddSingleton(sp => {
 
 builder.Services.AddSingleton<TokenService>();
 builder.Services.AddSingleton<LodestoneClient>();
+builder.Services.AddSingleton<FfLogsClient>();
 builder.Services.AddSingleton<LodestoneRateLimitService>();
 builder.Services.AddSingleton<Db>();
 builder.Services.AddSingleton<VoiceTransferTracker>();
 builder.Services.AddSingleton<VoiceChannelTextService>();
 builder.Services.AddSingleton<UserProfileEmbedService>();
 builder.Services.AddSingleton<GuildAuditLogService>();
+builder.Services.AddSingleton<FfLogsReportWatcherService>();
 builder.Services.AddSingleton<RuntimeDiagnosticsService>();
 builder.Services.AddSingleton<RuntimeTuningService>();
 builder.Services.AddSingleton<RecruitUndoService>();

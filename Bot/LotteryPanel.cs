@@ -20,6 +20,7 @@ public static class LotteryPanel
     public const string RedrawCustomIdPrefix = "lottery_redraw:";
     public const string CloseCustomIdPrefix = "lottery_close:";
     public const string CancelCustomIdPrefix = "lottery_cancel:";
+    public const string AdminConfirmActionCustomIdPrefix = "lottery_admin_confirm:";
     public const string ClaimPrizeCustomIdPrefix = "lottery_claim:";
 
     public static Embed BuildManagementEmbed(IReadOnlyList<Lottery> recent)
@@ -346,10 +347,10 @@ public static class LotteryPanel
 
         return new ComponentBuilder()
             .WithButton("更新", $"{RefreshCustomIdPrefix}{idText}", ButtonStyle.Secondary, row: 0)
-            .WithButton("抽選実行", $"{DrawCustomIdPrefix}{idText}", ButtonStyle.Primary, disabled: !canDraw, row: 1)
-            .WithButton("再抽選", $"{RedrawCustomIdPrefix}{idText}", ButtonStyle.Primary, disabled: !canRedraw, row: 1)
-            .WithButton("締切", $"{CloseCustomIdPrefix}{idText}", ButtonStyle.Secondary, disabled: !canClose, row: 1)
-            .WithButton("中止", $"{CancelCustomIdPrefix}{idText}", ButtonStyle.Danger, disabled: !canCancel, row: 1)
+            .WithButton("抽選実行", $"{AdminConfirmActionCustomIdPrefix}draw|{idText}", ButtonStyle.Primary, disabled: !canDraw, row: 1)
+            .WithButton("再抽選", $"{AdminConfirmActionCustomIdPrefix}redraw|{idText}", ButtonStyle.Primary, disabled: !canRedraw, row: 1)
+            .WithButton("締切", $"{AdminConfirmActionCustomIdPrefix}close|{idText}", ButtonStyle.Secondary, disabled: !canClose, row: 1)
+            .WithButton("中止", $"{AdminConfirmActionCustomIdPrefix}cancel|{idText}", ButtonStyle.Danger, disabled: !canCancel, row: 1)
             .WithButton("一覧へ戻る", ManageControlCustomId, ButtonStyle.Secondary, row: 2)
             .Build();
     }

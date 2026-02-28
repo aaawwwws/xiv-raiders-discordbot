@@ -8,7 +8,10 @@ public static class EnvLoader
     private static readonly HashSet<string> AllowedKeys = new(StringComparer.Ordinal)
     {
         "Discord__Token",
-        "Database__ConnectionString"
+        "Database__ConnectionString",
+        "FFLogs__Enabled",
+        "FFLogs__ClientId",
+        "FFLogs__ClientSecret"
     };
 
     public static void Load(string fileName = ".env")
@@ -60,18 +63,48 @@ public static class EnvLoader
 
     private static string? FindEnvPath(string fileName)
     {
-        var current = new DirectoryInfo(Directory.GetCurrentDirectory());
-        for (var depth = 0; depth < 5 && current is not null; depth++)
-        {
-            var candidate = Path.Combine(current.FullName, fileName);
-            if (File.Exists(candidate))
-            {
-                return candidate;
-            }
+        var searchRoots = new List<string>();
+        AddIfMissing(searchRoots, Directory.GetCurrentDirectory());
+        AddIfMissing(searchRoots, AppContext.BaseDirectory);
 
-            current = current.Parent;
+        foreach (var root in searchRoots)
+        {
+            var current = new DirectoryInfo(root);
+            for (var depth = 0; depth < 8 && current is not null; depth++)
+            {
+                foreach (var candidate in EnumerateEnvCandidates(current.FullName, fileName))
+                {
+                    if (File.Exists(candidate))
+                    {
+                        return candidate;
+                    }
+                }
+
+                current = current.Parent;
+            }
         }
 
         return null;
+    }
+
+    private static IEnumerable<string> EnumerateEnvCandidates(string baseDir, string fileName)
+    {
+        yield return Path.Combine(baseDir, fileName);
+        yield return Path.Combine(baseDir, "RaidDcBot", fileName);
+        yield return Path.Combine(baseDir, "src", "RaidDcBot", fileName);
+    }
+
+    private static void AddIfMissing(ICollection<string> values, string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return;
+        }
+
+        var normalized = Path.GetFullPath(path);
+        if (!values.Contains(normalized, StringComparer.OrdinalIgnoreCase))
+        {
+            values.Add(normalized);
+        }
     }
 }
