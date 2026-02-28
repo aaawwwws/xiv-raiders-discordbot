@@ -1402,16 +1402,67 @@ public sealed class SsAlbumModule : InteractionModuleBase<SocketInteractionConte
         {
             if (SystemFonts.TryGet(name, out var family))
             {
-                return family.CreateFont(20, FontStyle.Bold);
+                if (TryCreateUsableBadgeFont(family, out var preferred))
+                {
+                    return preferred;
+                }
             }
         }
 
-        if (SystemFonts.Collection.Families.Any())
+        foreach (var family in SystemFonts.Collection.Families)
         {
-            return SystemFonts.Collection.Families.First().CreateFont(20, FontStyle.Bold);
+            if (TryCreateUsableBadgeFont(family, out var fallback))
+            {
+                return fallback;
+            }
         }
 
         return null;
+    }
+
+    private static bool TryCreateUsableBadgeFont(FontFamily family, out Font font)
+    {
+        try
+        {
+            font = family.CreateFont(20, FontStyle.Bold);
+            if (CanRenderBadgeText(font))
+            {
+                return true;
+            }
+        }
+        catch
+        {
+            // Try regular below.
+        }
+
+        try
+        {
+            font = family.CreateFont(20, FontStyle.Regular);
+            if (CanRenderBadgeText(font))
+            {
+                return true;
+            }
+        }
+        catch
+        {
+            // Ignore and fail.
+        }
+
+        font = default!;
+        return false;
+    }
+
+    private static bool CanRenderBadgeText(Font font)
+    {
+        try
+        {
+            _ = TextMeasurer.MeasureBounds("0123456789", new TextOptions(font));
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private static void DrawTextSmooth(SixLabors.ImageSharp.Image<Rgba32> image, string text, Font font, Rgba32 color, float x, float y)
@@ -1421,13 +1472,20 @@ public sealed class SsAlbumModule : InteractionModuleBase<SocketInteractionConte
             return;
         }
 
-        image.Mutate(ctx =>
+        try
         {
-            ctx.DrawText(new RichTextOptions(font)
+            image.Mutate(ctx =>
             {
-                Origin = new PointF(x, y)
-            }, text, color);
-        });
+                ctx.DrawText(new RichTextOptions(font)
+                {
+                    Origin = new PointF(x, y)
+                }, text, color);
+            });
+        }
+        catch
+        {
+            // Skip badge text rendering when selected font backend is unsupported (e.g. CFF2).
+        }
     }
 
     private static string Truncate(string text, int maxLength)

@@ -7959,21 +7959,31 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
             try
             {
                 font = family.CreateFont(targetSize, targetStyle);
-                return true;
+                if (CanRenderChartText(font))
+                {
+                    return true;
+                }
             }
             catch
             {
-                try
+                // Try regular style below.
+            }
+
+            try
+            {
+                font = family.CreateFont(targetSize, FontStyle.Regular);
+                if (CanRenderChartText(font))
                 {
-                    font = family.CreateFont(targetSize, FontStyle.Regular);
                     return true;
                 }
-                catch
-                {
-                    font = default!;
-                    return false;
-                }
             }
+            catch
+            {
+                // Ignore and fallback to next family.
+            }
+
+            font = default!;
+            return false;
         }
 
         var tried = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -8067,12 +8077,10 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var candidatePaths = new[]
         {
-            "/usr/share/fonts/google-noto-sans-cjk-vf-fonts/NotoSansCJK-VF.ttc",
             "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
             "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
             "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
             "/usr/share/fonts/noto/NotoSansCJK-Regular.ttc",
-            "/usr/share/fonts/noto-cjk-vf/NotoSansCJK-VF.ttc",
             "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
             "/usr/share/fonts/opentype/ipaexfont-gothic/ipaexg.ttf",
             "/usr/share/fonts/ipa-gothic/ipag.ttf",
@@ -8101,6 +8109,19 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
         }
 
         return loaded;
+    }
+
+    private static bool CanRenderChartText(Font font)
+    {
+        try
+        {
+            _ = TextMeasurer.MeasureBounds("VC時間帯統計 123", new TextOptions(font));
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private static HttpClient CreateVoiceChartImageHttpClient()
