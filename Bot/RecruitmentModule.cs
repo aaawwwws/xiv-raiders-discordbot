@@ -11339,7 +11339,7 @@ public sealed class RecruitmentModule : InteractionModuleBase<SocketInteractionC
             if (hostDisplaySummary.Value.IsFlexDisplay)
             {
                 var participantLabel = $"{BuildRecruitEmbedUserName(hostSlot)} ({hostDisplaySummary.Value.JobLabel})";
-                flexLines.Add($"[主催] {hostDisplaySummary.Value.PositionLabel}: {participantLabel} どちらでもOK");
+                flexLines.Add($"[主催] {hostDisplaySummary.Value.PositionLabel}: {participantLabel} {BuildFlexResolutionLabel(hostDisplaySummary.Value)}");
                 flexOccupiedPositions.Add(hostSlot.Position);
             }
         }
@@ -11359,7 +11359,7 @@ public sealed class RecruitmentModule : InteractionModuleBase<SocketInteractionC
             }
 
             var participantLabel = $"{BuildRecruitEmbedUserName(slot)} ({participantDisplaySummary.JobLabel})";
-            flexLines.Add($"[参加] {participantDisplaySummary.PositionLabel}: {participantLabel} どちらでもOK");
+            flexLines.Add($"[参加] {participantDisplaySummary.PositionLabel}: {participantLabel} {BuildFlexResolutionLabel(participantDisplaySummary)}");
             flexOccupiedPositions.Add(slot.Position);
         }
 
@@ -11462,9 +11462,11 @@ private readonly record struct FlexDisplayAnalysis(
     string DisplayFlexSpec,
     IReadOnlyList<string> CandidateJobs,
     IReadOnlyList<string> DisplayJobs,
-    int AssignablePositionCount,
+    IReadOnlyList<string> AssignablePositions,
     bool CanRelocateClosedAnchor)
 {
+    public int AssignablePositionCount => AssignablePositions.Count;
+
     public bool IsDisplayable =>
         CanRelocateClosedAnchor &&
         (AssignablePositionCount >= 2 ||
@@ -11474,7 +11476,8 @@ private readonly record struct FlexDisplayAnalysis(
     private readonly record struct ActiveRecruitSlotDisplaySummary(
         string PositionLabel,
         string JobLabel,
-        bool IsFlexDisplay);
+        bool IsFlexDisplay,
+        string? ConfirmedPosition);
 
     private static ActiveRecruitSlotDisplaySummary BuildActiveRecruitSlotDisplaySummary(
         RecruitPost post,
@@ -11486,7 +11489,7 @@ private readonly record struct FlexDisplayAnalysis(
         var job = string.IsNullOrWhiteSpace(slot.Job) ? "不明" : slot.Job!;
         if (!slot.UserId.HasValue)
         {
-            return new ActiveRecruitSlotDisplaySummary(position, job, false);
+            return new ActiveRecruitSlotDisplaySummary(position, job, false, null);
         }
 
         var isHost = slot.UserId.Value == post.CreatorUserId;
@@ -11496,7 +11499,7 @@ private readonly record struct FlexDisplayAnalysis(
         if (string.IsNullOrWhiteSpace(flexSpec))
         {
             var fixedJobLabel = isHost ? BuildHostDisplayedJob(job, fallbackFlexJobs) : job;
-            return new ActiveRecruitSlotDisplaySummary(position, fixedJobLabel, false);
+            return new ActiveRecruitSlotDisplaySummary(position, fixedJobLabel, false, null);
         }
 
         var analysis = AnalyzeFlexDisplay(
@@ -11514,14 +11517,18 @@ private readonly record struct FlexDisplayAnalysis(
             : fallbackFlexJobs;
         if (analysis is { IsDisplayable: true })
         {
+            var confirmedPosition = analysis.Value.AssignablePositions.Count == 1
+                ? analysis.Value.AssignablePositions[0]
+                : null;
             return new ActiveRecruitSlotDisplaySummary(
                 BuildFlexEmbedPositionLabel(analysis.Value.DisplayFlexSpec, orderedPositions),
                 BuildHostDisplayedJob(job, displayJobs),
-                true);
+                true,
+                confirmedPosition);
         }
 
         var fixedJob = isHost ? BuildHostDisplayedJob(job, displayJobs) : job;
-        return new ActiveRecruitSlotDisplaySummary(position, fixedJob, false);
+        return new ActiveRecruitSlotDisplaySummary(position, fixedJob, false, null);
     }
 
     private static FlexDisplayAnalysis? AnalyzeFlexDisplay(
@@ -11557,7 +11564,7 @@ private readonly record struct FlexDisplayAnalysis(
 
         if (candidateJobs.Count == 0)
         {
-            return new FlexDisplayAnalysis(normalizedFlexSpec, Array.Empty<string>(), Array.Empty<string>(), 0, canRelocateClosedAnchor);
+            return new FlexDisplayAnalysis(normalizedFlexSpec, Array.Empty<string>(), Array.Empty<string>(), Array.Empty<string>(), canRelocateClosedAnchor);
         }
 
         var displayJobs = FilterDisplayAssignableFlexJobs(
@@ -11586,9 +11593,14 @@ private readonly record struct FlexDisplayAnalysis(
             displayFlexSpec,
             candidateJobs,
             displayJobs,
-            assignablePositionCount,
+            displayPositions,
             canRelocateClosedAnchor);
     }
+
+    private static string BuildFlexResolutionLabel(ActiveRecruitSlotDisplaySummary summary)
+        => string.IsNullOrWhiteSpace(summary.ConfirmedPosition)
+            ? "どちらでもOK"
+            : $"確定候補: {summary.ConfirmedPosition}";
 
     private static string BuildRecruitEmbedCreatorName(RecruitPost post, IReadOnlyList<RecruitSlot> slots)
     {
