@@ -11331,6 +11331,8 @@ public sealed class RecruitmentModule : InteractionModuleBase<SocketInteractionC
         var lines = new List<string>();
         var flexLines = new List<string>();
         var flexOccupiedPositions = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var fixedFlexDisplays = new Dictionary<string, (RecruitSlot Slot, ActiveRecruitSlotDisplaySummary Summary, bool IsHost)>(StringComparer.OrdinalIgnoreCase);
+        var fixedFlexAnchorPositions = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         ActiveRecruitSlotDisplaySummary? hostDisplaySummary = null;
 
         if (hostSlot is not null)
@@ -11338,9 +11340,21 @@ public sealed class RecruitmentModule : InteractionModuleBase<SocketInteractionC
             hostDisplaySummary = BuildActiveRecruitSlotDisplaySummary(post, slots, hostSlot, orderedPositions);
             if (hostDisplaySummary.Value.IsFlexDisplay)
             {
-                var participantLabel = $"{BuildRecruitEmbedUserName(hostSlot)} ({hostDisplaySummary.Value.JobLabel})";
-                flexLines.Add($"[主催] {hostDisplaySummary.Value.PositionLabel}: {participantLabel} {BuildFlexResolutionLabel(hostDisplaySummary.Value)}");
-                flexOccupiedPositions.Add(hostSlot.Position);
+                if (!string.IsNullOrWhiteSpace(hostDisplaySummary.Value.ConfirmedPosition))
+                {
+                    if (!fixedFlexDisplays.ContainsKey(hostDisplaySummary.Value.ConfirmedPosition))
+                    {
+                        fixedFlexDisplays[hostDisplaySummary.Value.ConfirmedPosition] = (hostSlot, hostDisplaySummary.Value, true);
+                    }
+
+                    fixedFlexAnchorPositions.Add(hostSlot.Position);
+                }
+                else
+                {
+                    var participantLabel = $"{BuildRecruitEmbedUserName(hostSlot)} ({hostDisplaySummary.Value.JobLabel})";
+                    flexLines.Add($"[主催] {hostDisplaySummary.Value.PositionLabel}: {participantLabel} {BuildFlexResolutionLabel(hostDisplaySummary.Value)}");
+                    flexOccupiedPositions.Add(hostSlot.Position);
+                }
             }
         }
 
@@ -11355,6 +11369,17 @@ public sealed class RecruitmentModule : InteractionModuleBase<SocketInteractionC
             var participantDisplaySummary = BuildActiveRecruitSlotDisplaySummary(post, slots, slot, orderedPositions);
             if (!participantDisplaySummary.IsFlexDisplay)
             {
+                continue;
+            }
+
+            if (!string.IsNullOrWhiteSpace(participantDisplaySummary.ConfirmedPosition))
+            {
+                if (!fixedFlexDisplays.ContainsKey(participantDisplaySummary.ConfirmedPosition))
+                {
+                    fixedFlexDisplays[participantDisplaySummary.ConfirmedPosition] = (slot, participantDisplaySummary, false);
+                }
+
+                fixedFlexAnchorPositions.Add(slot.Position);
                 continue;
             }
 
@@ -11393,9 +11418,31 @@ public sealed class RecruitmentModule : InteractionModuleBase<SocketInteractionC
 
         foreach (var position in orderedPositions)
         {
+            if (fixedFlexDisplays.TryGetValue(position, out var fixedFlexDisplay))
+            {
+                lines.Add(fixedFlexDisplay.IsHost
+                    ? $"[主催] {position}: {BuildRecruitEmbedUserName(fixedFlexDisplay.Slot)} ({fixedFlexDisplay.Summary.JobLabel})"
+                    : $"[参加] {position}: {BuildRecruitEmbedUserName(fixedFlexDisplay.Slot)} ({fixedFlexDisplay.Summary.JobLabel})");
+                continue;
+            }
+
             if (!map.TryGetValue(position, out var slot))
             {
                 lines.Add($"[空き] {position}");
+                continue;
+            }
+
+            if (fixedFlexAnchorPositions.Contains(position))
+            {
+                if (!string.IsNullOrWhiteSpace(slot.RequiredJob))
+                {
+                    lines.Add($"[空き(指定)] {position}: {slot.RequiredJob}");
+                }
+                else
+                {
+                    lines.Add($"[空き] {position}");
+                }
+
                 continue;
             }
 
