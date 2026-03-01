@@ -59,6 +59,7 @@ builder.Services.AddSingleton<RuntimeTuningService>();
 builder.Services.AddSingleton<RecruitUndoService>();
 builder.Services.AddSingleton<StatsEmbedService>();
 builder.Services.AddSingleton<VoiceStatsService>();
+builder.Services.AddSingleton<VoiceSessionReconciliationService>();
 builder.Services.AddSingleton<RecruitmentListService>();
 builder.Services.AddSingleton<RecruitJoinContextTracker>();
 builder.Services.AddSingleton<RecruitCommentEditContextTracker>();

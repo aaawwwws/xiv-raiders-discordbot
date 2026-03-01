@@ -14,6 +14,7 @@ public static class AdminControlPanel
     public const string PreviewInactiveKickCustomId = "admin_preview_inactive_kick";
     public const string HealthCheckCustomId = "admin_health_check";
     public const string IntegrityCheckCustomId = "admin_integrity_check";
+    public const string VoiceSessionIntegrityCustomId = "admin_voice_session_integrity";
     public const string RuntimeTuningCustomId = "admin_runtime_tuning";
     public const string VoiceHourlyStatsCustomId = "admin_voice_hourly_stats";
     public const string OpsKpiCustomId = "admin_ops_kpi";
@@ -47,6 +48,7 @@ public static class AdminControlPanel
             .WithButton("運用KPI", OpsKpiCustomId, ButtonStyle.Secondary, row: 0)
             .WithButton("募集KPI", RecruitKpiCustomId, ButtonStyle.Secondary, row: 0)
             .WithButton("VC時間帯統計", VoiceHourlyStatsCustomId, ButtonStyle.Secondary, row: 1)
+            .WithButton("VC整合性修復", VoiceSessionIntegrityCustomId, ButtonStyle.Secondary, row: 1)
             .WithButton("新規定着コホート/時間帯", OpsKpiCohortHourlyCustomId, ButtonStyle.Primary, row: 1)
             .WithButton("モデレーション時系列", ModerationTimelineCustomId, ButtonStyle.Secondary, row: 1)
             .Build();

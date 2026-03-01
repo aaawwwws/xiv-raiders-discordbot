@@ -25,6 +25,7 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
     private readonly GuildAuditLogService _audit;
     private readonly RuntimeDiagnosticsService _runtimeDiagnostics;
     private readonly RuntimeTuningService _runtimeTuning;
+    private readonly VoiceSessionReconciliationService _voiceSessionReconciliation;
     private readonly RecruitmentListService _recruitListService;
     private readonly UserProfileEmbedService _profileEmbeds;
     private readonly ConcurrentDictionary<string, MemberManageDangerActionContext> _memberDangerContexts = new();
@@ -142,6 +143,7 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
         GuildAuditLogService audit,
         RuntimeDiagnosticsService runtimeDiagnostics,
         RuntimeTuningService runtimeTuning,
+        VoiceSessionReconciliationService voiceSessionReconciliation,
         RecruitmentListService recruitListService,
         UserProfileEmbedService profileEmbeds)
     {
@@ -151,6 +153,7 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
         _audit = audit;
         _runtimeDiagnostics = runtimeDiagnostics;
         _runtimeTuning = runtimeTuning;
+        _voiceSessionReconciliation = voiceSessionReconciliation;
         _recruitListService = recruitListService;
         _profileEmbeds = profileEmbeds;
     }
@@ -413,6 +416,20 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
 
         await DeferAsync(ephemeral: true);
         await ShowHealthAsync();
+    }
+
+    [RequireBotAdmin]
+    [ComponentInteraction(AdminControlPanel.VoiceSessionIntegrityCustomId, ignoreGroupNames: true)]
+    public async Task RepairVoiceSessionIntegrityByButtonAsync()
+    {
+        if (Context.Guild is null)
+        {
+            await RespondAsync("この操作はサーバー内でのみ使えます。", ephemeral: true);
+            return;
+        }
+
+        await DeferAsync(ephemeral: true);
+        await ShowVoiceSessionIntegrityAsync(repair: true);
     }
 
     [RequireBotAdmin]
@@ -3715,6 +3732,52 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
         await FollowupAsync(embed: embedBuilder.Build(), ephemeral: true);
     }
 
+    private async Task ShowVoiceSessionIntegrityAsync(bool repair)
+    {
+        if (Context.Guild is null)
+        {
+            return;
+        }
+
+        var guild = Context.Guild;
+        var nowUtc = DateTimeOffset.UtcNow;
+        var result = await _voiceSessionReconciliation.ReconcileGuildAsync(guild, repair, nowUtc);
+        var hasIssue = result.HasPlannedActions || result.LongOpenSessionCount > 0;
+        var hasChange = result.HasAppliedChanges;
+        var color = hasIssue
+            ? (hasChange ? Color.Orange : Color.Red)
+            : Color.Green;
+
+        var lines = new List<string>
+        {
+            $"Openセッション: {result.OpenSessionCount:N0}",
+            $"実VC参加者: {result.CurrentVoiceUserCount:N0}",
+            $"要修復(重複): {result.DuplicateOpenSessionCount:N0}",
+            $"要修復(退出漏れ): {result.StaleSessionCount:N0}",
+            $"要修復(チャンネル不一致): {result.MismatchedChannelSessionCount:N0}",
+            $"要修復(開始漏れ): {result.MissingOpenSessionCount:N0}",
+            $"24h超Open警告: {result.LongOpenSessionCount:N0}",
+            $"適用(重複クローズ): {result.ClosedDuplicateSessions:N0}",
+            $"適用(退出漏れクローズ): {result.ClosedStaleSessions:N0}",
+            $"適用(不一致クローズ): {result.ClosedMismatchedSessions:N0}",
+            $"適用(開始漏れ補完): {result.StartedMissingSessions:N0}"
+        };
+
+        var status = hasIssue
+            ? (hasChange ? "修復を適用しました。" : "要修復項目があります。")
+            : "異常は検出されませんでした。";
+
+        var embed = new EmbedBuilder()
+            .WithTitle("VCセッション整合性")
+            .WithColor(color)
+            .WithCurrentTimestamp()
+            .AddField("状態", status, false)
+            .AddField("集計", JoinWithinLimit(lines, 980), false)
+            .Build();
+
+        await FollowupAsync(embed: embed, ephemeral: true);
+    }
+
     private async Task ShowHealthAsync()
     {
         if (Context.Guild is null)
@@ -3803,6 +3866,7 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
             checks.Add(BuildLoopHealthItem("定期処理/募集Schedule", "loop.recruit_schedule"));
         }
         checks.Add(BuildLoopHealthItem("定期処理/ActivityRole", "loop.activity_role_sync"));
+        checks.Add(BuildLoopHealthItem("定期処理/VC整合性", "loop.voice_session_reconcile"));
 
         var hasError = checks.Any(x => x.Level == "ERROR");
         var hasWarn = checks.Any(x => x.Level == "WARN");

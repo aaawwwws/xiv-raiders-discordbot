@@ -33,6 +33,7 @@ public sealed class DiscordBotService : IHostedService
     private readonly RuntimeTuningService _runtimeTuning;
     private readonly StatsEmbedService _stats;
     private readonly VoiceStatsService _voiceStats;
+    private readonly VoiceSessionReconciliationService _voiceSessionReconciliation;
     private readonly FfLogsReportWatcherService _fflogsWatcher;
     private readonly string? _attachmentArchiveRootPath;
     private readonly ConcurrentDictionary<ulong, byte> _tempVoiceChannelIds = new();
@@ -47,6 +48,7 @@ public sealed class DiscordBotService : IHostedService
     private static readonly TimeSpan FailureAlertCooldown = TimeSpan.FromMinutes(15);
     private static readonly TimeSpan LotteryParticipantRoleRetention = TimeSpan.FromHours(24);
     private static readonly TimeSpan VoiceStatusPromptReminderInterval = TimeSpan.FromHours(1);
+    private static readonly TimeSpan VoiceSessionReconcileInterval = TimeSpan.FromMinutes(3);
     private const string RecruitScheduleFormat = "yyyy/MM/dd HH:mm";
     private CancellationTokenSource? _cleanupCts;
     private Task? _cleanupTask;
@@ -56,6 +58,8 @@ public sealed class DiscordBotService : IHostedService
     private Task? _activityRoleSyncTask;
     private CancellationTokenSource? _fflogsPollingCts;
     private Task? _fflogsPollingTask;
+    private CancellationTokenSource? _voiceSessionReconcileCts;
+    private Task? _voiceSessionReconcileTask;
 
     public DiscordBotService(
         DiscordSocketClient client,
@@ -72,6 +76,7 @@ public sealed class DiscordBotService : IHostedService
         RuntimeTuningService runtimeTuning,
         StatsEmbedService stats,
         VoiceStatsService voiceStats,
+        VoiceSessionReconciliationService voiceSessionReconciliation,
         FfLogsReportWatcherService fflogsWatcher)
     {
         _client = client;
@@ -88,6 +93,7 @@ public sealed class DiscordBotService : IHostedService
         _runtimeTuning = runtimeTuning;
         _stats = stats;
         _voiceStats = voiceStats;
+        _voiceSessionReconciliation = voiceSessionReconciliation;
         _fflogsWatcher = fflogsWatcher;
         _attachmentArchiveRootPath = ResolveAttachmentArchiveRootPath(_options);
     }
@@ -156,6 +162,8 @@ public sealed class DiscordBotService : IHostedService
         _activityRoleSyncTask = Task.Run(() => ActivityRoleSyncLoopAsync(_activityRoleSyncCts.Token), _activityRoleSyncCts.Token);
         _fflogsPollingCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         _fflogsPollingTask = Task.Run(() => FfLogsPollingLoopAsync(_fflogsPollingCts.Token), _fflogsPollingCts.Token);
+        _voiceSessionReconcileCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        _voiceSessionReconcileTask = Task.Run(() => VoiceSessionReconcileLoopAsync(_voiceSessionReconcileCts.Token), _voiceSessionReconcileCts.Token);
 
         await _client.LoginAsync(TokenType.Bot, _options.Token);
         await _client.StartAsync();
@@ -264,6 +272,22 @@ public sealed class DiscordBotService : IHostedService
             }
         }
 
+        if (_voiceSessionReconcileCts is not null)
+        {
+            _voiceSessionReconcileCts.Cancel();
+        }
+
+        if (_voiceSessionReconcileTask is not null)
+        {
+            try
+            {
+                await _voiceSessionReconcileTask;
+            }
+            catch (OperationCanceledException)
+            {
+            }
+        }
+
         await _client.StopAsync();
     }
 
@@ -283,6 +307,17 @@ public sealed class DiscordBotService : IHostedService
 
         _logger.LogInformation("Bot ready. Commands registered.");
         await EnsureGuildResourcesAsync();
+        try
+        {
+            await RunVoiceSessionReconcileTickAsync("startup", repair: true);
+            _runtimeDiagnostics.Mark("startup.voice_session_reconcile", success: true, note: "Startup reconciliation completed");
+        }
+        catch (Exception ex)
+        {
+            _runtimeDiagnostics.Mark("startup.voice_session_reconcile", success: false, note: ex.Message);
+            _logger.LogWarning(ex, "Failed to reconcile voice sessions on startup.");
+        }
+
         foreach (var guild in _client.Guilds)
         {
             await TrySendStartupRecoveryAuditAsync(guild);
@@ -600,6 +635,71 @@ public sealed class DiscordBotService : IHostedService
             }
             catch (TaskCanceledException)
             {
+            }
+        }
+    }
+
+    private async Task VoiceSessionReconcileLoopAsync(CancellationToken token)
+    {
+        while (!token.IsCancellationRequested)
+        {
+            try
+            {
+                await RunVoiceSessionReconcileTickAsync("loop", repair: true);
+                _runtimeDiagnostics.Mark("loop.voice_session_reconcile", success: true, note: $"interval={VoiceSessionReconcileInterval.TotalMinutes:0}m");
+            }
+            catch (TaskCanceledException)
+            {
+                return;
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+            catch (Exception ex)
+            {
+                _runtimeDiagnostics.Mark("loop.voice_session_reconcile", success: false, note: ex.GetType().Name);
+                _logger.LogWarning(ex, "Failed in voice session reconciliation loop.");
+            }
+
+            try
+            {
+                await Task.Delay(VoiceSessionReconcileInterval, token);
+            }
+            catch (TaskCanceledException)
+            {
+                return;
+            }
+        }
+    }
+
+    private async Task RunVoiceSessionReconcileTickAsync(string source, bool repair)
+    {
+        var nowUtc = DateTimeOffset.UtcNow;
+        foreach (var guild in _client.Guilds)
+        {
+            var result = await _voiceSessionReconciliation.ReconcileGuildAsync(guild, repair, nowUtc);
+
+            if (result.HasAppliedChanges)
+            {
+                _logger.LogInformation(
+                    "Voice session reconciliation applied. Source={Source}, GuildId={GuildId}, ClosedDuplicate={ClosedDuplicate}, ClosedStale={ClosedStale}, ClosedMismatch={ClosedMismatch}, StartedMissing={StartedMissing}",
+                    source,
+                    guild.Id,
+                    result.ClosedDuplicateSessions,
+                    result.ClosedStaleSessions,
+                    result.ClosedMismatchedSessions,
+                    result.StartedMissingSessions);
+            }
+
+            if (result.LongOpenSessionCount > 0)
+            {
+                _logger.LogWarning(
+                    "Detected long-open voice sessions. Source={Source}, GuildId={GuildId}, LongOpenSessions={LongOpenSessions}, OpenSessions={OpenSessions}",
+                    source,
+                    guild.Id,
+                    result.LongOpenSessionCount,
+                    result.OpenSessionCount);
             }
         }
     }

@@ -1245,6 +1245,55 @@ ORDER BY joined_at ASC;";
         return rows.ToList();
     }
 
+    public async Task<IReadOnlyList<VoiceSession>> ListOpenVoiceSessionsByGuildAsync(ulong guildId)
+    {
+        const string sql = @"
+SELECT id AS Id,
+       guild_id AS GuildId,
+       channel_id AS ChannelId,
+       user_id AS UserId,
+       user_name AS UserName,
+       joined_at AS JoinedAt,
+       left_at AS LeftAt,
+       duration_seconds AS DurationSeconds
+FROM voice_sessions
+WHERE guild_id = @GuildId
+  AND left_at IS NULL
+ORDER BY joined_at ASC, id ASC;";
+
+        await using var conn = CreateConnection();
+        var rows = await conn.QueryAsync<VoiceSession>(sql, new
+        {
+            GuildId = ToDbId(guildId)
+        });
+        return rows.ToList();
+    }
+
+    public async Task<VoiceSession?> EndVoiceSessionByIdAsync(long sessionId, DateTimeOffset leftAt)
+    {
+        const string sql = @"
+UPDATE voice_sessions
+SET left_at = @LeftAt,
+    duration_seconds = GREATEST(0, EXTRACT(EPOCH FROM (@LeftAt - joined_at))::int)
+WHERE id = @SessionId
+  AND left_at IS NULL
+RETURNING id AS Id,
+          guild_id AS GuildId,
+          channel_id AS ChannelId,
+          user_id AS UserId,
+          user_name AS UserName,
+          joined_at AS JoinedAt,
+          left_at AS LeftAt,
+          duration_seconds AS DurationSeconds;";
+
+        await using var conn = CreateConnection();
+        return await conn.QuerySingleOrDefaultAsync<VoiceSession>(sql, new
+        {
+            SessionId = sessionId,
+            LeftAt = leftAt
+        });
+    }
+
     public async Task<int> AddAdminMemberNoteAsync(
         ulong guildId,
         ulong targetUserId,
