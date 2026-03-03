@@ -11631,10 +11631,9 @@ private readonly record struct FlexDisplayAnalysis(
             userId,
             post.DisallowDuplicateJobs,
             requireClosedFlexRelocatable ? slot.Position : null);
-        var assignablePositionCount = displayPositions.Count;
-        var displayFlexSpec = assignablePositionCount >= 2
-            ? string.Join(',', displayPositions)
-            : normalizedFlexSpec;
+        // Keep the original selected FLEX candidates visible in embed labels.
+        // Runtime-assignable positions are still tracked separately via DisplayPositions.
+        var displayFlexSpec = normalizedFlexSpec;
 
         return new FlexDisplayAnalysis(
             displayFlexSpec,

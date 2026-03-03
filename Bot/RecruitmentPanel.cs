@@ -5,8 +5,8 @@ using RaidDcBot.Services;
 namespace RaidDcBot.Bot;
 
 public static class RecruitmentPanel {
-    public const string PanelMessage = "※不具合がある可能性があります。\n終了: 募集を完了します。\n中断: 募集を取りやめます。";
-    public const string DisabledPanelMessage = "（開発中・現在利用できません）\n※不具合がある可能性があります。\n終了: 募集を完了します。\n中断: 募集を取りやめます。";
+    public const string PanelMessage = "※不具合がある可能性があります。\n終了: 募集を完了します。\n中断: 募集を取りやめます。\n終了/中断後も管理メニューから再開できます。";
+    public const string DisabledPanelMessage = "（開発中・現在利用できません）\n※不具合がある可能性があります。\n終了: 募集を完了します。\n中断: 募集を取りやめます。\n終了/中断後も管理メニューから再開できます。";
 
     public static string BuildPanelMessage(bool enabled = true)
         => enabled ? PanelMessage : DisabledPanelMessage;
@@ -23,12 +23,11 @@ public static class RecruitmentPanel {
 
     public static MessageComponent BuildRecruitComponents(RecruitPostStatus status, IReadOnlyList<string> positions) {
         var participationEnabled = status is RecruitPostStatus.Open or RecruitPostStatus.Full;
-        var editEnabled = status is RecruitPostStatus.Open or RecruitPostStatus.Full;
         var hasOpenPositions = positions.Count > 0;
 
         return new ComponentBuilder()
             .WithButton("参加メニュー", "recruit_participation_tools", ButtonStyle.Success, disabled: !participationEnabled || !hasOpenPositions, row: 0)
-            .WithButton("管理メニュー", "recruit_manage_tools", ButtonStyle.Primary, disabled: !editEnabled, row: 0)
+            .WithButton("管理メニュー", "recruit_manage_tools", ButtonStyle.Primary, disabled: false, row: 0)
             .Build();
     }
 
