@@ -41,6 +41,7 @@ public sealed class DiscordBotService : IHostedService
     private readonly ConcurrentDictionary<ulong, int> _dailyActivityRankingPosted = new();
     private readonly ConcurrentDictionary<ulong, int> _weeklyVoiceRankingPosted = new();
     private readonly ConcurrentDictionary<ulong, int> _inactiveAutoKickProcessedDay = new();
+    private readonly ConcurrentDictionary<string, byte> _expectedAutoKickLeaves = new();
     private readonly ConcurrentDictionary<string, DateTimeOffset> _failureAlerts = new();
     private readonly SemaphoreSlim _tempVoiceLock = new(1, 1);
     private static readonly HttpClient AttachmentArchiveHttpClient = CreateAttachmentArchiveHttpClient();
@@ -136,6 +137,7 @@ public sealed class DiscordBotService : IHostedService
         await _db.EnsureRecruitTemplatesTableAsync();
         await _db.EnsureMessageLogPayloadColumnsAsync();
         await _db.EnsureUserReactionLogsTableAsync();
+        await _db.EnsureInactiveKickRetentionTableAsync();
         await RestoreRuntimeTuningAsync();
         EnsureAttachmentArchiveDirectory();
 
@@ -146,6 +148,7 @@ public sealed class DiscordBotService : IHostedService
         _client.JoinedGuild += OnJoinedGuildAsync;
         _client.UserJoined += OnUserJoinedAsync;
         _client.UserLeft += OnUserLeftAsync;
+        _client.UserBanned += OnUserBannedAsync;
         _client.GuildMemberUpdated += OnGuildMemberUpdatedAsync;
         _client.UserVoiceStateUpdated += OnUserVoiceStateUpdatedAsync;
         _client.MessageDeleted += OnMessageDeletedAsync;
@@ -772,6 +775,15 @@ public sealed class DiscordBotService : IHostedService
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Failed to cleanup recruit artifacts.");
+        }
+
+        try
+        {
+            await CleanupInactiveKickUserDataRetentionsAsync(DateTimeOffset.UtcNow);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to cleanup inactive auto-kick retained user data.");
         }
 
         try
@@ -1429,6 +1441,162 @@ public sealed class DiscordBotService : IHostedService
                 deletedCount,
                 closedRetention.TotalHours,
                 canceledRetention.TotalHours);
+        }
+    }
+
+    private async Task CleanupInactiveKickUserDataRetentionsAsync(DateTimeOffset nowUtc)
+    {
+        var warningRows = await _db.ListDueInactiveKickUserDataRetentionWarningsAsync(nowUtc);
+        var warningSent = 0;
+        var warningFailed = 0;
+        foreach (var row in warningRows)
+        {
+            var guildId = ToUlong(row.GuildId);
+            var userId = ToUlong(row.UserId);
+            try
+            {
+                var guild = _client.GetGuild(guildId);
+                if (guild is null)
+                {
+                    continue;
+                }
+
+                if (guild.GetUser(userId) is not null)
+                {
+                    await _db.RemoveInactiveKickUserDataRetentionAsync(guildId, userId);
+                    continue;
+                }
+
+                var deleteAfterJst = row.DeleteAfter.ToOffset(JapanTimeOffset);
+                await _audit.SendSystemAsync(
+                    guild,
+                    "自動キックデータ削除予告",
+                    $"対象ユーザー: <@{userId}> (`{userId}`)\n削除予定: {deleteAfterJst:yyyy/MM/dd HH:mm} (JST)\n内容: 連携プロフィール/連携キャラ情報を削除します。",
+                    Color.Orange);
+                await _db.MarkInactiveKickUserDataRetentionWarningNotifiedAsync(guildId, userId, nowUtc);
+                warningSent++;
+            }
+            catch (Exception ex)
+            {
+                warningFailed++;
+                _logger.LogWarning(
+                    ex,
+                    "Failed to send inactive auto-kick data deletion warning. GuildId={GuildId}, UserId={UserId}",
+                    guildId,
+                    userId);
+            }
+        }
+
+        var finalWarningRows = await _db.ListDueInactiveKickUserDataFinalWarningsAsync(nowUtc);
+        var finalWarningSent = 0;
+        var finalWarningFailed = 0;
+        foreach (var row in finalWarningRows)
+        {
+            var guildId = ToUlong(row.GuildId);
+            var userId = ToUlong(row.UserId);
+            try
+            {
+                var guild = _client.GetGuild(guildId);
+                if (guild is null)
+                {
+                    continue;
+                }
+
+                if (guild.GetUser(userId) is not null)
+                {
+                    await _db.RemoveInactiveKickUserDataRetentionAsync(guildId, userId);
+                    continue;
+                }
+
+                var deleteAfterJst = row.DeleteAfter.ToOffset(JapanTimeOffset);
+                await _audit.SendSystemAsync(
+                    guild,
+                    "自動キックデータ削除最終予告",
+                    $"対象ユーザー: <@{userId}> (`{userId}`)\n削除予定: {deleteAfterJst:yyyy/MM/dd HH:mm} (JST)\n内容: 連携プロフィール/連携キャラ情報を1時間後に削除します。",
+                    Color.DarkOrange);
+                await _db.MarkInactiveKickUserDataRetentionFinalWarningNotifiedAsync(guildId, userId, nowUtc);
+                finalWarningSent++;
+            }
+            catch (Exception ex)
+            {
+                finalWarningFailed++;
+                _logger.LogWarning(
+                    ex,
+                    "Failed to send final inactive auto-kick data deletion warning. GuildId={GuildId}, UserId={UserId}",
+                    guildId,
+                    userId);
+            }
+        }
+
+        var dueRows = await _db.ListDueInactiveKickUserDataRetentionsAsync(nowUtc);
+        var deletedUsers = 0;
+        var canceledRows = 0;
+        var failedRows = 0;
+        var handledUsers = new HashSet<ulong>();
+
+        foreach (var row in dueRows)
+        {
+            var guildId = ToUlong(row.GuildId);
+            var userId = ToUlong(row.UserId);
+            try
+            {
+                var guild = _client.GetGuild(guildId);
+                if (guild?.GetUser(userId) is not null)
+                {
+                    if (await _db.RemoveInactiveKickUserDataRetentionAsync(guildId, userId))
+                    {
+                        canceledRows++;
+                    }
+
+                    continue;
+                }
+
+                if (handledUsers.Add(userId))
+                {
+                    if (await _db.DeleteDiscordUserDataAsync(userId))
+                    {
+                        deletedUsers++;
+                    }
+                }
+                else
+                {
+                    await _db.RemoveInactiveKickUserDataRetentionAsync(guildId, userId);
+                }
+            }
+            catch (Exception ex)
+            {
+                failedRows++;
+                _logger.LogWarning(
+                    ex,
+                    "Failed to process inactive auto-kick retained user data cleanup. GuildId={GuildId}, UserId={UserId}",
+                    guildId,
+                    userId);
+            }
+        }
+
+        if (deletedUsers > 0 || canceledRows > 0 || failedRows > 0)
+        {
+            _logger.LogInformation(
+                "Processed inactive auto-kick retained user data cleanup. DeletedUsers={DeletedUsers}, CanceledRows={CanceledRows}, FailedRows={FailedRows}",
+                deletedUsers,
+                canceledRows,
+                failedRows);
+        }
+
+        if (warningSent > 0 || warningFailed > 0)
+        {
+            _logger.LogInformation(
+                "Processed inactive auto-kick data deletion warnings. Sent={Sent}, Failed={Failed}",
+                warningSent,
+                warningFailed);
+        }
+
+        if (finalWarningSent > 0 || finalWarningFailed > 0)
+        {
+            _logger.LogInformation(
+                "Processed final inactive auto-kick data deletion warnings. Sent={Sent}, Failed={Failed}",
+                finalWarningSent,
+                finalWarningFailed);
         }
     }
 
@@ -2182,6 +2350,7 @@ public sealed class DiscordBotService : IHostedService
         var activeUserIdsForKick = kickEnabled
             ? await _db.ListActiveUserIdsSinceAsync(guild.Id, kickCutoff)
             : Array.Empty<ulong>();
+        var inactiveKickRetentionDays = ResolveInactiveKickUserDataRetentionDays(guildSettings);
         var kickExemptRoleNames = BuildInactiveKickExemptRoleNameSet();
         var currentBotUser = guild.CurrentUser;
         var addedActive = 0;
@@ -2218,12 +2387,25 @@ public sealed class DiscordBotService : IHostedService
                 {
                     try
                     {
+                        var deleteAfter = nowUtc.AddDays(inactiveKickRetentionDays);
+                        await _db.UpsertInactiveKickUserDataRetentionAsync(guild.Id, user.Id, deleteAfter);
+                        _expectedAutoKickLeaves[BuildGuildUserKey(guild.Id, user.Id)] = 1;
                         await user.KickAsync($"Inactive for {kickDays} days.");
                         kickedUsers++;
                         continue;
                     }
                     catch (Exception ex)
                     {
+                        _expectedAutoKickLeaves.TryRemove(BuildGuildUserKey(guild.Id, user.Id), out _);
+                        try
+                        {
+                            await _db.RemoveInactiveKickUserDataRetentionAsync(guild.Id, user.Id);
+                        }
+                        catch (Exception retentionEx)
+                        {
+                            _logger.LogWarning(retentionEx, "Failed to rollback inactive auto-kick user data retention entry. GuildId={GuildId}, UserId={UserId}", guild.Id, user.Id);
+                        }
+
                         _logger.LogWarning(ex, "Failed to auto-kick inactive user. GuildId={GuildId}, UserId={UserId}", guild.Id, user.Id);
                     }
                 }
@@ -2426,6 +2608,67 @@ public sealed class DiscordBotService : IHostedService
         }
 
         return botUser.Hierarchy > targetUser.Hierarchy;
+    }
+
+    private IRole? ResolveMemberRole(SocketGuild guild, GuildSettings? settings)
+    {
+        if (settings is not null && settings.MemberRoleId != 0)
+        {
+            var byId = guild.GetRole(ToUlong(settings.MemberRoleId));
+            if (byId is not null)
+            {
+                return byId;
+            }
+        }
+
+        return guild.Roles.FirstOrDefault(role =>
+            string.Equals(role.Name, _options.MemberRoleName, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static bool CanAssignRole(SocketGuildUser? botUser, SocketGuildUser targetUser, IRole role, out string reason)
+    {
+        reason = string.Empty;
+        if (botUser is null)
+        {
+            reason = "bot user not found";
+            return false;
+        }
+
+        if (!botUser.GuildPermissions.ManageRoles)
+        {
+            reason = "Manage Roles権限がありません";
+            return false;
+        }
+
+        if (role.Id == targetUser.Guild.EveryoneRole.Id)
+        {
+            reason = "@everyone は操作対象外です";
+            return false;
+        }
+
+        if (botUser.Hierarchy <= role.Position)
+        {
+            reason = "Botより上位ロールです";
+            return false;
+        }
+
+        if (botUser.Hierarchy <= targetUser.Hierarchy)
+        {
+            reason = "対象ユーザーがBot以上のロール階層です";
+            return false;
+        }
+
+        return true;
+    }
+
+    private int ResolveInactiveKickUserDataRetentionDays(GuildSettings? guildSettings)
+    {
+        if (guildSettings?.InactiveAutoKickUserDataRetentionDays is int perGuild)
+        {
+            return Math.Clamp(perGuild, 1, 30);
+        }
+
+        return Math.Clamp(_options.InactiveAutoKickUserDataRetentionDays <= 0 ? 7 : _options.InactiveAutoKickUserDataRetentionDays, 1, 30);
     }
 
     private async Task MarkUserActiveNowAsync(SocketGuild guild, ulong userId)
@@ -3482,6 +3725,8 @@ public sealed class DiscordBotService : IHostedService
 
     private async Task OnUserJoinedAsync(SocketGuildUser user)
     {
+        await TryRestoreReturningMemberRoleAsync(user);
+
         var summary = BuildMemberSummary(user, user.Guild.MemberCount);
         var embed = CreateLogEmbedBase(user.Guild, "メンバー参加", Color.Green, user)
             .WithDescription(summary)
@@ -3499,12 +3744,132 @@ public sealed class DiscordBotService : IHostedService
             .Build();
 
         await SendLogEmbedAsync(guild, embed);
+
+        await TryDeleteUserDataOnLeaveAsync(guild.Id, user.Id);
         _ = _stats.RefreshIfConfiguredAsync(guild);
+    }
+
+    private async Task OnUserBannedAsync(SocketUser user, SocketGuild guild)
+    {
+        _expectedAutoKickLeaves.TryRemove(BuildGuildUserKey(guild.Id, user.Id), out _);
+
+        try
+        {
+            await _db.RemoveInactiveKickUserDataRetentionAsync(guild.Id, user.Id);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to clear inactive auto-kick retention on ban. GuildId={GuildId}, UserId={UserId}", guild.Id, user.Id);
+        }
+
+        try
+        {
+            await _db.DeleteDiscordUserDataAsync(user.Id);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to delete user data on ban. GuildId={GuildId}, UserId={UserId}", guild.Id, user.Id);
+        }
     }
 
     private async Task OnGuildMemberUpdatedAsync(Cacheable<SocketGuildUser, ulong> beforeCache, SocketGuildUser after)
     {
         await Task.CompletedTask;
+    }
+
+    private async Task TryRestoreReturningMemberRoleAsync(SocketGuildUser user)
+    {
+        _expectedAutoKickLeaves.TryRemove(BuildGuildUserKey(user.Guild.Id, user.Id), out _);
+
+        try
+        {
+            await _db.RemoveInactiveKickUserDataRetentionAsync(user.Guild.Id, user.Id);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to clear inactive auto-kick retention on rejoin. GuildId={GuildId}, UserId={UserId}", user.Guild.Id, user.Id);
+        }
+
+        bool hasMainCharacter;
+        try
+        {
+            hasMainCharacter = await _db.HasMainCharacterAsync(user.Id);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to check retained user data on rejoin. GuildId={GuildId}, UserId={UserId}", user.Guild.Id, user.Id);
+            return;
+        }
+
+        if (!hasMainCharacter)
+        {
+            return;
+        }
+
+        GuildSettings? settings;
+        try
+        {
+            settings = await _db.GetGuildSettingsAsync(user.Guild.Id);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to load guild settings when restoring member role. GuildId={GuildId}, UserId={UserId}", user.Guild.Id, user.Id);
+            return;
+        }
+
+        var memberRole = ResolveMemberRole(user.Guild, settings);
+        if (memberRole is null || user.Roles.Any(role => role.Id == memberRole.Id))
+        {
+            return;
+        }
+
+        if (!CanAssignRole(user.Guild.CurrentUser, user, memberRole, out var reason))
+        {
+            _logger.LogWarning(
+                "Skipped member role restore on rejoin due to permission/hierarchy. GuildId={GuildId}, UserId={UserId}, RoleId={RoleId}, Reason={Reason}",
+                user.Guild.Id,
+                user.Id,
+                memberRole.Id,
+                reason);
+            return;
+        }
+
+        try
+        {
+            await user.AddRoleAsync(memberRole);
+            _logger.LogInformation("Restored member role on rejoin from retained data. GuildId={GuildId}, UserId={UserId}, RoleId={RoleId}", user.Guild.Id, user.Id, memberRole.Id);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to restore member role on rejoin. GuildId={GuildId}, UserId={UserId}, RoleId={RoleId}", user.Guild.Id, user.Id, memberRole.Id);
+        }
+    }
+
+    private async Task TryDeleteUserDataOnLeaveAsync(ulong guildId, ulong userId)
+    {
+        var leaveKey = BuildGuildUserKey(guildId, userId);
+        if (_expectedAutoKickLeaves.TryRemove(leaveKey, out _))
+        {
+            return;
+        }
+
+        try
+        {
+            await _db.RemoveInactiveKickUserDataRetentionAsync(guildId, userId);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to clear inactive auto-kick retention on leave. GuildId={GuildId}, UserId={UserId}", guildId, userId);
+        }
+
+        try
+        {
+            await _db.DeleteDiscordUserDataAsync(userId);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to delete user data on leave. GuildId={GuildId}, UserId={UserId}", guildId, userId);
+        }
     }
 
     private async Task OnUserVoiceStateUpdatedAsync(SocketUser user, SocketVoiceState before, SocketVoiceState after)
@@ -4523,6 +4888,7 @@ public sealed class DiscordBotService : IHostedService
 
     private static ulong ToUlong(long value) => unchecked((ulong)value);
     private static long ToDbId(ulong value) => unchecked((long)value);
+    private static string BuildGuildUserKey(ulong guildId, ulong userId) => $"{guildId}:{userId}";
     private static bool IsUnknownMessage(Discord.Net.HttpException ex)
         => ex.DiscordCode == DiscordErrorCode.UnknownMessage;
 

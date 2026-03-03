@@ -63,6 +63,7 @@ public sealed class DiscordOptions
     public int ActivityRoleSyncIntervalMinutes { get; init; } = 30;
     public bool InactiveAutoKickEnabled { get; init; } = true;
     public int InactiveAutoKickDays { get; init; } = 30;
+    public int InactiveAutoKickUserDataRetentionDays { get; init; } = 7;
     public string[] ManagementRoleNames { get; init; } = ["管理者", "オフィサー", "宣伝係"];
     public string[] InactiveAutoKickExemptRoleNames { get; init; } = Array.Empty<string>();
     public bool ApplyChannelPermissionOverwritesOnStartup { get; init; }

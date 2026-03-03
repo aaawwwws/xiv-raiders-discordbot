@@ -62,6 +62,8 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
     private const string LotteryAdminConfirmCancelCustomId = "lottery_admin_confirm_cancel";
     private const string RuntimeTuningEditCustomId = "admin_runtime_tuning_edit";
     private const string RuntimeTuningModalCustomId = "admin_runtime_tuning_modal";
+    private const string RuntimeInactiveKickRetentionEditCustomId = "admin_runtime_inactive_kick_retention_edit";
+    private const string RuntimeInactiveKickRetentionModalCustomId = "admin_runtime_inactive_kick_retention_modal";
     private const int VoiceHourlyStatsDefaultDays = 30;
     private const int VoiceHourlyStatsMaxDays = 90;
     private const int OpsKpiDefaultDays = 30;
@@ -1803,10 +1805,12 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
             return;
         }
 
+        var embed = await BuildRuntimeTuningEmbedAsync(Context.Guild.Id);
         await RespondAsync(
-            embed: BuildRuntimeTuningEmbed(),
+            embed: embed,
             components: new ComponentBuilder()
                 .WithButton("編集", RuntimeTuningEditCustomId, ButtonStyle.Primary, row: 0)
+                .WithButton("保持日数編集", RuntimeInactiveKickRetentionEditCustomId, ButtonStyle.Secondary, row: 0)
                 .Build(),
             ephemeral: true);
     }
@@ -1850,6 +1854,28 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
                 "admin_runtime_voice_session_retention_days",
                 value: tuning.VoiceSessionRetentionDays.ToString(System.Globalization.CultureInfo.InvariantCulture),
                 maxLength: 4);
+        await RespondWithModalAsync(modal.Build());
+    }
+
+    [RequireBotAdmin]
+    [ComponentInteraction(RuntimeInactiveKickRetentionEditCustomId, ignoreGroupNames: true)]
+    public async Task ShowInactiveKickRetentionModalAsync()
+    {
+        if (Context.Guild is null)
+        {
+            await RespondAsync("この操作はサーバー内でのみ使えます。", ephemeral: true);
+            return;
+        }
+
+        var retentionDays = await ResolveInactiveKickDataRetentionDaysAsync(Context.Guild.Id);
+        var modal = new ModalBuilder()
+            .WithTitle("自動キック後データ保持")
+            .WithCustomId(RuntimeInactiveKickRetentionModalCustomId)
+            .AddTextInput(
+                "保持日数（日 / 1-30）",
+                "admin_runtime_inactive_kick_user_data_retention_days",
+                value: retentionDays.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                maxLength: 2);
         await RespondWithModalAsync(modal.Build());
     }
 
@@ -1922,7 +1948,40 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
             Color.Blue,
             Context.User);
 
-        await RespondAsync(embed: BuildRuntimeTuningEmbed(), ephemeral: true);
+        await RespondAsync(embed: await BuildRuntimeTuningEmbedAsync(Context.Guild.Id), ephemeral: true);
+    }
+
+    [RequireBotAdmin]
+    [ModalInteraction(RuntimeInactiveKickRetentionModalCustomId, ignoreGroupNames: true)]
+    public async Task HandleInactiveKickRetentionModalAsync(AdminInactiveKickRetentionModal modal)
+    {
+        if (Context.Guild is null)
+        {
+            await RespondAsync("この操作はサーバー内でのみ使えます。", ephemeral: true);
+            return;
+        }
+
+        if (!int.TryParse(modal.RetentionDays, out var retentionDays))
+        {
+            await RespondAsync("保持日数は数値で入力してください。", ephemeral: true);
+            return;
+        }
+
+        if (retentionDays is < 1 or > 30)
+        {
+            await RespondAsync("保持日数は 1-30 の範囲で入力してください。", ephemeral: true);
+            return;
+        }
+
+        var updatedDays = await _db.UpsertGuildInactiveKickUserDataRetentionDaysAsync(Context.Guild.Id, retentionDays);
+        await _audit.SendAsync(
+            Context.Guild,
+            "運用設定更新（自動キック後データ保持）",
+            $"👤 実行者: {Context.User.Mention} ({Context.User})\n🗓️ 自動キック後ユーザーデータ保持: {updatedDays}日\n💾 DBに保存しました（再起動後も維持）。",
+            Color.Blue,
+            Context.User);
+
+        await RespondAsync(embed: await BuildRuntimeTuningEmbedAsync(Context.Guild.Id), ephemeral: true);
     }
 
     [RequireBotAdmin]
@@ -3897,9 +3956,10 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
         await FollowupAsync(embed: embed, ephemeral: true);
     }
 
-    private Embed BuildRuntimeTuningEmbed()
+    private async Task<Embed> BuildRuntimeTuningEmbedAsync(ulong guildId)
     {
         var tuning = _runtimeTuning.GetSnapshot();
+        var inactiveKickRetentionDays = await ResolveInactiveKickDataRetentionDaysAsync(guildId);
         return new EmbedBuilder()
             .WithTitle("運用設定")
             .WithColor(Color.Blue)
@@ -3910,8 +3970,20 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
             .AddField("メッセージ保持", tuning.MessageLogRetentionDays <= 0 ? "無効" : $"{tuning.MessageLogRetentionDays}日", true)
             .AddField("VC保持", tuning.VoiceSessionRetentionDays <= 0 ? "無効" : $"{tuning.VoiceSessionRetentionDays}日", true)
             .AddField("リアクション保持", tuning.ReactionLogRetentionDays <= 0 ? "無効" : $"{tuning.ReactionLogRetentionDays}日", true)
+            .AddField("自動キック後ユーザーデータ保持", $"{inactiveKickRetentionDays}日", true)
             .AddField("保存", "DB保存（再起動後も維持）", false)
             .Build();
+    }
+
+    private async Task<int> ResolveInactiveKickDataRetentionDaysAsync(ulong guildId)
+    {
+        var settings = await _db.GetGuildSettingsAsync(guildId);
+        if (settings?.InactiveAutoKickUserDataRetentionDays is int perGuild)
+        {
+            return Math.Clamp(perGuild, 1, 30);
+        }
+
+        return Math.Clamp(_options.InactiveAutoKickUserDataRetentionDays <= 0 ? 7 : _options.InactiveAutoKickUserDataRetentionDays, 1, 30);
     }
 
     private async Task ShowIntegrityCheckAsync(bool repair)
@@ -8909,6 +8981,15 @@ public sealed class AdminRuntimeTuningModal : IModal
     [InputLabel("VC保持（日 / 0-3650, 0=無効）")]
     [ModalTextInput("admin_runtime_voice_session_retention_days", maxLength: 4)]
     public string VoiceSessionRetentionDays { get; set; } = "90";
+}
+
+public sealed class AdminInactiveKickRetentionModal : IModal
+{
+    public string Title => "自動キック後データ保持";
+
+    [InputLabel("保持日数（日 / 1-30）")]
+    [ModalTextInput("admin_runtime_inactive_kick_user_data_retention_days", maxLength: 2)]
+    public string RetentionDays { get; set; } = "7";
 }
 
 public sealed class MemberManageTimeoutModal : IModal

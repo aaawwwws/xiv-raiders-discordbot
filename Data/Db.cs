@@ -336,6 +336,7 @@ ADD COLUMN IF NOT EXISTS registration_channel_id BIGINT NOT NULL DEFAULT 0,
 ADD COLUMN IF NOT EXISTS registration_review_channel_id BIGINT NOT NULL DEFAULT 0,
 ADD COLUMN IF NOT EXISTS registration_approval_required BOOLEAN NOT NULL DEFAULT TRUE,
 ADD COLUMN IF NOT EXISTS inactive_auto_kick_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+ADD COLUMN IF NOT EXISTS inactive_auto_kick_user_data_retention_days INTEGER NOT NULL DEFAULT 7,
 ADD COLUMN IF NOT EXISTS log_channel_id BIGINT NOT NULL DEFAULT 0,
 ADD COLUMN IF NOT EXISTS control_channel_id BIGINT NOT NULL DEFAULT 0,
 ADD COLUMN IF NOT EXISTS runtime_cleanup_interval_minutes INTEGER NULL,
@@ -402,6 +403,34 @@ ON public.user_reaction_logs (guild_id, reacted_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_user_reaction_logs_user
 ON public.user_reaction_logs (user_id);";
+
+        await using var conn = CreateConnection();
+        await conn.ExecuteAsync(sql);
+    }
+
+    public async Task EnsureInactiveKickRetentionTableAsync()
+    {
+        const string sql = @"
+CREATE TABLE IF NOT EXISTS public.inactive_kick_user_data_retentions (
+    id SERIAL PRIMARY KEY,
+    guild_id BIGINT NOT NULL,
+    user_id BIGINT NOT NULL,
+    delete_after TIMESTAMPTZ NOT NULL,
+    warning_notified_at TIMESTAMPTZ NULL,
+    final_warning_notified_at TIMESTAMPTZ NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT ux_inactive_kick_user_data_retentions UNIQUE (guild_id, user_id)
+);
+
+ALTER TABLE IF EXISTS public.inactive_kick_user_data_retentions
+ADD COLUMN IF NOT EXISTS warning_notified_at TIMESTAMPTZ NULL;
+
+ALTER TABLE IF EXISTS public.inactive_kick_user_data_retentions
+ADD COLUMN IF NOT EXISTS final_warning_notified_at TIMESTAMPTZ NULL;
+
+CREATE INDEX IF NOT EXISTS idx_inactive_kick_user_data_retentions_delete_after
+ON public.inactive_kick_user_data_retentions (delete_after ASC);";
 
         await using var conn = CreateConnection();
         await conn.ExecuteAsync(sql);
@@ -661,6 +690,219 @@ SET display_name = EXCLUDED.display_name,
             DisplayName = displayName,
             DiscordName = discordName
         });
+    }
+
+    public async Task<bool> HasMainCharacterAsync(ulong userId)
+    {
+        const string sql = @"
+SELECT 1
+FROM discord_user_characters
+WHERE discord_user_id = @UserId
+LIMIT 1;";
+
+        await using var conn = CreateConnection();
+        var exists = await conn.ExecuteScalarAsync<int?>(sql, new { UserId = ToDbId(userId) });
+        return exists.HasValue;
+    }
+
+    public async Task<bool> DeleteDiscordUserDataAsync(ulong userId)
+    {
+        const string deleteSql = @"
+DELETE FROM discord_users
+WHERE discord_user_id = @UserId;";
+
+        const string cleanupSql = @"
+DELETE FROM lodestone_characters c
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM discord_user_characters duc
+    WHERE duc.lodestone_id = c.lodestone_id
+);";
+
+        const string clearRetentionSql = @"
+DELETE FROM inactive_kick_user_data_retentions
+WHERE user_id = @UserId;";
+
+        await using var conn = CreateConnection();
+        await conn.OpenAsync();
+        await using var tx = await conn.BeginTransactionAsync();
+
+        var affected = await conn.ExecuteAsync(deleteSql, new { UserId = ToDbId(userId) }, transaction: tx);
+        await conn.ExecuteAsync(cleanupSql, transaction: tx);
+        await conn.ExecuteAsync(clearRetentionSql, new { UserId = ToDbId(userId) }, transaction: tx);
+
+        await tx.CommitAsync();
+        return affected > 0;
+    }
+
+    public async Task UpsertInactiveKickUserDataRetentionAsync(ulong guildId, ulong userId, DateTimeOffset deleteAfter)
+    {
+        const string sql = @"
+INSERT INTO inactive_kick_user_data_retentions (guild_id, user_id, delete_after)
+VALUES (@GuildId, @UserId, @DeleteAfter)
+ON CONFLICT (guild_id, user_id) DO UPDATE
+SET delete_after = EXCLUDED.delete_after,
+    warning_notified_at = NULL,
+    final_warning_notified_at = NULL,
+    updated_at = NOW();";
+
+        await using var conn = CreateConnection();
+        await conn.ExecuteAsync(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            UserId = ToDbId(userId),
+            DeleteAfter = deleteAfter
+        });
+    }
+
+    public async Task<bool> HasInactiveKickUserDataRetentionAsync(ulong guildId, ulong userId)
+    {
+        const string sql = @"
+SELECT 1
+FROM inactive_kick_user_data_retentions
+WHERE guild_id = @GuildId
+  AND user_id = @UserId
+LIMIT 1;";
+
+        await using var conn = CreateConnection();
+        var exists = await conn.ExecuteScalarAsync<int?>(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            UserId = ToDbId(userId)
+        });
+        return exists.HasValue;
+    }
+
+    public async Task<bool> RemoveInactiveKickUserDataRetentionAsync(ulong guildId, ulong userId)
+    {
+        const string sql = @"
+DELETE FROM inactive_kick_user_data_retentions
+WHERE guild_id = @GuildId
+  AND user_id = @UserId;";
+
+        await using var conn = CreateConnection();
+        var affected = await conn.ExecuteAsync(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            UserId = ToDbId(userId)
+        });
+        return affected > 0;
+    }
+
+    public async Task<IReadOnlyList<InactiveKickRetentionEntry>> ListDueInactiveKickUserDataRetentionsAsync(DateTimeOffset dueUtc, int maxRows = 200)
+    {
+        const string sql = @"
+SELECT guild_id AS GuildId,
+       user_id AS UserId,
+       delete_after AS DeleteAfter,
+       warning_notified_at AS WarningNotifiedAt,
+       final_warning_notified_at AS FinalWarningNotifiedAt,
+       created_at AS CreatedAt,
+       updated_at AS UpdatedAt
+FROM inactive_kick_user_data_retentions
+WHERE delete_after <= @DueUtc
+ORDER BY delete_after ASC
+LIMIT @MaxRows;";
+
+        await using var conn = CreateConnection();
+        var rows = await conn.QueryAsync<InactiveKickRetentionEntry>(sql, new
+        {
+            DueUtc = dueUtc,
+            MaxRows = Math.Clamp(maxRows, 1, 1000)
+        });
+        return rows.ToList();
+    }
+
+    public async Task<IReadOnlyList<InactiveKickRetentionEntry>> ListDueInactiveKickUserDataRetentionWarningsAsync(DateTimeOffset nowUtc, int maxRows = 200)
+    {
+        const string sql = @"
+SELECT guild_id AS GuildId,
+       user_id AS UserId,
+       delete_after AS DeleteAfter,
+       warning_notified_at AS WarningNotifiedAt,
+       final_warning_notified_at AS FinalWarningNotifiedAt,
+       created_at AS CreatedAt,
+       updated_at AS UpdatedAt
+FROM inactive_kick_user_data_retentions
+WHERE warning_notified_at IS NULL
+  AND delete_after > @NowUtc + INTERVAL '1 hour'
+  AND delete_after <= @NowUtc + INTERVAL '1 day'
+ORDER BY delete_after ASC
+LIMIT @MaxRows;";
+
+        await using var conn = CreateConnection();
+        var rows = await conn.QueryAsync<InactiveKickRetentionEntry>(sql, new
+        {
+            NowUtc = nowUtc,
+            MaxRows = Math.Clamp(maxRows, 1, 1000)
+        });
+        return rows.ToList();
+    }
+
+    public async Task<IReadOnlyList<InactiveKickRetentionEntry>> ListDueInactiveKickUserDataFinalWarningsAsync(DateTimeOffset nowUtc, int maxRows = 200)
+    {
+        const string sql = @"
+SELECT guild_id AS GuildId,
+       user_id AS UserId,
+       delete_after AS DeleteAfter,
+       warning_notified_at AS WarningNotifiedAt,
+       final_warning_notified_at AS FinalWarningNotifiedAt,
+       created_at AS CreatedAt,
+       updated_at AS UpdatedAt
+FROM inactive_kick_user_data_retentions
+WHERE final_warning_notified_at IS NULL
+  AND delete_after > @NowUtc
+  AND delete_after <= @NowUtc + INTERVAL '1 hour'
+ORDER BY delete_after ASC
+LIMIT @MaxRows;";
+
+        await using var conn = CreateConnection();
+        var rows = await conn.QueryAsync<InactiveKickRetentionEntry>(sql, new
+        {
+            NowUtc = nowUtc,
+            MaxRows = Math.Clamp(maxRows, 1, 1000)
+        });
+        return rows.ToList();
+    }
+
+    public async Task<bool> MarkInactiveKickUserDataRetentionWarningNotifiedAsync(ulong guildId, ulong userId, DateTimeOffset notifiedAtUtc)
+    {
+        const string sql = @"
+UPDATE inactive_kick_user_data_retentions
+SET warning_notified_at = @NotifiedAtUtc,
+    updated_at = NOW()
+WHERE guild_id = @GuildId
+  AND user_id = @UserId
+  AND warning_notified_at IS NULL;";
+
+        await using var conn = CreateConnection();
+        var affected = await conn.ExecuteAsync(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            UserId = ToDbId(userId),
+            NotifiedAtUtc = notifiedAtUtc
+        });
+        return affected > 0;
+    }
+
+    public async Task<bool> MarkInactiveKickUserDataRetentionFinalWarningNotifiedAsync(ulong guildId, ulong userId, DateTimeOffset notifiedAtUtc)
+    {
+        const string sql = @"
+UPDATE inactive_kick_user_data_retentions
+SET final_warning_notified_at = @NotifiedAtUtc,
+    updated_at = NOW()
+WHERE guild_id = @GuildId
+  AND user_id = @UserId
+  AND final_warning_notified_at IS NULL;";
+
+        await using var conn = CreateConnection();
+        var affected = await conn.ExecuteAsync(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            UserId = ToDbId(userId),
+            NotifiedAtUtc = notifiedAtUtc
+        });
+        return affected > 0;
     }
 
     public async Task UpdateUserProfileAsync(ulong userId, string? xHandle, string? blueskyHandle, string? bio)
@@ -5091,6 +5333,7 @@ SELECT guild_id AS GuildId,
        registration_review_channel_id AS RegistrationReviewChannelId,
        registration_approval_required AS RegistrationApprovalRequired,
        inactive_auto_kick_enabled AS InactiveAutoKickEnabled,
+       inactive_auto_kick_user_data_retention_days AS InactiveAutoKickUserDataRetentionDays,
        log_channel_id AS LogChannelId,
        control_channel_id AS ControlChannelId,
        runtime_cleanup_interval_minutes AS RuntimeCleanupIntervalMinutes,
@@ -5178,6 +5421,47 @@ WHERE guild_id = @GuildId;";
         return affected > 0;
     }
 
+    public async Task<int> UpsertGuildInactiveKickUserDataRetentionDaysAsync(ulong guildId, int retentionDays)
+    {
+        const string sql = @"
+INSERT INTO guild_settings (
+    guild_id,
+    admin_role_id,
+    member_role_id,
+    provisional_role_id,
+    registration_channel_id,
+    registration_review_channel_id,
+    registration_approval_required,
+    inactive_auto_kick_enabled,
+    inactive_auto_kick_user_data_retention_days,
+    log_channel_id,
+    control_channel_id)
+VALUES (
+    @GuildId,
+    0,
+    0,
+    0,
+    0,
+    0,
+    TRUE,
+    TRUE,
+    @RetentionDays,
+    0,
+    0)
+ON CONFLICT (guild_id) DO UPDATE
+SET inactive_auto_kick_user_data_retention_days = @RetentionDays,
+    updated_at = NOW()
+RETURNING inactive_auto_kick_user_data_retention_days;";
+
+        var normalized = Math.Clamp(retentionDays, 1, 30);
+        await using var conn = CreateConnection();
+        return await conn.ExecuteScalarAsync<int>(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            RetentionDays = normalized
+        });
+    }
+
     public async Task UpsertGuildRuntimeTuningAsync(
         ulong guildId,
         int cleanupIntervalMinutes,
@@ -5258,6 +5542,7 @@ SELECT guild_id AS GuildId,
        registration_review_channel_id AS RegistrationReviewChannelId,
        registration_approval_required AS RegistrationApprovalRequired,
        inactive_auto_kick_enabled AS InactiveAutoKickEnabled,
+       inactive_auto_kick_user_data_retention_days AS InactiveAutoKickUserDataRetentionDays,
        log_channel_id AS LogChannelId,
        control_channel_id AS ControlChannelId,
        runtime_cleanup_interval_minutes AS RuntimeCleanupIntervalMinutes,
