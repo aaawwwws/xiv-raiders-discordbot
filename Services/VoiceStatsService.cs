@@ -125,7 +125,7 @@ public sealed class VoiceStatsService {
         var vcTop = voiceRows
             .Take(topLimit)
             .ToList();
-        var totalVcSeconds = Math.Max(0, voiceRows.Sum(x => x.DurationSeconds));
+        var totalVcSeconds = await _db.SummarizeVoiceDurationByGuildAsync(guild.Id, fromUtc, toUtc);
         var messageTop = nonAdminMessageCounts
             .OrderByDescending(x => x.Value)
             .ThenBy(x => x.Key)
@@ -162,6 +162,10 @@ public sealed class VoiceStatsService {
         var totalMessages = Math.Max(0, nonAdminMessageCounts.Values.Sum());
         var reactorUserCount = nonAdminReactionGivenCounts.Count;
         var reactedUserCount = nonAdminReactionReceivedCounts.Count;
+        var includeAllTimeVoiceTotal = title.Contains("今日", StringComparison.Ordinal);
+        var allTimeVoiceTotalSeconds = includeAllTimeVoiceTotal
+            ? await _db.SummarizeVoiceDurationByGuildAsync(guild.Id, DateTimeOffset.UnixEpoch, toUtc)
+            : 0L;
 
         var fromJst = fromUtc.ToOffset(TimeSpan.FromHours(9));
         var toJst = toUtc.ToOffset(TimeSpan.FromHours(9));
@@ -222,7 +226,8 @@ public sealed class VoiceStatsService {
                 "📅 **集計期間**\n" +
                 $"`{period}`\n" +
                 $"👥 **アクティブ人数**: `{activeUsers.Count}人`\n" +
-                $"🎙️ **VC合計**: `{FormatDuration(totalVcSeconds)}`\n" +
+                $"🎙️ **VC稼働時間**: `{FormatDuration(totalVcSeconds)}`\n" +
+                (includeAllTimeVoiceTotal ? $"🗃️ **VC累計(全期間)**: `{FormatDuration(allTimeVoiceTotalSeconds)}`\n" : string.Empty) +
                 $"💬 **発言合計**: `{totalMessages}件`\n" +
                 $"👏 **リアクションした人数**: `{reactorUserCount}人`\n" +
                 $"🎯 **リアクションされた人数**: `{reactedUserCount}人`");

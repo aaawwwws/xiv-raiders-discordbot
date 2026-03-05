@@ -3501,7 +3501,7 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
             ? new List<string> { $"期間({lookbackDays}日)にVCログがありません。" }
             : new List<string>
             {
-                $"VC合計({lookbackDays}日): {FormatDuration((int)Math.Min(int.MaxValue, totalVoiceSeconds))}",
+                $"VC稼働時間({lookbackDays}日): {FormatDuration((int)Math.Min(int.MaxValue, totalVoiceSeconds))}",
                 $"上位3時間帯占有率: {FormatPercent(topHourShare)}",
                 $"上位時間帯: {topHourText}",
                 $"上位3VC占有率: {FormatPercent(topChannelShare)}",
@@ -3767,7 +3767,7 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
             $"🧩 よく集まる時間帯(人数): {(topUserHours.Length == 0 ? "-" : string.Join(", ", topUserHours))}",
             $"🗓️ 混雑スロット(曜日×時間): {(hotSlots.Length == 0 ? "-" : string.Join(", ", hotSlots))}",
             BuildHourRegularsLine(hourRegulars, currentHourJst),
-            $"⏱️ 1日あたりVC合計: {FormatDuration((int)Math.Min(int.MaxValue, avgDailySeconds))}"
+            $"⏱️ 1日あたりVC稼働時間: {FormatDuration((int)Math.Min(int.MaxValue, avgDailySeconds))}"
         };
         var chartPng = await BuildVoiceHourlyChartPngAsync(hourly, weekdayHourSeconds, lookbackDays, currentHourJst, regularChartItems);
         var chartFileName = $"voice_hourly_{Context.Guild.Id}_{toUtcExclusive:yyyyMMddHHmm}.png";

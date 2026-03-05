@@ -3142,6 +3142,64 @@ WHERE guild_id = @GuildId
         return (Math.Max(0, row.SessionCount), Math.Max(0L, row.TotalDurationSeconds));
     }
 
+    public async Task<long> SummarizeVoiceDurationByGuildAsync(
+        ulong guildId,
+        DateTimeOffset fromUtcInclusive,
+        DateTimeOffset toUtcExclusive)
+    {
+        if (guildId == 0 || toUtcExclusive <= fromUtcInclusive)
+        {
+            return 0L;
+        }
+
+        const string sql = @"
+WITH clipped AS (
+    SELECT GREATEST(joined_at, @FromUtcInclusive) AS start_at,
+           LEAST(COALESCE(left_at, @ToUtcExclusive), @ToUtcExclusive) AS end_at
+    FROM voice_sessions
+    WHERE guild_id = @GuildId
+      AND COALESCE(left_at, @ToUtcExclusive) > @FromUtcInclusive
+      AND joined_at < @ToUtcExclusive
+),
+events AS (
+    SELECT start_at AS ts, 1 AS delta
+    FROM clipped
+    WHERE end_at > start_at
+    UNION ALL
+    SELECT end_at AS ts, -1 AS delta
+    FROM clipped
+    WHERE end_at > start_at
+),
+merged AS (
+    SELECT ts,
+           SUM(delta) AS delta
+    FROM events
+    GROUP BY ts
+),
+timeline AS (
+    SELECT ts,
+           LEAD(ts) OVER (ORDER BY ts) AS next_ts,
+           SUM(delta) OVER (ORDER BY ts ROWS UNBOUNDED PRECEDING) AS active_count
+    FROM merged
+)
+SELECT COALESCE(
+           SUM(
+               EXTRACT(EPOCH FROM (next_ts - ts))
+           ) FILTER (WHERE active_count > 0 AND next_ts IS NOT NULL AND next_ts > ts),
+           0
+       )::BIGINT
+FROM timeline;";
+
+        await using var conn = CreateConnection();
+        var total = await conn.ExecuteScalarAsync<long>(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            FromUtcInclusive = fromUtcInclusive,
+            ToUtcExclusive = toUtcExclusive
+        });
+        return Math.Max(0L, total);
+    }
+
     public async Task<IReadOnlyList<MessageLog>> ListMessageLogsForUserExportAsync(
         ulong guildId,
         ulong userId,
