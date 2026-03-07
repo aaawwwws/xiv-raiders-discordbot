@@ -25,6 +25,7 @@ public sealed class StatsEmbedService
     private const int EditRetryCount = 2;
     private static readonly ConcurrentDictionary<ulong, SemaphoreSlim> RefreshLocks = new();
     private static readonly ConcurrentDictionary<ulong, DateTimeOffset> LastAutoRefreshAt = new();
+    private static readonly ConcurrentDictionary<string, bool> RenderableFontCache = new(StringComparer.OrdinalIgnoreCase);
 
     private static readonly Rgba32[][] ChartPalettes =
     [
@@ -768,8 +769,7 @@ public sealed class StatsEmbedService
         }
         catch (NotSupportedException)
         {
-            // CFF2 fonts are unsupported on some Linux environments.
-            // Keep chart image output even if text rendering is unavailable.
+            DrawPieChartTextFallback(image, chartTitle, segments, total, pieCenterX, pieCenterY, pieRadius);
         }
 
         using var ms = new MemoryStream();
@@ -912,44 +912,126 @@ public sealed class StatsEmbedService
         {
             if (SystemFonts.TryGet(name, out var family))
             {
-                try
+                if (TryCreateUsableFont(family, size, style, out var font))
                 {
-                    return family.CreateFont(size, style);
-                }
-                catch
-                {
-                    try
-                    {
-                        return family.CreateFont(size, FontStyle.Regular);
-                    }
-                    catch
-                    {
-                        // Try next family.
-                    }
+                    return font;
                 }
             }
         }
 
         foreach (var family in SystemFonts.Collection.Families)
         {
-            try
+            if (TryCreateUsableFont(family, size, style, out var font))
             {
-                return family.CreateFont(size, style);
-            }
-            catch
-            {
-                try
-                {
-                    return family.CreateFont(size, FontStyle.Regular);
-                }
-                catch
-                {
-                    // Try next family.
-                }
+                return font;
             }
         }
 
         throw new InvalidOperationException("No usable system fonts available.");
+    }
+
+    private static bool TryCreateUsableFont(FontFamily family, float size, FontStyle style, out Font font)
+    {
+        if (TryCreateFont(family, size, style, out font) && IsFontRenderable(font))
+        {
+            return true;
+        }
+
+        if (style != FontStyle.Regular &&
+            TryCreateFont(family, size, FontStyle.Regular, out font) &&
+            IsFontRenderable(font))
+        {
+            return true;
+        }
+
+        font = default!;
+        return false;
+    }
+
+    private static bool TryCreateFont(FontFamily family, float size, FontStyle style, out Font font)
+    {
+        try
+        {
+            font = family.CreateFont(size, style);
+            return true;
+        }
+        catch
+        {
+            font = default!;
+            return false;
+        }
+    }
+
+    private static bool IsFontRenderable(Font font)
+    {
+        var key = font.Family.Name;
+        if (RenderableFontCache.TryGetValue(key, out var cached))
+        {
+            return cached;
+        }
+
+        var renderable = TryMeasureFont(font);
+        RenderableFontCache[key] = renderable;
+        return renderable;
+    }
+
+    private static bool TryMeasureFont(Font font)
+    {
+        try
+        {
+            _ = TextMeasurer.MeasureBounds("Aa1%", new TextOptions(font));
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static void DrawPieChartTextFallback(
+        Image<Rgba32> image,
+        string chartTitle,
+        IReadOnlyList<PieSegment> segments,
+        int total,
+        int pieCenterX,
+        int pieCenterY,
+        int pieRadius)
+    {
+        var normalizedTitle = NormalizeLegendText(chartTitle);
+        if (!string.IsNullOrWhiteSpace(normalizedTitle))
+        {
+            DrawText(image, 64, 76, normalizedTitle, new Rgba32(35, 35, 35, 255), 6);
+        }
+
+        foreach (var seg in segments)
+        {
+            var span = seg.EndRatio - seg.StartRatio;
+            if (span < 0.03)
+            {
+                continue;
+            }
+
+            var percentText = $"{ToPercent(seg.Row.Count, total):0.#}%";
+            var angle = RatioToAngle(seg.MidRatio);
+            var radius = pieRadius * 0.62;
+            var centerX = pieCenterX + (int)Math.Round(Math.Cos(angle) * radius);
+            var centerY = pieCenterY + (int)Math.Round(Math.Sin(angle) * radius);
+
+            if (span >= 0.13)
+            {
+                var name = NormalizeLegendText(TruncateLegendText(seg.Row.Name, 9));
+                if (!string.IsNullOrWhiteSpace(name))
+                {
+                    DrawTextCentered(image, centerX, centerY - 18, name, new Rgba32(255, 255, 255, 255), 2);
+                }
+
+                DrawTextCentered(image, centerX, centerY + 18, percentText, new Rgba32(255, 255, 255, 255), 3);
+            }
+            else
+            {
+                DrawTextCentered(image, centerX, centerY, percentText, new Rgba32(255, 255, 255, 255), 2);
+            }
+        }
     }
 
     private static FontRectangle MeasureTextSmooth(string text, Font font)
