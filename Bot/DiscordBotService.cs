@@ -3917,7 +3917,7 @@ public sealed class DiscordBotService : IHostedService
         }
         var duration = await ResolveVoiceDurationAsync(guild, user, beforeChannel, now);
         var summary = BuildVoiceSummary(guild, user, beforeChannel, afterChannel, duration);
-        var isFirstJoinInChannel = IsFirstHumanJoinInChannel(beforeChannel, afterChannel);
+        var isFirstJoinInChannel = await IsFirstHumanJoinInChannelAsync(guild, user.Id, beforeChannel, afterChannel);
         var endedChannel = ResolveEndedVoiceChannel(beforeChannel, afterChannel);
         var shouldNotifyUserVoiceActivity = true;
         if (isFirstJoinInChannel || endedChannel is not null)
@@ -3974,7 +3974,7 @@ public sealed class DiscordBotService : IHostedService
             var endedEmbed = CreateLogEmbedBase(guild, "通話終了", Color.DarkGrey, user, preferGuildDisplayName: true)
                 .WithDescription(BuildVoiceCallEndedSummary(guild, user, endedChannel, now, duration))
                 .Build();
-            await SendNotificationEmbedAsync(guild, endedEmbed, mentionVoiceRole: true);
+            await SendNotificationEmbedAsync(guild, endedEmbed, mentionVoiceRole: false);
         }
 
         if (afterChannel is not null && _options.VoiceProfileEmbedEnabled)
@@ -5569,7 +5569,11 @@ public sealed class DiscordBotService : IHostedService
         return IsImageLike(attachment.ContentType, attachment.Filename);
     }
 
-    private static bool IsFirstHumanJoinInChannel(SocketVoiceChannel? beforeChannel, SocketVoiceChannel? afterChannel)
+    private async Task<bool> IsFirstHumanJoinInChannelAsync(
+        SocketGuild guild,
+        ulong userId,
+        SocketVoiceChannel? beforeChannel,
+        SocketVoiceChannel? afterChannel)
     {
         if (afterChannel is null)
         {
@@ -5581,8 +5585,32 @@ public sealed class DiscordBotService : IHostedService
             return false;
         }
 
-        var humanCount = afterChannel.ConnectedUsers.Count(member => !member.IsBot);
-        return humanCount == 1;
+        // Fast-path: if another human is already visible in the channel, it is not the first join.
+        if (afterChannel.ConnectedUsers.Any(member => !member.IsBot && member.Id != userId))
+        {
+            return false;
+        }
+
+        // Guard against transient cache desync by checking open DB sessions in the channel.
+        try
+        {
+            var openSessions = await _db.ListOpenVoiceSessionsAsync(guild.Id, afterChannel.Id);
+            if (openSessions.Any(session => ToUlong(session.UserId) != userId))
+            {
+                return false;
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "Failed to verify first-join status using open voice sessions. GuildId={GuildId}, ChannelId={ChannelId}, UserId={UserId}",
+                guild.Id,
+                afterChannel.Id,
+                userId);
+        }
+
+        return true;
     }
 
     private static SocketVoiceChannel? ResolveEndedVoiceChannel(SocketVoiceChannel? beforeChannel, SocketVoiceChannel? afterChannel)
