@@ -122,9 +122,15 @@ public sealed class StatsEmbedService
             return new StatsRefreshResult(false, false, 0, "未設定");
         }
 
-        var channel = guild.GetTextChannel(ToUlong(panel.ChannelId));
+        var channelId = ToUlong(panel.ChannelId);
+        var channel = guild.GetTextChannel(channelId)
+            ?? guild.GetChannel(channelId) as IMessageChannel;
         if (channel is null)
         {
+            _logger.LogWarning(
+                "Failed to resolve stats channel from panel config. GuildId={GuildId}, ChannelId={ChannelId}",
+                guild.Id,
+                channelId);
             return new StatsRefreshResult(false, false, 0, "統計チャンネル未検出");
         }
 
@@ -161,6 +167,11 @@ public sealed class StatsEmbedService
 
             return result;
         }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to refresh stats population embeds. GuildId={GuildId}", guild.Id);
+            return new StatsRefreshResult(false, true, 0, "更新失敗");
+        }
         finally
         {
             gate.Release();
@@ -177,7 +188,18 @@ public sealed class StatsEmbedService
 
         try
         {
-            await guild.DownloadUsersAsync();
+            var downloadUsersTask = guild.DownloadUsersAsync();
+            var completed = await Task.WhenAny(downloadUsersTask, Task.Delay(TimeSpan.FromSeconds(20)));
+            if (completed == downloadUsersTask)
+            {
+                await downloadUsersTask;
+            }
+            else
+            {
+                _logger.LogWarning(
+                    "Timed out while downloading guild users for stats refresh. GuildId={GuildId}",
+                    guild.Id);
+            }
         }
         catch (Exception ex)
         {
@@ -214,14 +236,27 @@ public sealed class StatsEmbedService
             }
 
             existingByTitle.TryGetValue(spec.EmbedTitle, out var existing);
-            var chartPng = BuildPieChartPng(spec.ChartTitle, spec.ChartSlices, spec.TotalCount, spec.PaletteIndex);
+            byte[]? chartPng;
+            try
+            {
+                chartPng = BuildPieChartPng(spec.ChartTitle, spec.ChartSlices, spec.TotalCount, spec.PaletteIndex);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(
+                    ex,
+                    "Failed to build stats pie chart image. GuildId={GuildId} Title={Title}",
+                    guild.Id,
+                    spec.EmbedTitle);
+                chartPng = null;
+            }
             var embed = BuildDistributionEmbed(
                 spec.EmbedTitle,
                 spec.TotalCount,
                 spec.DisplayRows,
                 spec.MaxRows,
                 spec.Color,
-                spec.ChartFileName);
+                chartPng is { Length: > 0 } ? spec.ChartFileName : null);
 
             var posted = await UpsertStatsMessageAsync(channel, existing, embed, chartPng, spec.ChartFileName);
             createdByTitle[spec.EmbedTitle] = posted;
@@ -526,7 +561,7 @@ public sealed class StatsEmbedService
         IReadOnlyList<DistributionRow> rows,
         int maxRows,
         Discord.Color color,
-        string chartFileName)
+        string? chartFileName)
     {
         var displayRows = rows.Take(Math.Max(1, maxRows)).ToList();
         var otherCount = rows.Skip(displayRows.Count).Sum(row => row.Count);
@@ -632,101 +667,109 @@ public sealed class StatsEmbedService
         DrawCircleOutline(image, pieCenterX, pieCenterY, pieRadius, new Rgba32(245, 245, 245, 255));
         DrawCircleOutline(image, pieCenterX, pieCenterY, pieRadius - 1, new Rgba32(245, 245, 245, 255));
 
-        var titleFont = GetChartFont(66, FontStyle.Bold);
-        DrawTextSmooth(image, chartTitle, titleFont, new Rgba32(35, 35, 35, 255), 64, 76);
-
-        foreach (var seg in segments)
+        try
         {
-            var span = seg.EndRatio - seg.StartRatio;
-            if (span < 0.02)
+            var titleFont = GetChartFont(66, FontStyle.Bold);
+            DrawTextSmooth(image, chartTitle, titleFont, new Rgba32(35, 35, 35, 255), 64, 76);
+
+            foreach (var seg in segments)
             {
-                continue;
-            }
-
-            var percent = ToPercent(seg.Row.Count, total);
-            var (nameFontSize, percentFontSize) = span switch
-            {
-                >= 0.20 => (52f, 56f),
-                >= 0.13 => (44f, 48f),
-                >= 0.09 => (36f, 40f),
-                _ => (30f, 34f)
-            };
-
-            var nameFont = GetChartFont(nameFontSize, FontStyle.Bold);
-            var percentFont = GetChartFont(percentFontSize, FontStyle.Bold);
-            var angle = RatioToAngle(seg.MidRatio);
-            var radius = pieRadius * 0.58;
-            var centerX = pieCenterX + (float)(Math.Cos(angle) * radius);
-            var centerY = pieCenterY + (float)(Math.Sin(angle) * radius);
-
-            var name = TruncateLegendText(seg.Row.Name, span >= 0.12 ? 10 : 7);
-            var percentText = $"{percent:0.#}%";
-
-            var rendered = false;
-            var fitRadius = radius;
-            for (var attempt = 0; attempt < 8; attempt++)
-            {
-                var nameSize = MeasureTextSmooth(name, nameFont);
-                var percentSize = MeasureTextSmooth(percentText, percentFont);
-                var totalHeight = nameSize.Height + 8 + percentSize.Height;
-                var arcLength = span * 2.0 * Math.PI * fitRadius;
-                var maxWidth = Math.Max(nameSize.Width, percentSize.Width);
-                var canPlaceInside =
-                    span >= 0.05 &&
-                    maxWidth <= (arcLength * 0.92) &&
-                    totalHeight <= (pieRadius * 0.58);
-
-                if (canPlaceInside)
+                var span = seg.EndRatio - seg.StartRatio;
+                if (span < 0.02)
                 {
-                    DrawTextCenteredSmoothShadow(image, name, nameFont, new Rgba32(255, 255, 255, 255), centerX, centerY - (totalHeight / 2f) + (nameSize.Height / 2f), shadowAlpha: 82);
-                    DrawTextCenteredSmoothShadow(image, percentText, percentFont, new Rgba32(255, 255, 255, 255), centerX, centerY + (totalHeight / 2f) - (percentSize.Height / 2f), shadowAlpha: 82);
-                    rendered = true;
-                    break;
+                    continue;
                 }
 
-                var nextNameSize = nameFont.Size - 2f;
-                var nextPercentSize = percentFont.Size - 2f;
-                if (nextNameSize < 20f || nextPercentSize < 22f)
+                var percent = ToPercent(seg.Row.Count, total);
+                var (nameFontSize, percentFontSize) = span switch
                 {
-                    break;
+                    >= 0.20 => (52f, 56f),
+                    >= 0.13 => (44f, 48f),
+                    >= 0.09 => (36f, 40f),
+                    _ => (30f, 34f)
+                };
+
+                var nameFont = GetChartFont(nameFontSize, FontStyle.Bold);
+                var percentFont = GetChartFont(percentFontSize, FontStyle.Bold);
+                var angle = RatioToAngle(seg.MidRatio);
+                var radius = pieRadius * 0.58;
+                var centerX = pieCenterX + (float)(Math.Cos(angle) * radius);
+                var centerY = pieCenterY + (float)(Math.Sin(angle) * radius);
+
+                var name = TruncateLegendText(seg.Row.Name, span >= 0.12 ? 10 : 7);
+                var percentText = $"{percent:0.#}%";
+
+                var rendered = false;
+                var fitRadius = radius;
+                for (var attempt = 0; attempt < 8; attempt++)
+                {
+                    var nameSize = MeasureTextSmooth(name, nameFont);
+                    var percentSize = MeasureTextSmooth(percentText, percentFont);
+                    var totalHeight = nameSize.Height + 8 + percentSize.Height;
+                    var arcLength = span * 2.0 * Math.PI * fitRadius;
+                    var maxWidth = Math.Max(nameSize.Width, percentSize.Width);
+                    var canPlaceInside =
+                        span >= 0.05 &&
+                        maxWidth <= (arcLength * 0.92) &&
+                        totalHeight <= (pieRadius * 0.58);
+
+                    if (canPlaceInside)
+                    {
+                        DrawTextCenteredSmoothShadow(image, name, nameFont, new Rgba32(255, 255, 255, 255), centerX, centerY - (totalHeight / 2f) + (nameSize.Height / 2f), shadowAlpha: 82);
+                        DrawTextCenteredSmoothShadow(image, percentText, percentFont, new Rgba32(255, 255, 255, 255), centerX, centerY + (totalHeight / 2f) - (percentSize.Height / 2f), shadowAlpha: 82);
+                        rendered = true;
+                        break;
+                    }
+
+                    var nextNameSize = nameFont.Size - 2f;
+                    var nextPercentSize = percentFont.Size - 2f;
+                    if (nextNameSize < 20f || nextPercentSize < 22f)
+                    {
+                        break;
+                    }
+
+                    nameFont = GetChartFont(nextNameSize, FontStyle.Bold);
+                    percentFont = GetChartFont(nextPercentSize, FontStyle.Bold);
+                    fitRadius = Math.Min(pieRadius * 0.82, fitRadius + 12);
+                    centerX = pieCenterX + (float)(Math.Cos(angle) * fitRadius);
+                    centerY = pieCenterY + (float)(Math.Sin(angle) * fitRadius);
                 }
 
-                nameFont = GetChartFont(nextNameSize, FontStyle.Bold);
-                percentFont = GetChartFont(nextPercentSize, FontStyle.Bold);
-                fitRadius = Math.Min(pieRadius * 0.82, fitRadius + 12);
-                centerX = pieCenterX + (float)(Math.Cos(angle) * fitRadius);
-                centerY = pieCenterY + (float)(Math.Sin(angle) * fitRadius);
-            }
-
-            if (rendered)
-            {
-                continue;
-            }
-
-            var percentOnlyRadius = Math.Min(pieRadius * 0.86, fitRadius + 10);
-            var percentOnlyX = pieCenterX + (float)(Math.Cos(angle) * percentOnlyRadius);
-            var percentOnlyY = pieCenterY + (float)(Math.Sin(angle) * percentOnlyRadius);
-            var percentOnlyFont = GetChartFont(Math.Max(20f, percentFont.Size), FontStyle.Bold);
-
-            for (var attempt = 0; attempt < 6; attempt++)
-            {
-                var percentSize = MeasureTextSmooth(percentText, percentOnlyFont);
-                var arcLength = span * 2.0 * Math.PI * percentOnlyRadius;
-                if (percentSize.Width <= (arcLength * 0.96))
+                if (rendered)
                 {
-                    DrawTextCenteredSmoothShadow(image, percentText, percentOnlyFont, new Rgba32(255, 255, 255, 255), percentOnlyX, percentOnlyY, shadowAlpha: 78);
-                    rendered = true;
-                    break;
+                    continue;
                 }
 
-                var next = percentOnlyFont.Size - 2f;
-                if (next < 16f)
-                {
-                    break;
-                }
+                var percentOnlyRadius = Math.Min(pieRadius * 0.86, fitRadius + 10);
+                var percentOnlyX = pieCenterX + (float)(Math.Cos(angle) * percentOnlyRadius);
+                var percentOnlyY = pieCenterY + (float)(Math.Sin(angle) * percentOnlyRadius);
+                var percentOnlyFont = GetChartFont(Math.Max(20f, percentFont.Size), FontStyle.Bold);
 
-                percentOnlyFont = GetChartFont(next, FontStyle.Bold);
+                for (var attempt = 0; attempt < 6; attempt++)
+                {
+                    var percentSize = MeasureTextSmooth(percentText, percentOnlyFont);
+                    var arcLength = span * 2.0 * Math.PI * percentOnlyRadius;
+                    if (percentSize.Width <= (arcLength * 0.96))
+                    {
+                        DrawTextCenteredSmoothShadow(image, percentText, percentOnlyFont, new Rgba32(255, 255, 255, 255), percentOnlyX, percentOnlyY, shadowAlpha: 78);
+                        rendered = true;
+                        break;
+                    }
+
+                    var next = percentOnlyFont.Size - 2f;
+                    if (next < 16f)
+                    {
+                        break;
+                    }
+
+                    percentOnlyFont = GetChartFont(next, FontStyle.Bold);
+                }
             }
+        }
+        catch (NotSupportedException)
+        {
+            // CFF2 fonts are unsupported on some Linux environments.
+            // Keep chart image output even if text rendering is unavailable.
         }
 
         using var ms = new MemoryStream();

@@ -47,7 +47,26 @@ public sealed class StatsModule : InteractionModuleBase<SocketInteractionContext
 
         await DeferAsync(ephemeral: true);
 
-        var result = await _stats.SetupAndRefreshAsync(Context.Guild, channel);
+        var refreshTask = _stats.SetupAndRefreshAsync(Context.Guild, channel);
+        var completed = await Task.WhenAny(refreshTask, Task.Delay(TimeSpan.FromSeconds(30)));
+        if (completed != refreshTask)
+        {
+            await FollowupAsync(
+                "統計EMBED更新がタイムアウトしました。しばらくして再実行してください。",
+                ephemeral: true);
+            return;
+        }
+
+        var result = await refreshTask;
+        if (!result.Updated)
+        {
+            await FollowupAsync(
+                $"統計EMBEDの更新に失敗しました。理由: {result.Source}\n" +
+                "Botのチャンネル参照権限/送信権限を確認してください。",
+                ephemeral: true);
+            return;
+        }
+
         await FollowupAsync(
             $"統計EMBEDを更新しました。対象登録数: {result.RegisteredCount} / 集計元: {result.Source}\n" +
             "このサーバーのメンバー登録更新・参加/退出時に自動更新されます。",
