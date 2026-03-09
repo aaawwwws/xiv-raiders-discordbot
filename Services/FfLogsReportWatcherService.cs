@@ -193,7 +193,7 @@ public sealed class FfLogsReportWatcherService
                 continue;
             }
 
-            var latestFight = await TryGetLatestFightForReportAsync(item.Report.Code, cancellationToken);
+            var latestFight = await TryGetLatestFightForReportAsync(item.Report.Code, item.Report.StartTime, cancellationToken);
             await PostReportAsync(guild, item, latestFight);
         }
     }
@@ -220,7 +220,7 @@ public sealed class FfLogsReportWatcherService
             return false;
         }
 
-        var latestFight = SelectLatestFight(fights);
+        var latestFight = SelectLatestFight(fights, item.Report.StartTime);
         if (latestFight is null)
         {
             return false;
@@ -240,7 +240,7 @@ public sealed class FfLogsReportWatcherService
         return true;
     }
 
-    private async Task<FfLogsClient.ReportFight?> TryGetLatestFightForReportAsync(string reportCode, CancellationToken cancellationToken)
+    private async Task<FfLogsClient.ReportFight?> TryGetLatestFightForReportAsync(string reportCode, DateTimeOffset? reportStart, CancellationToken cancellationToken)
     {
         if (string.IsNullOrWhiteSpace(reportCode))
         {
@@ -250,7 +250,7 @@ public sealed class FfLogsReportWatcherService
         try
         {
             var fights = await _fflogs.GetReportFightsAsync(reportCode, cancellationToken);
-            return SelectLatestFight(fights);
+            return SelectLatestFight(fights, reportStart);
         }
         catch (OperationCanceledException)
         {
@@ -263,7 +263,7 @@ public sealed class FfLogsReportWatcherService
         }
     }
 
-    private static FfLogsClient.ReportFight? SelectLatestFight(IReadOnlyList<FfLogsClient.ReportFight> fights)
+    private static FfLogsClient.ReportFight? SelectLatestFight(IReadOnlyList<FfLogsClient.ReportFight> fights, DateTimeOffset? reportStart)
     {
         if (fights.Count == 0)
         {
@@ -271,7 +271,9 @@ public sealed class FfLogsReportWatcherService
         }
 
         return fights
-            .OrderByDescending(f => f.EndTimeMs ?? f.StartTimeMs ?? long.MinValue)
+            .OrderByDescending(f => ResolveFightTimeMs(reportStart, f.EndTimeMs) ??
+                                    ResolveFightTimeMs(reportStart, f.StartTimeMs) ??
+                                    DateTimeOffset.MinValue)
             .ThenByDescending(f => f.Id)
             .FirstOrDefault();
     }
@@ -376,9 +378,7 @@ public sealed class FfLogsReportWatcherService
 
     private async Task PostReportAsync(SocketGuild guild, ReportAggregate item, FfLogsClient.ReportFight? fight)
     {
-        var reportUrl = fight is null
-            ? $"https://www.fflogs.com/reports/{item.Report.Code}"
-            : $"https://www.fflogs.com/reports/{item.Report.Code}#fight={fight.Id}";
+        var reportUrl = $"https://www.fflogs.com/reports/{item.Report.Code}";
         var matchedUsers = item.UserIds
             .OrderBy(id => id)
             .Select(id => $"<@{id}>")
@@ -400,7 +400,7 @@ public sealed class FfLogsReportWatcherService
             : "🕒 時刻: 不明";
         var fightLine = fight is null
             ? null
-            : $"⚔️ fight: #{fight.Id} / {(fight.Kill == true ? "Kill" : fight.Kill == false ? "Wipe" : "Unknown")}";
+            : $"⚔️ fight候補: #{fight.Id} / {(fight.Kill == true ? "Kill" : fight.Kill == false ? "Wipe" : "Unknown")}";
 
         var lines = new List<string>
         {

@@ -2088,6 +2088,67 @@ ORDER BY Hour ASC;";
         return rows.ToList();
     }
 
+    public async Task<IReadOnlyList<VoiceHourlyActivity>> ListVoiceHourlyActivityByUserAsync(
+        ulong guildId,
+        ulong userId,
+        DateTimeOffset fromUtcInclusive,
+        DateTimeOffset toUtcExclusive)
+    {
+        if (guildId == 0 || userId == 0 || toUtcExclusive <= fromUtcInclusive)
+        {
+            return Array.Empty<VoiceHourlyActivity>();
+        }
+
+        const string sql = @"
+WITH bounded AS (
+    SELECT id,
+           GREATEST(joined_at, @FromUtcInclusive) AS start_utc,
+           LEAST(COALESCE(left_at, @ToUtcExclusive), @ToUtcExclusive) AS end_utc
+    FROM voice_sessions
+    WHERE guild_id = @GuildId
+      AND user_id = @UserId
+      AND COALESCE(left_at, @ToUtcExclusive) > @FromUtcInclusive
+      AND joined_at < @ToUtcExclusive
+),
+expanded AS (
+    SELECT b.id,
+           gs.bucket_start,
+           (b.start_utc AT TIME ZONE 'Asia/Tokyo') AS start_jst,
+           (b.end_utc AT TIME ZONE 'Asia/Tokyo') AS end_jst
+    FROM bounded b
+    CROSS JOIN LATERAL generate_series(
+        date_trunc('hour', b.start_utc AT TIME ZONE 'Asia/Tokyo'),
+        date_trunc('hour', (b.end_utc AT TIME ZONE 'Asia/Tokyo') - INTERVAL '1 second'),
+        INTERVAL '1 hour'
+    ) AS gs(bucket_start)
+)
+SELECT EXTRACT(HOUR FROM bucket_start)::INT AS Hour,
+       COALESCE(SUM(
+           GREATEST(
+               0,
+               EXTRACT(EPOCH FROM (
+                   LEAST(end_jst, bucket_start + INTERVAL '1 hour')
+                   - GREATEST(start_jst, bucket_start)
+               ))
+           )
+       ), 0)::BIGINT AS TotalSeconds,
+       COUNT(DISTINCT id)::INT AS SessionCount,
+       CASE WHEN COUNT(DISTINCT id) > 0 THEN 1 ELSE 0 END::INT AS ActiveUsers
+FROM expanded
+GROUP BY Hour
+ORDER BY Hour ASC;";
+
+        await using var conn = CreateConnection();
+        var rows = await conn.QueryAsync<VoiceHourlyActivity>(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            UserId = ToDbId(userId),
+            FromUtcInclusive = fromUtcInclusive,
+            ToUtcExclusive = toUtcExclusive
+        });
+        return rows.ToList();
+    }
+
     public async Task<IReadOnlyList<VoiceWeekdayHourlyActivity>> ListVoiceWeekdayHourlyActivityAsync(
         ulong guildId,
         DateTimeOffset fromUtcInclusive,
@@ -2317,6 +2378,42 @@ ORDER BY Weekday ASC, Hour ASC;";
             GuildId = ToDbId(guildId),
             FromUtcInclusive = fromUtcInclusive,
             ToUtcExclusive = toUtcExclusive
+        });
+        return rows.ToList();
+    }
+
+    public async Task<IReadOnlyList<MessageHourlyActivity>> ListMessageHourlyActivityByUserAsync(
+        ulong guildId,
+        ulong userId,
+        DateTimeOffset fromUtcInclusive,
+        DateTimeOffset toUtcExclusive,
+        bool includeDeleted = false)
+    {
+        if (guildId == 0 || userId == 0 || toUtcExclusive <= fromUtcInclusive)
+        {
+            return Array.Empty<MessageHourlyActivity>();
+        }
+
+        const string sql = @"
+SELECT EXTRACT(HOUR FROM created_at AT TIME ZONE 'Asia/Tokyo')::INT AS Hour,
+       COUNT(1)::BIGINT AS MessageCount
+FROM message_logs
+WHERE guild_id = @GuildId
+  AND author_id = @UserId
+  AND created_at >= @FromUtcInclusive
+  AND created_at < @ToUtcExclusive
+  AND (@IncludeDeleted OR deleted_at IS NULL)
+GROUP BY Hour
+ORDER BY Hour ASC;";
+
+        await using var conn = CreateConnection();
+        var rows = await conn.QueryAsync<MessageHourlyActivity>(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            UserId = ToDbId(userId),
+            FromUtcInclusive = fromUtcInclusive,
+            ToUtcExclusive = toUtcExclusive,
+            IncludeDeleted = includeDeleted
         });
         return rows.ToList();
     }

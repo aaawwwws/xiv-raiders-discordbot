@@ -6176,6 +6176,8 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
         var messageCountLookbackTask = _db.CountMessagesByUserAsync(guild.Id, target.Id, lookbackFromUtc, nowUtc, includeDeleted: false);
         var reactionCountLookbackTask = _db.CountReactionsByUserAsync(guild.Id, target.Id, lookbackFromUtc, nowUtc);
         var voiceLookbackTask = _db.SummarizeVoiceByUserAsync(guild.Id, target.Id, lookbackFromUtc, nowUtc);
+        var messageHourlyLookbackTask = _db.ListMessageHourlyActivityByUserAsync(guild.Id, target.Id, lookbackFromUtc, nowUtc);
+        var voiceHourlyLookbackTask = _db.ListVoiceHourlyActivityByUserAsync(guild.Id, target.Id, lookbackFromUtc, nowUtc);
         var timelineTask = _db.ListUserActivityTimelinesAsync(guild.Id, new[] { target.Id });
         await Task.WhenAll(
             messageCount24hTask,
@@ -6184,6 +6186,8 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
             messageCountLookbackTask,
             reactionCountLookbackTask,
             voiceLookbackTask,
+            messageHourlyLookbackTask,
+            voiceHourlyLookbackTask,
             timelineTask);
 
         var messageCount24h = messageCount24hTask.Result;
@@ -6192,6 +6196,8 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
         var messageCountLookback = messageCountLookbackTask.Result;
         var reactionCountLookback = reactionCountLookbackTask.Result;
         var (voiceSessionCountLookback, voiceDurationSecondsLookback) = voiceLookbackTask.Result;
+        var messageHourlyLookback = messageHourlyLookbackTask.Result;
+        var voiceHourlyLookback = voiceHourlyLookbackTask.Result;
         var voiceDurationMinutesLookback = (int)Math.Round(Math.Max(0L, voiceDurationSecondsLookback) / 60d, MidpointRounding.AwayFromZero);
         var activityTimeline = timelineTask.Result.FirstOrDefault();
 
@@ -6236,6 +6242,10 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
         embed.AddField(
             $"期間集計({lookbackDays}日)",
             $"発言: {messageCountLookback}件 / リアクション: {reactionCountLookback}件 / VC入室: {voiceSessionCountLookback}回 / VC滞在: {voiceDurationMinutesLookback}分",
+            false);
+        embed.AddField(
+            $"よくいる時間帯({lookbackDays}日/JST)",
+            BuildMemberManageFrequentHoursSummary(messageHourlyLookback, voiceHourlyLookback),
             false);
         embed.AddField("最終活動", BuildMemberManageLastActivitySummary(activityTimeline), false);
 
@@ -8593,6 +8603,35 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
         }
 
         return normalized.Substring(0, Math.Max(1, maxLength - 3)) + "...";
+    }
+
+    private static string BuildMemberManageFrequentHoursSummary(
+        IReadOnlyList<MessageHourlyActivity> messageRows,
+        IReadOnlyList<VoiceHourlyActivity> voiceRows)
+    {
+        var topMessageHours = messageRows
+            .Where(row => row.MessageCount > 0)
+            .OrderByDescending(row => row.MessageCount)
+            .ThenBy(row => row.Hour)
+            .Take(3)
+            .Select(row => $"{FormatHourRangeLabel(row.Hour)} ({row.MessageCount}件)")
+            .ToArray();
+
+        var topVoiceHours = voiceRows
+            .Where(row => row.TotalSeconds > 0)
+            .OrderByDescending(row => row.TotalSeconds)
+            .ThenBy(row => row.Hour)
+            .Take(3)
+            .Select(row => $"{FormatHourRangeLabel(row.Hour)} ({FormatDuration((int)Math.Min(int.MaxValue, row.TotalSeconds))})")
+            .ToArray();
+
+        var voiceLine = topVoiceHours.Length == 0
+            ? "🎙️ VC滞在: データなし"
+            : $"🎙️ VC滞在: {string.Join(", ", topVoiceHours)}";
+        var messageLine = topMessageHours.Length == 0
+            ? "💬 発言: データなし"
+            : $"💬 発言: {string.Join(", ", topMessageHours)}";
+        return $"{voiceLine}\n{messageLine}";
     }
 
     private static string BuildMemberManageLastActivitySummary(UserActivityTimeline? timeline)
