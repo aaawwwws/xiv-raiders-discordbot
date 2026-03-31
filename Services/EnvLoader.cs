@@ -90,8 +90,10 @@ public static class EnvLoader
     private static IEnumerable<string> EnumerateEnvCandidates(string baseDir, string fileName)
     {
         yield return Path.Combine(baseDir, fileName);
+        yield return Path.Combine(baseDir, "xiv-raiders-discordbot", fileName);
         yield return Path.Combine(baseDir, "discordbot", fileName);
         yield return Path.Combine(baseDir, "RaidDcBot", fileName);
+        yield return Path.Combine(baseDir, "src", "xiv-raiders-discordbot", fileName);
         yield return Path.Combine(baseDir, "src", "discordbot", fileName);
         yield return Path.Combine(baseDir, "src", "RaidDcBot", fileName);
     }
