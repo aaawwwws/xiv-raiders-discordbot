@@ -4,3 +4,5 @@ obj
 attachments
 tmp_build
 obj_verify
+bin_verify*
+obj_verify*

@@ -6,7 +6,7 @@
     <IsTestProject>false</IsTestProject>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
-    <DefaultItemExcludes>$(DefaultItemExcludes);artifacts/**;obj_verify/**;bin_verify/**</DefaultItemExcludes>
+    <DefaultItemExcludes>$(DefaultItemExcludes);artifacts/**;obj_verify/**;bin_verify/**;obj_verify*/**;bin_verify*/**</DefaultItemExcludes>
   </PropertyGroup>
 
   <ItemGroup>

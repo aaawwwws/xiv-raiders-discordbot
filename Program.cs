@@ -52,6 +52,7 @@ builder.Services.AddSingleton<Db>();
 builder.Services.AddSingleton<VoiceTransferTracker>();
 builder.Services.AddSingleton<VoiceChannelTextService>();
 builder.Services.AddSingleton<UserProfileEmbedService>();
+builder.Services.AddSingleton<AchievementResumeService>();
 builder.Services.AddSingleton<GuildAuditLogService>();
 builder.Services.AddSingleton<FfLogsReportWatcherService>();
 builder.Services.AddSingleton<RuntimeDiagnosticsService>();

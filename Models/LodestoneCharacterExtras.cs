@@ -48,6 +48,12 @@ public sealed record LodestoneAchievementListSnapshot(
     int? Count,
     IReadOnlyList<LodestoneAchievementItem> Items);
 
+public sealed record LodestoneAchievementDetailSnapshot(
+    LodestonePageDataStatus Status,
+    DateTimeOffset? EarnedAt,
+    string? Title,
+    string? DetailUrl);
+
 public sealed record LodestoneCharacterExtrasDetailsSnapshot(
     LodestoneJobLevelsSnapshot JobLevels,
     LodestoneCollectibleListSnapshot Mounts,

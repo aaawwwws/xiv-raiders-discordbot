@@ -1,0 +1,18 @@
+FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
+WORKDIR /src
+
+COPY RaidDcBot.csproj ./
+RUN dotnet restore RaidDcBot.csproj
+
+COPY . ./
+RUN dotnet publish RaidDcBot.csproj -c Release -o /app/publish /p:UseAppHost=false
+
+FROM mcr.microsoft.com/dotnet/runtime:10.0 AS runtime
+WORKDIR /app
+
+ENV DOTNET_ENVIRONMENT=Production
+
+COPY --from=build /app/publish ./
+
+ENTRYPOINT ["dotnet", "RaidDcBot.dll"]
+

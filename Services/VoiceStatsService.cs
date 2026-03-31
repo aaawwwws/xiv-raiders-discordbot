@@ -1,7 +1,10 @@
 using Discord;
 using Discord.WebSocket;
 using System.Globalization;
+using System.IO;
+using System.Net.Sockets;
 using Microsoft.Extensions.Logging;
+using Npgsql;
 using RaidDcBot.Data;
 using RaidDcBot.Models;
 
@@ -10,6 +13,8 @@ namespace RaidDcBot.Services;
 public sealed class VoiceStatsService {
     private readonly Db _db;
     private readonly ILogger<VoiceStatsService> _logger;
+    private static readonly TimeSpan RankingDbRetryDelayBase = TimeSpan.FromMilliseconds(300);
+    private const int RankingDbMaxAttempts = 3;
     public const string RankingMetricVoiceDuration = "voice_duration";
     public const string RankingMetricMessageCount = "message_count";
 
@@ -35,12 +40,30 @@ public sealed class VoiceStatsService {
         }
 
         var topLimit = Math.Clamp(topCount, 1, 10);
-        var voiceRows = await _db.ListVoiceDurationSummaryAsync(guild.Id, fromUtc, toUtc, topLimit);
-        var messageRows = await _db.ListMessageCountsByChannelAsync(guild.Id, fromUtc, toUtc);
-        var reactionGivenRows = await _db.ListReactionCountsByChannelAsync(guild.Id, fromUtc, toUtc);
-        var reactionReceivedRows = await _db.ListReactionReceivedCountsByChannelAsync(guild.Id, fromUtc, toUtc);
-        var reactionReceivedTopPostRows = await _db.ListTopReactionReceivedPostsByUserAsync(guild.Id, fromUtc, toUtc);
-        var activeUsers = await _db.ListActiveUserIdsSinceAsync(guild.Id, fromUtc);
+        var voiceRows = await ExecuteRankingDbQueryWithRetryAsync(
+            guild.Id,
+            nameof(Db.ListVoiceDurationSummaryAsync),
+            () => _db.ListVoiceDurationSummaryAsync(guild.Id, fromUtc, toUtc, topLimit));
+        var messageRows = await ExecuteRankingDbQueryWithRetryAsync(
+            guild.Id,
+            nameof(Db.ListMessageCountsByChannelAsync),
+            () => _db.ListMessageCountsByChannelAsync(guild.Id, fromUtc, toUtc));
+        var reactionGivenRows = await ExecuteRankingDbQueryWithRetryAsync(
+            guild.Id,
+            nameof(Db.ListReactionCountsByChannelAsync),
+            () => _db.ListReactionCountsByChannelAsync(guild.Id, fromUtc, toUtc));
+        var reactionReceivedRows = await ExecuteRankingDbQueryWithRetryAsync(
+            guild.Id,
+            nameof(Db.ListReactionReceivedCountsByChannelAsync),
+            () => _db.ListReactionReceivedCountsByChannelAsync(guild.Id, fromUtc, toUtc));
+        var reactionReceivedTopPostRows = await ExecuteRankingDbQueryWithRetryAsync(
+            guild.Id,
+            nameof(Db.ListTopReactionReceivedPostsByUserAsync),
+            () => _db.ListTopReactionReceivedPostsByUserAsync(guild.Id, fromUtc, toUtc));
+        var activeUsers = await ExecuteRankingDbQueryWithRetryAsync(
+            guild.Id,
+            nameof(Db.ListActiveUserIdsSinceAsync),
+            () => _db.ListActiveUserIdsSinceAsync(guild.Id, fromUtc));
 
         var nonAdminMessageCounts = new Dictionary<ulong, int>();
         foreach (var row in messageRows) {
@@ -125,7 +148,10 @@ public sealed class VoiceStatsService {
         var vcTop = voiceRows
             .Take(topLimit)
             .ToList();
-        var totalVcSeconds = await _db.SummarizeVoiceDurationByGuildAsync(guild.Id, fromUtc, toUtc);
+        var totalVcSeconds = await ExecuteRankingDbQueryWithRetryAsync(
+            guild.Id,
+            nameof(Db.SummarizeVoiceDurationByGuildAsync),
+            () => _db.SummarizeVoiceDurationByGuildAsync(guild.Id, fromUtc, toUtc));
         var messageTop = nonAdminMessageCounts
             .OrderByDescending(x => x.Value)
             .ThenBy(x => x.Key)
@@ -164,7 +190,10 @@ public sealed class VoiceStatsService {
         var reactedUserCount = nonAdminReactionReceivedCounts.Count;
         var includeAllTimeVoiceTotal = title.Contains("今日", StringComparison.Ordinal);
         var allTimeVoiceTotalSeconds = includeAllTimeVoiceTotal
-            ? await _db.SummarizeVoiceDurationByGuildAsync(guild.Id, DateTimeOffset.UnixEpoch, toUtc)
+            ? await ExecuteRankingDbQueryWithRetryAsync(
+                guild.Id,
+                nameof(Db.SummarizeVoiceDurationByGuildAsync),
+                () => _db.SummarizeVoiceDurationByGuildAsync(guild.Id, DateTimeOffset.UnixEpoch, toUtc))
             : 0L;
 
         var fromJst = fromUtc.ToOffset(TimeSpan.FromHours(9));
@@ -377,6 +406,63 @@ public sealed class VoiceStatsService {
 
     private static string BuildMessageLink(ulong guildId, ulong channelId, ulong messageId)
         => $"https://discord.com/channels/{guildId}/{channelId}/{messageId}";
+
+    private async Task<T> ExecuteRankingDbQueryWithRetryAsync<T>(
+        ulong guildId,
+        string operation,
+        Func<Task<T>> query)
+    {
+        for (var attempt = 1; attempt <= RankingDbMaxAttempts; attempt++)
+        {
+            try
+            {
+                return await query();
+            }
+            catch (Exception ex) when (attempt < RankingDbMaxAttempts && IsTransientRankingDbException(ex))
+            {
+                var delay = TimeSpan.FromMilliseconds(RankingDbRetryDelayBase.TotalMilliseconds * attempt);
+                _logger.LogWarning(
+                    ex,
+                    "Transient DB error while building activity ranking. GuildId={GuildId}, Operation={Operation}, Attempt={Attempt}/{MaxAttempts}. Retrying after {DelayMs}ms.",
+                    guildId,
+                    operation,
+                    attempt,
+                    RankingDbMaxAttempts,
+                    (int)Math.Round(delay.TotalMilliseconds));
+                await Task.Delay(delay);
+            }
+        }
+
+        throw new InvalidOperationException("Unexpected retry flow exit in activity ranking DB query.");
+    }
+
+    private static bool IsTransientRankingDbException(Exception ex)
+    {
+        if (ex is TimeoutException or IOException or SocketException)
+        {
+            return true;
+        }
+
+        if (ex is NpgsqlException npgsqlEx)
+        {
+            if (npgsqlEx.IsTransient)
+            {
+                return true;
+            }
+
+            if (npgsqlEx.Message.Contains("Exception while reading from stream", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        if (ex.InnerException is not null)
+        {
+            return IsTransientRankingDbException(ex.InnerException);
+        }
+
+        return false;
+    }
 
     private static void UpdateBestRank(IDictionary<ulong, int> bestRanksByUser, ulong userId, int rank)
     {

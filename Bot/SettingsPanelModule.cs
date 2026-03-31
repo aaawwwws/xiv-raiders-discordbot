@@ -196,6 +196,22 @@ public sealed class SettingsPanelModule : InteractionModuleBase<SocketInteractio
         }
     }
 
+    [ComponentInteraction(SettingsPanel.ShowAchievementResumeCustomId, ignoreGroupNames: true)]
+    public async Task ShowAchievementResumeAsync()
+    {
+        if (Context.Guild is null)
+        {
+            await RespondAsync("この操作はサーバー内でのみ使えます。", ephemeral: true);
+            return;
+        }
+
+        var components = AchievementResumeModule.BuildSavageFilterComponents(Context.User.Id);
+        await RespondAsync(
+            "表示したい零式カテゴリを選択してください。選択後に履歴書を生成します。",
+            components: components,
+            ephemeral: true);
+    }
+
     [ComponentInteraction(SettingsPanel.ShowSelfProfileCustomId, ignoreGroupNames: true)]
     public async Task ShowSelfProfileAsync()
     {

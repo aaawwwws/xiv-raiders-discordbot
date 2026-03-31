@@ -1,4 +1,5 @@
 using System.Net;
+using System.Globalization;
 using System.Text.RegularExpressions;
 using Microsoft.Extensions.Options;
 using RaidDcBot.Models;
@@ -108,6 +109,77 @@ public sealed class LodestoneClient
 
     public Task<string> FetchProfileHtmlAsync(string url, CancellationToken cancellationToken = default)
         => FetchHtmlAsync(url, cancellationToken);
+
+    public async Task<LodestoneAchievementDetailSnapshot> FetchAchievementDetailAsync(
+        string characterUrl,
+        int achievementId,
+        CancellationToken cancellationToken = default)
+    {
+        if (achievementId <= 0)
+        {
+            return new LodestoneAchievementDetailSnapshot(LodestonePageDataStatus.Error, null, null, null);
+        }
+
+        var detailUrl = BuildCharacterAchievementDetailUrl(characterUrl, achievementId);
+        if (string.IsNullOrWhiteSpace(detailUrl))
+        {
+            return new LodestoneAchievementDetailSnapshot(LodestonePageDataStatus.Error, null, null, null);
+        }
+
+        var html = await TryFetchOptionalHtmlAsync(detailUrl, cancellationToken);
+        if (string.IsNullOrWhiteSpace(html))
+        {
+            return new LodestoneAchievementDetailSnapshot(LodestonePageDataStatus.Error, null, null, detailUrl);
+        }
+
+        var status = DetectPageDataStatus(html);
+        if (status != LodestonePageDataStatus.Available)
+        {
+            return new LodestoneAchievementDetailSnapshot(status, null, null, detailUrl);
+        }
+
+        var earnedAt = TryExtractAchievementDetailEarnedAt(html);
+        var title = TryExtractAchievementDetailTitle(html);
+        return new LodestoneAchievementDetailSnapshot(status, earnedAt, title, detailUrl);
+    }
+
+    public async Task<bool?> TryResolveAchievementDetailAvailableAsync(
+        string characterUrl,
+        int achievementId,
+        CancellationToken cancellationToken = default)
+    {
+        var detail = await FetchAchievementDetailAsync(characterUrl, achievementId, cancellationToken);
+        var status = detail.Status;
+        return status switch
+        {
+            LodestonePageDataStatus.Available => true,
+            LodestonePageDataStatus.Private => null,
+            LodestonePageDataStatus.NotFound => false,
+            _ => false
+        };
+    }
+
+    public string? BuildCharacterAchievementDetailUrl(string characterUrl, int achievementId)
+    {
+        if (achievementId <= 0)
+        {
+            return null;
+        }
+
+        if (!Uri.TryCreate(characterUrl, UriKind.Absolute, out var uri))
+        {
+            return null;
+        }
+
+        var match = LodestoneIdRegex.Match(uri.AbsoluteUri);
+        if (!match.Success)
+        {
+            return null;
+        }
+
+        var characterId = match.Groups[1].Value;
+        return $"https://{uri.Host}/lodestone/character/{characterId}/achievement/detail/{achievementId}/";
+    }
 
     public async Task<LodestoneCharacterExtrasSnapshot> FetchCharacterExtrasAsync(
         string characterUrl,
@@ -397,6 +469,148 @@ public sealed class LodestoneClient
         return LodestonePageDataStatus.Available;
     }
 
+    private static DateTimeOffset? TryExtractAchievementDetailEarnedAt(string html)
+    {
+        var earnedAtMatches = Regex.Matches(
+            html,
+            "<[^>]*(?=[^>]*class=[\"'][^\"']*(?:entry__achievement__datetime|achievement__datetime|entry__achievement)[^\"']*[\"'])[^>]*>.*?ldst_strftime\\((?<epoch>\\d{9,}),\\s*'[^']*'\\)",
+            RegexOptions.IgnoreCase | RegexOptions.Singleline);
+        foreach (Match match in earnedAtMatches)
+        {
+            if (long.TryParse(match.Groups["epoch"].Value, out var epoch))
+            {
+                var parsed = TryConvertUnixTime(epoch);
+                if (parsed.HasValue)
+                {
+                    return parsed;
+                }
+            }
+        }
+
+        var dateTimeAttributeMatches = Regex.Matches(
+            html,
+            "<[^>]*(?=[^>]*class=[\"'][^\"']*(?:entry__achievement__datetime|achievement__datetime|entry__achievement)[^\"']*[\"'])(?=[^>]*datetime=[\"'](?<value>[^\"']+)[\"'])[^>]*>",
+            RegexOptions.IgnoreCase | RegexOptions.Singleline);
+        foreach (Match match in dateTimeAttributeMatches)
+        {
+            var parsed = TryParseDateTimeOffsetFlexible(match.Groups["value"].Value);
+            if (parsed.HasValue)
+            {
+                return parsed.Value;
+            }
+        }
+
+        return null;
+    }
+
+    private static string? TryExtractAchievementDetailTitle(string html)
+    {
+        var title = FindElementText(html, new[]
+        {
+            new ElementPattern("achievement__name", "p"),
+            new ElementPattern("achievement__name", "h2"),
+            new ElementPattern("achievement__name", "h3"),
+            new ElementPattern("entry__achievement__name", "p"),
+            new ElementPattern("entry__achievement__name", "h2"),
+            new ElementPattern("entry__achievement__name", "h3")
+        });
+        if (!string.IsNullOrWhiteSpace(title))
+        {
+            return title;
+        }
+
+        return null;
+    }
+
+    private static DateTimeOffset? TryConvertUnixTime(long epoch)
+    {
+        try
+        {
+            return DateTimeOffset.FromUnixTimeSeconds(epoch);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static DateTimeOffset? TryParseDateTimeOffsetFlexible(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return null;
+        }
+
+        var normalized = value.Trim();
+        if (DateTimeOffset.TryParse(
+                normalized,
+                CultureInfo.InvariantCulture,
+                DateTimeStyles.AllowWhiteSpaces | DateTimeStyles.AssumeUniversal,
+                out var dto))
+        {
+            return IsReasonableDate(dto) ? dto : null;
+        }
+
+        if (DateTimeOffset.TryParse(
+                normalized,
+                CultureInfo.GetCultureInfo("ja-JP"),
+                DateTimeStyles.AllowWhiteSpaces | DateTimeStyles.AssumeUniversal,
+                out dto))
+        {
+            return IsReasonableDate(dto) ? dto : null;
+        }
+
+        if (DateTime.TryParse(
+                normalized,
+                CultureInfo.InvariantCulture,
+                DateTimeStyles.AllowWhiteSpaces,
+                out var dt))
+        {
+            var assumed = new DateTimeOffset(
+                dt.Year,
+                dt.Month,
+                dt.Day,
+                dt.Hour,
+                dt.Minute,
+                dt.Second,
+                TimeSpan.FromHours(9));
+            return IsReasonableDate(assumed) ? assumed : null;
+        }
+
+        return null;
+    }
+
+    private static bool TryBuildDateTimeOffset(string yearRaw, string monthRaw, string dayRaw, out DateTimeOffset value)
+    {
+        value = default;
+        if (!int.TryParse(yearRaw, out var year) ||
+            !int.TryParse(monthRaw, out var month) ||
+            !int.TryParse(dayRaw, out var day))
+        {
+            return false;
+        }
+
+        if (year is < 2013 or > 2100)
+        {
+            return false;
+        }
+
+        try
+        {
+            value = new DateTimeOffset(year, month, day, 0, 0, 0, TimeSpan.FromHours(9));
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool IsReasonableDate(DateTimeOffset value)
+    {
+        return value.Year is >= 2013 and <= 2100;
+    }
+
     private static bool IsPermissionDeniedPage(string html)
     {
         return html.Contains("You do not have permission to view this page.", StringComparison.OrdinalIgnoreCase)
@@ -624,7 +838,6 @@ public sealed class LodestoneClient
         var matches = Regex.Matches(
             html,
             "<a[^>]*href=[\"'](?<detail>/lodestone/character/\\d+/achievement/detail/(?<id>\\d+)/)[\"'][^>]*class=[\"'][^\"']*entry__achievement[^\"']*[\"'][^>]*>.*?" +
-            "(?:ldst_strftime\\((?<epoch>\\d+),\\s*'YMD'\\))?.*?" +
             "<p[^>]*class=[\"'][^\"']*entry__activity__txt[^\"']*[\"'][^>]*>(?<text>.*?)</p>.*?</a>",
             RegexOptions.IgnoreCase | RegexOptions.Singleline);
 
@@ -642,15 +855,24 @@ public sealed class LodestoneClient
             }
 
             DateTimeOffset? earnedAt = null;
-            if (match.Groups["epoch"].Success && long.TryParse(match.Groups["epoch"].Value, out var epoch))
+            var epochMatch = Regex.Match(
+                match.Value,
+                "ldst_strftime\\((?<epoch>\\d{9,}),\\s*'[^']*'\\)",
+                RegexOptions.IgnoreCase | RegexOptions.Singleline);
+            if (epochMatch.Success && long.TryParse(epochMatch.Groups["epoch"].Value, out var epoch))
             {
-                try
+                earnedAt = TryConvertUnixTime(epoch);
+            }
+
+            if (!earnedAt.HasValue)
+            {
+                var dateTimeAttributeMatch = Regex.Match(
+                    match.Value,
+                    "<[^>]*(?=[^>]*class=[\"'][^\"']*(?:entry__achievement__datetime|achievement__datetime)[^\"']*[\"'])(?=[^>]*datetime=[\"'](?<value>[^\"']+)[\"'])[^>]*>",
+                    RegexOptions.IgnoreCase | RegexOptions.Singleline);
+                if (dateTimeAttributeMatch.Success)
                 {
-                    earnedAt = DateTimeOffset.FromUnixTimeSeconds(epoch);
-                }
-                catch
-                {
-                    earnedAt = null;
+                    earnedAt = TryParseDateTimeOffsetFlexible(dateTimeAttributeMatch.Groups["value"].Value);
                 }
             }
 

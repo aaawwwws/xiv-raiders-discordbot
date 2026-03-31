@@ -11,6 +11,7 @@ public static class SettingsPanel
     public const string ShowSelfStatusCustomId = "settings_show_self_status";
     public const string ShowSelfProfileCustomId = "settings_show_self_profile";
     public const string ShowMyPageCustomId = "settings_show_my_page";
+    public const string ShowAchievementResumeCustomId = "settings_show_achievement_resume";
 
     public static MessageComponent BuildComponents()
     {
@@ -24,6 +25,7 @@ public static class SettingsPanel
             .WithButton("DC/サーバー変更", LodestonePanel.ChangeDataCenterWorldCustomId, ButtonStyle.Secondary, row: 2)
             .WithButton("現在の設定を確認", ShowSelfStatusCustomId, ButtonStyle.Secondary, row: 2)
             .WithButton("マイページ", ShowMyPageCustomId, ButtonStyle.Success, row: 3)
+            .WithButton("レイド履歴書", ShowAchievementResumeCustomId, ButtonStyle.Primary, row: 3)
             .Build();
     }
 

@@ -13,7 +13,7 @@ public sealed class DiscordOptions
     public string RegistrationReviewChannelName { get; init; } = "登録確認";
     public bool AutoCreateDcRoles { get; init; } = true;
     public string LogChannelName { get; init; } = "log";
-    public string NotificationChannelName { get; init; } = "notice";
+    public string NotificationChannelName { get; init; } = "通知";
     public bool MentionVoiceNotificationRole { get; init; } = true;
     public string VoiceNotificationRoleName { get; init; } = "通話通知";
     public bool AutoCreateVoiceNotificationRole { get; init; } = true;

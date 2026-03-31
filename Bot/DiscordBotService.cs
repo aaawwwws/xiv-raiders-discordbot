@@ -1619,7 +1619,7 @@ public sealed class DiscordBotService : IHostedService
         var memberRoleName = string.IsNullOrWhiteSpace(_options.MemberRoleName) ? "メンバー" : _options.MemberRoleName;
         var provisionalRoleName = string.IsNullOrWhiteSpace(_options.ProvisionalRoleName) ? "仮登録" : _options.ProvisionalRoleName;
         var logChannelName = string.IsNullOrWhiteSpace(_options.LogChannelName) ? "log" : _options.LogChannelName;
-        var notificationChannelName = string.IsNullOrWhiteSpace(_options.NotificationChannelName) ? "notice" : _options.NotificationChannelName;
+        var notificationChannelName = string.IsNullOrWhiteSpace(_options.NotificationChannelName) ? "通知" : _options.NotificationChannelName;
         var activityRankingChannelName = string.IsNullOrWhiteSpace(_options.ActivityRankingChannelName) ? "ランキング" : _options.ActivityRankingChannelName;
         var voiceNotificationRoleName = string.IsNullOrWhiteSpace(_options.VoiceNotificationRoleName) ? "通話通知" : _options.VoiceNotificationRoleName;
         var registrationReviewChannelName = string.IsNullOrWhiteSpace(_options.RegistrationReviewChannelName) ? "登録確認" : _options.RegistrationReviewChannelName;
@@ -4628,7 +4628,7 @@ public sealed class DiscordBotService : IHostedService
 
     private Task<IMessageChannel?> ResolveNotificationChannelAsync(SocketGuild guild)
     {
-        var notificationChannelName = string.IsNullOrWhiteSpace(_options.NotificationChannelName) ? "notice" : _options.NotificationChannelName;
+        var notificationChannelName = string.IsNullOrWhiteSpace(_options.NotificationChannelName) ? "通知" : _options.NotificationChannelName;
         IMessageChannel? channel = guild.TextChannels.FirstOrDefault(c => string.Equals(c.Name, notificationChannelName, StringComparison.OrdinalIgnoreCase));
         return Task.FromResult(channel);
     }

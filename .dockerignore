@@ -1,0 +1,12 @@
+bin
+obj
+artifacts
+bin_verify*
+obj_verify*
+Data/attachments
+.env
+.env.*
+.git
+.gitignore
+build_diag_now.txt
+
