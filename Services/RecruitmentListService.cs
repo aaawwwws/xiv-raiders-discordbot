@@ -1,8 +1,10 @@
 using Discord;
+using Discord.Net;
 using Discord.WebSocket;
 using Microsoft.Extensions.Logging;
 using RaidDcBot.Data;
 using RaidDcBot.Models;
+using System.Net;
 using System.Text;
 
 namespace RaidDcBot.Services;
@@ -25,11 +27,17 @@ public sealed class RecruitmentListService
     public async Task<IUserMessage?> EnsureListMessageAsync(SocketGuild guild, IMessageChannel channel, ulong? existingMessageId)
     {
         IUserMessage? existing = null;
+        var transientFailure = false;
         if (existingMessageId.HasValue)
         {
             try
             {
-                existing = await channel.GetMessageAsync(existingMessageId.Value) as IUserMessage;
+                var (fetched, isTransientFailure) = await TryGetMessageWithRetryAsync(
+                    channel,
+                    existingMessageId.Value,
+                    "fetching existing recruit list message by id");
+                existing = fetched;
+                transientFailure |= isTransientFailure;
             }
             catch (Exception ex)
             {
@@ -39,12 +47,32 @@ public sealed class RecruitmentListService
 
         if (existing is null)
         {
-            var recent = await channel.GetMessagesAsync(50).FlattenAsync();
-            existing = recent
-                .OfType<IUserMessage>()
-                .FirstOrDefault(message =>
-                    message.Author.Id == guild.CurrentUser.Id &&
-                    IsRecruitListMessage(message));
+            try
+            {
+                var (recent, isTransientFailure) = await TryGetMessagesWithRetryAsync(
+                    channel,
+                    50,
+                    "scanning recent messages for recruit list");
+                transientFailure |= isTransientFailure;
+                if (recent is not null)
+                {
+                    existing = recent
+                        .OfType<IUserMessage>()
+                        .FirstOrDefault(message =>
+                            message.Author.Id == guild.CurrentUser.Id &&
+                            IsRecruitListMessage(message));
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to scan recent messages for recruit list.");
+            }
+        }
+
+        if (existing is null && transientFailure)
+        {
+            _logger.LogInformation("Skipped recruit list regeneration because Discord API is temporarily unavailable.");
+            return null;
         }
 
         var embed = await BuildListEmbedAsync(guild.Id);
@@ -77,13 +105,25 @@ public sealed class RecruitmentListService
         try
         {
             IUserMessage? message = null;
+            var transientFailure = false;
             if (panel is not null && panel.MessageId != 0)
             {
-                message = await channel.GetMessageAsync(ToUlong(panel.MessageId)) as IUserMessage;
+                var (fetched, isTransientFailure) = await TryGetMessageWithRetryAsync(
+                    channel,
+                    ToUlong(panel.MessageId),
+                    "refreshing recruit list message by saved panel id");
+                message = fetched;
+                transientFailure |= isTransientFailure;
             }
 
             if (message is null)
             {
+                if (transientFailure)
+                {
+                    _logger.LogInformation("Skipped recruit list refresh because Discord API is temporarily unavailable.");
+                    return;
+                }
+
                 var ensured = await EnsureListMessageAsync(guild, channel, null);
                 if (ensured is not null)
                 {
@@ -190,7 +230,16 @@ public sealed class RecruitmentListService
 
     private async Task<IUserMessage> EnsureListMessageLatestAsync(IMessageChannel channel, IUserMessage message, Embed embed)
     {
-        var latest = (await channel.GetMessagesAsync(1).FlattenAsync())
+        var (latestMessages, transientFailure) = await TryGetMessagesWithRetryAsync(
+            channel,
+            1,
+            "checking latest recruit list message");
+        if (transientFailure || latestMessages is null)
+        {
+            return message;
+        }
+
+        var latest = latestMessages
             .OfType<IUserMessage>()
             .FirstOrDefault();
 
@@ -211,6 +260,64 @@ public sealed class RecruitmentListService
 
         return reposted;
     }
+
+    private async Task<(IUserMessage? Message, bool TransientFailure)> TryGetMessageWithRetryAsync(
+        IMessageChannel channel,
+        ulong messageId,
+        string context)
+    {
+        const int maxAttempts = 3;
+        for (var attempt = 1; attempt <= maxAttempts; attempt++)
+        {
+            try
+            {
+                return (await channel.GetMessageAsync(messageId) as IUserMessage, false);
+            }
+            catch (HttpException ex) when (IsTransientDiscordStatusCode(ex.HttpCode))
+            {
+                if (attempt >= maxAttempts)
+                {
+                    _logger.LogWarning(ex, "Discord API transient error while {Context}.", context);
+                    return (null, true);
+                }
+
+                await Task.Delay(TimeSpan.FromMilliseconds(250 * attempt));
+            }
+        }
+
+        return (null, false);
+    }
+
+    private async Task<(IReadOnlyCollection<IMessage>? Messages, bool TransientFailure)> TryGetMessagesWithRetryAsync(
+        IMessageChannel channel,
+        int limit,
+        string context)
+    {
+        const int maxAttempts = 3;
+        for (var attempt = 1; attempt <= maxAttempts; attempt++)
+        {
+            try
+            {
+                var messages = await channel.GetMessagesAsync(limit).FlattenAsync();
+                return (messages.ToList(), false);
+            }
+            catch (HttpException ex) when (IsTransientDiscordStatusCode(ex.HttpCode))
+            {
+                if (attempt >= maxAttempts)
+                {
+                    _logger.LogWarning(ex, "Discord API transient error while {Context}.", context);
+                    return (null, true);
+                }
+
+                await Task.Delay(TimeSpan.FromMilliseconds(250 * attempt));
+            }
+        }
+
+        return (null, false);
+    }
+
+    private static bool IsTransientDiscordStatusCode(HttpStatusCode httpCode)
+        => httpCode is HttpStatusCode.ServiceUnavailable or HttpStatusCode.BadGateway or HttpStatusCode.GatewayTimeout;
 
     private static bool IsRecruitListMessage(IUserMessage message)
     {

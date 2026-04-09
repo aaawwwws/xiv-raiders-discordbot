@@ -3,6 +3,7 @@ using System.Globalization;
 using System.Linq;
 using System.Reflection;
 using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using Discord;
 using Discord.Interactions;
@@ -42,9 +43,11 @@ public sealed class DiscordBotService : IHostedService
     private readonly ConcurrentDictionary<ulong, int> _weeklyVoiceRankingPosted = new();
     private readonly ConcurrentDictionary<ulong, int> _inactiveAutoKickProcessedDay = new();
     private readonly ConcurrentDictionary<string, byte> _expectedAutoKickLeaves = new();
+    private readonly ConcurrentDictionary<ulong, byte> _suppressedDeleteLogMessageIds = new();
     private readonly ConcurrentDictionary<string, DateTimeOffset> _failureAlerts = new();
     private readonly SemaphoreSlim _tempVoiceLock = new(1, 1);
     private static readonly HttpClient AttachmentArchiveHttpClient = CreateAttachmentArchiveHttpClient();
+    private static readonly HttpClient TimelineMirrorHttpClient = CreateTimelineMirrorHttpClient();
     private static readonly TimeSpan JapanTimeOffset = TimeSpan.FromHours(9);
     private static readonly TimeSpan FailureAlertCooldown = TimeSpan.FromMinutes(15);
     private static readonly TimeSpan LotteryParticipantRoleRetention = TimeSpan.FromHours(24);
@@ -3967,6 +3970,8 @@ public sealed class DiscordBotService : IHostedService
             {
                 _logger.LogWarning(ex, "Failed to post voice status prompt. ChannelId={ChannelId}", afterChannel.Id);
             }
+
+            await TryMirrorVoiceFirstJoinToWebTimelineAsync(guild, user, afterChannel, now);
         }
 
         if (shouldNotifyUserVoiceActivity && endedChannel is not null)
@@ -3975,6 +3980,11 @@ public sealed class DiscordBotService : IHostedService
                 .WithDescription(BuildVoiceCallEndedSummary(guild, user, endedChannel, now, duration))
                 .Build();
             await SendNotificationEmbedAsync(guild, endedEmbed, mentionVoiceRole: false);
+        }
+
+        if (endedChannel is not null)
+        {
+            await TryMirrorVoiceEndedToWebTimelineAsync(guild, user, endedChannel, now);
         }
 
         if (afterChannel is not null && _options.VoiceProfileEmbedEnabled)
@@ -4044,6 +4054,12 @@ public sealed class DiscordBotService : IHostedService
 
             var message = deletedMessage;
             var fromDb = await _db.GetMessageAsync(cache.Id);
+
+            if (_suppressedDeleteLogMessageIds.TryRemove(cache.Id, out _))
+            {
+                await _db.MarkMessageDeletedAsync(cache.Id);
+                return;
+            }
 
             if (fromDb is null && message?.Author?.IsBot == true)
             {
@@ -4317,14 +4333,17 @@ public sealed class DiscordBotService : IHostedService
 
         try
         {
+            _suppressedDeleteLogMessageIds[messageId] = 0;
             await channel.DeleteMessageAsync(messageId);
         }
         catch (Discord.Net.HttpException ex) when (ex.DiscordCode is DiscordErrorCode.UnknownMessage or DiscordErrorCode.UnknownChannel)
         {
+            _suppressedDeleteLogMessageIds.TryRemove(messageId, out _);
             return;
         }
         catch (Exception ex)
         {
+            _suppressedDeleteLogMessageIds.TryRemove(messageId, out _);
             _logger.LogWarning(ex, "Failed to auto-delete VC text message. GuildId={GuildId}, ChannelId={ChannelId}, MessageId={MessageId}",
                 guildId, channelId, messageId);
             return;
@@ -5134,6 +5153,160 @@ public sealed class DiscordBotService : IHostedService
         return string.Join('\n', lines);
     }
 
+    private async Task TryMirrorVoiceFirstJoinToWebTimelineAsync(
+        SocketGuild guild,
+        SocketUser user,
+        SocketVoiceChannel channel,
+        DateTimeOffset joinedAt)
+    {
+        if (!_options.WebTimelineMirrorEnabled)
+        {
+            return;
+        }
+
+        var origin = _options.WebTimelineApiOrigin?.Trim();
+        if (string.IsNullOrWhiteSpace(origin))
+        {
+            return;
+        }
+
+        if (!Uri.TryCreate(origin, UriKind.Absolute, out var baseUri))
+        {
+            _logger.LogWarning("Invalid Discord:WebTimelineApiOrigin. Value={Value}", origin);
+            return;
+        }
+
+        var endpoint = new Uri(baseUri, "/api/timeline/system/voice-start");
+        var guildUser = guild.GetUser(user.Id);
+        var author = guildUser?.DisplayName ?? guildUser?.GlobalName ?? user.GlobalName ?? user.Username;
+        var authorUserName = guildUser?.Username ?? user.Username;
+        var authorAvatarUrl = user.GetAvatarUrl(size: 256) ?? user.GetDefaultAvatarUrl();
+        var payload = new
+        {
+            author,
+            authorDiscordId = user.Id.ToString(CultureInfo.InvariantCulture),
+            authorDiscordUserName = authorUserName,
+            authorAvatarUrl,
+            channelName = channel.Name,
+            channelId = channel.Id.ToString(CultureInfo.InvariantCulture),
+            guildId = guild.Id.ToString(CultureInfo.InvariantCulture),
+            joinedAtUtc = joinedAt
+        };
+
+        var json = JsonSerializer.Serialize(payload);
+        using var request = new HttpRequestMessage(HttpMethod.Post, endpoint)
+        {
+            Content = new StringContent(json, Encoding.UTF8, "application/json")
+        };
+
+        var secret = _options.WebTimelineBridgeSecret?.Trim();
+        if (!string.IsNullOrWhiteSpace(secret))
+        {
+            request.Headers.TryAddWithoutValidation("X-Raid-Bot-Secret", secret);
+        }
+
+        try
+        {
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            using var response = await TimelineMirrorHttpClient.SendAsync(request, cts.Token);
+            if (!response.IsSuccessStatusCode)
+            {
+                _logger.LogWarning(
+                    "Failed to mirror voice-start timeline. Status={StatusCode}, GuildId={GuildId}, UserId={UserId}, ChannelId={ChannelId}",
+                    (int)response.StatusCode,
+                    guild.Id,
+                    user.Id,
+                    channel.Id);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "Failed to mirror voice-start timeline. GuildId={GuildId}, UserId={UserId}, ChannelId={ChannelId}",
+                guild.Id,
+                user.Id,
+                channel.Id);
+        }
+    }
+
+    private async Task TryMirrorVoiceEndedToWebTimelineAsync(
+        SocketGuild guild,
+        SocketUser user,
+        SocketVoiceChannel channel,
+        DateTimeOffset endedAt)
+    {
+        if (!_options.WebTimelineMirrorEnabled)
+        {
+            return;
+        }
+
+        var origin = _options.WebTimelineApiOrigin?.Trim();
+        if (string.IsNullOrWhiteSpace(origin))
+        {
+            return;
+        }
+
+        if (!Uri.TryCreate(origin, UriKind.Absolute, out var baseUri))
+        {
+            _logger.LogWarning("Invalid Discord:WebTimelineApiOrigin. Value={Value}", origin);
+            return;
+        }
+
+        var endpoint = new Uri(baseUri, "/api/timeline/system/voice-end");
+        var guildUser = guild.GetUser(user.Id);
+        var author = guildUser?.DisplayName ?? guildUser?.GlobalName ?? user.GlobalName ?? user.Username;
+        var authorUserName = guildUser?.Username ?? user.Username;
+        var authorAvatarUrl = user.GetAvatarUrl(size: 256) ?? user.GetDefaultAvatarUrl();
+        var payload = new
+        {
+            author,
+            authorDiscordId = user.Id.ToString(CultureInfo.InvariantCulture),
+            authorDiscordUserName = authorUserName,
+            authorAvatarUrl,
+            channelName = channel.Name,
+            channelId = channel.Id.ToString(CultureInfo.InvariantCulture),
+            guildId = guild.Id.ToString(CultureInfo.InvariantCulture),
+            joinedAtUtc = endedAt
+        };
+
+        var json = JsonSerializer.Serialize(payload);
+        using var request = new HttpRequestMessage(HttpMethod.Post, endpoint)
+        {
+            Content = new StringContent(json, Encoding.UTF8, "application/json")
+        };
+
+        var secret = _options.WebTimelineBridgeSecret?.Trim();
+        if (!string.IsNullOrWhiteSpace(secret))
+        {
+            request.Headers.TryAddWithoutValidation("X-Raid-Bot-Secret", secret);
+        }
+
+        try
+        {
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            using var response = await TimelineMirrorHttpClient.SendAsync(request, cts.Token);
+            if (!response.IsSuccessStatusCode)
+            {
+                _logger.LogWarning(
+                    "Failed to mirror voice-end timeline. Status={StatusCode}, GuildId={GuildId}, UserId={UserId}, ChannelId={ChannelId}",
+                    (int)response.StatusCode,
+                    guild.Id,
+                    user.Id,
+                    channel.Id);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "Failed to mirror voice-end timeline. GuildId={GuildId}, UserId={UserId}, ChannelId={ChannelId}",
+                guild.Id,
+                user.Id,
+                channel.Id);
+        }
+    }
+
     private static string BuildVoiceCallEndedSummary(SocketGuild guild, SocketUser user, SocketVoiceChannel channel, DateTimeOffset endedAt, TimeSpan? duration)
     {
         var lines = new List<string>
@@ -5159,6 +5332,14 @@ public sealed class DiscordBotService : IHostedService
         };
         client.DefaultRequestHeaders.UserAgent.ParseAdd("RaidDcBot/1.0");
         return client;
+    }
+
+    private static HttpClient CreateTimelineMirrorHttpClient()
+    {
+        return new HttpClient
+        {
+            Timeout = TimeSpan.FromSeconds(7)
+        };
     }
 
     private static string? ResolveAttachmentArchiveRootPath(DiscordOptions options)

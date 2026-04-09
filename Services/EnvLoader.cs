@@ -8,6 +8,9 @@ public static class EnvLoader
     private static readonly HashSet<string> AllowedKeys = new(StringComparer.Ordinal)
     {
         "Discord__Token",
+        "Discord__WebTimelineMirrorEnabled",
+        "Discord__WebTimelineApiOrigin",
+        "Discord__WebTimelineBridgeSecret",
         "Database__ConnectionString",
         "FFLogs__Enabled",
         "FFLogs__ClientId",
