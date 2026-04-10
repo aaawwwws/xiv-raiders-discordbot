@@ -767,8 +767,10 @@ public sealed class StatsEmbedService
                 }
             }
         }
-        catch (NotSupportedException)
+        catch (Exception ex) when (IsChartTextRenderingFailure(ex))
         {
+            // Linux environments can lack a renderable system font; keep the chart image and
+            // fall back to the built-in bitmap text instead of dropping the attachment entirely.
             DrawPieChartTextFallback(image, chartTitle, segments, total, pieCenterX, pieCenterY, pieRadius);
         }
 
@@ -986,6 +988,26 @@ public sealed class StatsEmbedService
         {
             return false;
         }
+    }
+
+    private static bool IsChartTextRenderingFailure(Exception ex)
+    {
+        for (Exception? current = ex; current is not null; current = current.InnerException)
+        {
+            if (current is NotSupportedException or InvalidOperationException)
+            {
+                return true;
+            }
+
+            var exceptionNamespace = current.GetType().Namespace;
+            if (!string.IsNullOrWhiteSpace(exceptionNamespace) &&
+                exceptionNamespace.StartsWith("SixLabors.Fonts", StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private static void DrawPieChartTextFallback(

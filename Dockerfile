@@ -10,9 +10,12 @@ RUN dotnet publish RaidDcBot.csproj -c Release -o /app/publish /p:UseAppHost=fal
 FROM mcr.microsoft.com/dotnet/runtime:10.0 AS runtime
 WORKDIR /app
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends fontconfig fonts-noto-cjk \
+    && rm -rf /var/lib/apt/lists/*
+
 ENV DOTNET_ENVIRONMENT=Production
 
 COPY --from=build /app/publish ./
 
 ENTRYPOINT ["dotnet", "RaidDcBot.dll"]
-
