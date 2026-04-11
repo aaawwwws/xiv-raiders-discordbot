@@ -64,6 +64,7 @@ public sealed class DiscordBotService : IHostedService
     private Task? _fflogsPollingTask;
     private CancellationTokenSource? _voiceSessionReconcileCts;
     private Task? _voiceSessionReconcileTask;
+    private int _missingTimelineBridgeSecretLogged;
 
     public DiscordBotService(
         DiscordSocketClient client,
@@ -3971,7 +3972,11 @@ public sealed class DiscordBotService : IHostedService
                 _logger.LogWarning(ex, "Failed to post voice status prompt. ChannelId={ChannelId}", afterChannel.Id);
             }
 
-            await TryMirrorVoiceFirstJoinToWebTimelineAsync(guild, user, afterChannel, now);
+        }
+
+        if (afterChannel is not null)
+        {
+            await TryMirrorVoiceJoinToWebTimelineAsync(guild, user, afterChannel, now);
         }
 
         if (shouldNotifyUserVoiceActivity && endedChannel is not null)
@@ -5153,7 +5158,7 @@ public sealed class DiscordBotService : IHostedService
         return string.Join('\n', lines);
     }
 
-    private async Task TryMirrorVoiceFirstJoinToWebTimelineAsync(
+    private async Task TryMirrorVoiceJoinToWebTimelineAsync(
         SocketGuild guild,
         SocketUser user,
         SocketVoiceChannel channel,
@@ -5167,6 +5172,13 @@ public sealed class DiscordBotService : IHostedService
         var origin = _options.WebTimelineApiOrigin?.Trim();
         if (string.IsNullOrWhiteSpace(origin))
         {
+            return;
+        }
+
+        var secret = _options.WebTimelineBridgeSecret?.Trim();
+        if (string.IsNullOrWhiteSpace(secret))
+        {
+            LogMissingTimelineBridgeSecretOnce();
             return;
         }
 
@@ -5199,11 +5211,7 @@ public sealed class DiscordBotService : IHostedService
             Content = new StringContent(json, Encoding.UTF8, "application/json")
         };
 
-        var secret = _options.WebTimelineBridgeSecret?.Trim();
-        if (!string.IsNullOrWhiteSpace(secret))
-        {
-            request.Headers.TryAddWithoutValidation("X-Raid-Bot-Secret", secret);
-        }
+        request.Headers.TryAddWithoutValidation("X-Raid-Bot-Secret", secret);
 
         try
         {
@@ -5247,6 +5255,13 @@ public sealed class DiscordBotService : IHostedService
             return;
         }
 
+        var secret = _options.WebTimelineBridgeSecret?.Trim();
+        if (string.IsNullOrWhiteSpace(secret))
+        {
+            LogMissingTimelineBridgeSecretOnce();
+            return;
+        }
+
         if (!Uri.TryCreate(origin, UriKind.Absolute, out var baseUri))
         {
             _logger.LogWarning("Invalid Discord:WebTimelineApiOrigin. Value={Value}", origin);
@@ -5276,11 +5291,7 @@ public sealed class DiscordBotService : IHostedService
             Content = new StringContent(json, Encoding.UTF8, "application/json")
         };
 
-        var secret = _options.WebTimelineBridgeSecret?.Trim();
-        if (!string.IsNullOrWhiteSpace(secret))
-        {
-            request.Headers.TryAddWithoutValidation("X-Raid-Bot-Secret", secret);
-        }
+        request.Headers.TryAddWithoutValidation("X-Raid-Bot-Secret", secret);
 
         try
         {
@@ -5305,6 +5316,16 @@ public sealed class DiscordBotService : IHostedService
                 user.Id,
                 channel.Id);
         }
+    }
+
+    private void LogMissingTimelineBridgeSecretOnce()
+    {
+        if (Interlocked.Exchange(ref _missingTimelineBridgeSecretLogged, 1) != 0)
+        {
+            return;
+        }
+
+        _logger.LogWarning("Discord:WebTimelineBridgeSecret is not configured. Voice timeline mirroring is disabled.");
     }
 
     private static string BuildVoiceCallEndedSummary(SocketGuild guild, SocketUser user, SocketVoiceChannel channel, DateTimeOffset endedAt, TimeSpan? duration)

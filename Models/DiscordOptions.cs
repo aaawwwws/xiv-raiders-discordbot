@@ -73,7 +73,7 @@ public sealed class DiscordOptions
     public string TempVoiceChannelPrefix { get; init; } = "VC-";
     public int TempVoiceUserLimit { get; init; }
     public string ControlChannelName { get; init; } = "bot-control";
-    public bool WebTimelineMirrorEnabled { get; init; } = true;
+    public bool WebTimelineMirrorEnabled { get; init; }
     public string WebTimelineApiOrigin { get; init; } = "http://localhost:5214";
     public string WebTimelineBridgeSecret { get; init; } = string.Empty;
 
