@@ -111,7 +111,7 @@ public sealed class UserProfileEmbedService
     {
         var guildUser = guild?.GetUser(user.Id);
         var displayName = guildUser?.DisplayName ?? user.GlobalName ?? user.Username;
-        await _db.UpsertDiscordUserProfileAsync(user.Id, displayName, user.Username);
+        await _db.UpsertDiscordUserProfileAsync(user.Id, displayName, user.Username, user.GetAvatarUrl() ?? user.GetDefaultAvatarUrl());
 
         var character = await _db.GetMainCharacterAsync(user.Id);
         var profile = await _db.GetDiscordUserProfileAsync(user.Id);

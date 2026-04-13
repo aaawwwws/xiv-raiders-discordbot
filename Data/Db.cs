@@ -144,6 +144,16 @@ ADD COLUMN IF NOT EXISTS vc_text_auto_delete_hours INTEGER NOT NULL DEFAULT 6;";
         await conn.ExecuteAsync(sql);
     }
 
+    public async Task EnsureDiscordUserAvatarColumnAsync()
+    {
+        const string sql = @"
+ALTER TABLE IF EXISTS discord_users
+ADD COLUMN IF NOT EXISTS discord_avatar_url TEXT NULL;";
+
+        await using var conn = CreateConnection();
+        await conn.ExecuteAsync(sql);
+    }
+
     public async Task EnsureGuildLodestonePanelTableAsync()
     {
         const string sql = @"
@@ -673,14 +683,15 @@ ON public.lottery_claim_channels (channel_id);";
         await conn.ExecuteAsync(sql, new { UserId = ToDbId(userId) });
     }
 
-    public async Task UpsertDiscordUserProfileAsync(ulong userId, string displayName, string discordName)
+    public async Task UpsertDiscordUserProfileAsync(ulong userId, string displayName, string discordName, string? discordAvatarUrl = null)
     {
         const string sql = @"
-INSERT INTO discord_users (discord_user_id, display_name, discord_name)
-VALUES (@UserId, @DisplayName, @DiscordName)
+INSERT INTO discord_users (discord_user_id, display_name, discord_name, discord_avatar_url)
+VALUES (@UserId, @DisplayName, @DiscordName, @DiscordAvatarUrl)
 ON CONFLICT (discord_user_id) DO UPDATE
 SET display_name = EXCLUDED.display_name,
     discord_name = EXCLUDED.discord_name,
+    discord_avatar_url = COALESCE(EXCLUDED.discord_avatar_url, discord_users.discord_avatar_url),
     updated_at = NOW();";
 
         await using var conn = CreateConnection();
@@ -688,7 +699,8 @@ SET display_name = EXCLUDED.display_name,
         {
             UserId = ToDbId(userId),
             DisplayName = displayName,
-            DiscordName = discordName
+            DiscordName = discordName,
+            DiscordAvatarUrl = NullIfBlank(discordAvatarUrl)
         });
     }
 

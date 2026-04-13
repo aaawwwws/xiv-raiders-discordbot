@@ -118,6 +118,7 @@ public sealed class DiscordBotService : IHostedService
         await _db.EnsureRecruitSlotFlexSpecColumnAsync();
         await _db.EnsureRecruitSlotFlexJobsSpecColumnAsync();
         await _db.EnsureRecruitUnderfilledDecisionDeadlineColumnAsync();
+        await _db.EnsureDiscordUserAvatarColumnAsync();
         await _db.BackfillRecruitSlotFlexJobsSpecAsync();
         await _db.EnsureDiscordUserProfileCharacterColumnsAsync();
         await _db.EnsureDiscordUserVoiceNotificationColumnAsync();
@@ -327,6 +328,7 @@ public sealed class DiscordBotService : IHostedService
 
         foreach (var guild in _client.Guilds)
         {
+            await SyncGuildMemberProfilesAsync(guild);
             await TrySendStartupRecoveryAuditAsync(guild);
         }
         if (ShouldRunActivityMaintenance())
@@ -3778,7 +3780,38 @@ public sealed class DiscordBotService : IHostedService
 
     private async Task OnGuildMemberUpdatedAsync(Cacheable<SocketGuildUser, ulong> beforeCache, SocketGuildUser after)
     {
-        await Task.CompletedTask;
+        try
+        {
+            await UpsertGuildUserProfileAsync(after);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to sync member profile. GuildId={GuildId}, UserId={UserId}", after.Guild.Id, after.Id);
+        }
+    }
+
+    private async Task SyncGuildMemberProfilesAsync(SocketGuild guild)
+    {
+        foreach (var user in guild.Users)
+        {
+            try
+            {
+                await UpsertGuildUserProfileAsync(user);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Skipped guild member profile sync. GuildId={GuildId}, UserId={UserId}", guild.Id, user.Id);
+            }
+        }
+    }
+
+    private Task UpsertGuildUserProfileAsync(SocketGuildUser user)
+    {
+        var displayName = string.IsNullOrWhiteSpace(user.DisplayName)
+            ? user.GlobalName ?? user.Username
+            : user.DisplayName;
+        var avatarUrl = user.GetAvatarUrl(size: 256) ?? user.GetDefaultAvatarUrl();
+        return _db.UpsertDiscordUserProfileAsync(user.Id, displayName, user.Username, avatarUrl);
     }
 
     private async Task TryRestoreReturningMemberRoleAsync(SocketGuildUser user)
@@ -3974,7 +4007,7 @@ public sealed class DiscordBotService : IHostedService
 
         }
 
-        if (afterChannel is not null)
+        if (isFirstJoinInChannel && afterChannel is not null)
         {
             await TryMirrorVoiceJoinToWebTimelineAsync(guild, user, afterChannel, now);
         }

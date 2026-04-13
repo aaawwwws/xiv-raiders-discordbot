@@ -75,7 +75,9 @@ public sealed class DiscordOptions
     public string ControlChannelName { get; init; } = "bot-control";
     public bool WebTimelineMirrorEnabled { get; init; }
     public string WebTimelineApiOrigin { get; init; } = "http://localhost:5214";
+    public string WebTimelineFrontendOrigin { get; init; } = "http://localhost:5173";
     public string WebTimelineBridgeSecret { get; init; } = string.Empty;
+    public int WebTimelinePollingIntervalSeconds { get; init; } = 5;
 
     public HashSet<string> BuildManagementRoleNameSet()
     {

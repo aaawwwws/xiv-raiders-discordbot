@@ -44,6 +44,9 @@ builder.Services.AddSingleton(sp => {
     return client;
 });
 
+builder.Services.AddSingleton<BotNotificationService>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<BotNotificationService>());
+
 builder.Services.AddSingleton<TokenService>();
 builder.Services.AddSingleton<LodestoneClient>();
 builder.Services.AddSingleton<FfLogsClient>();

@@ -419,7 +419,7 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
         }
 
         await _db.EnsureDiscordUserAsync(Context.User.Id);
-        await _db.UpsertDiscordUserProfileAsync(Context.User.Id, guildUser.DisplayName, Context.User.Username);
+        await _db.UpsertDiscordUserProfileAsync(Context.User.Id, guildUser.DisplayName, Context.User.Username, Context.User.GetAvatarUrl() ?? Context.User.GetDefaultAvatarUrl());
         await _db.UpdateUserRegistrationProfileAsync(
             Context.User.Id,
             ffxivName,
@@ -556,7 +556,7 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
         }
 
         await _db.EnsureDiscordUserAsync(Context.User.Id);
-        await _db.UpsertDiscordUserProfileAsync(Context.User.Id, guildUser.DisplayName, Context.User.Username);
+        await _db.UpsertDiscordUserProfileAsync(Context.User.Id, guildUser.DisplayName, Context.User.Username, Context.User.GetAvatarUrl() ?? Context.User.GetDefaultAvatarUrl());
         await _db.UpdateUserRegistrationProfileAsync(
             Context.User.Id,
             currentProfile.FfxivName ?? string.Empty,
@@ -649,7 +649,7 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
         await _db.EnsureDiscordUserAsync(Context.User.Id);
 
         var displayName = (Context.User as SocketGuildUser)?.DisplayName ?? Context.User.GlobalName ?? Context.User.Username;
-        await _db.UpsertDiscordUserProfileAsync(Context.User.Id, displayName, Context.User.Username);
+        await _db.UpsertDiscordUserProfileAsync(Context.User.Id, displayName, Context.User.Username, Context.User.GetAvatarUrl() ?? Context.User.GetDefaultAvatarUrl());
         await _db.UpdateUserRegistrationProfileAsync(
             Context.User.Id,
             draft.FfxivName,
