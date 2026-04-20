@@ -28,7 +28,8 @@ public sealed class RequireBotAdminAttribute : PreconditionAttribute
         var roleName = string.IsNullOrWhiteSpace(options.AdminRoleName) ? "RaidDC Admin" : options.AdminRoleName;
 
         var hasRole = guildUser.Roles.Any(role =>
-            string.Equals(role.Name, roleName, StringComparison.OrdinalIgnoreCase));
+            string.Equals(role.Name, roleName, StringComparison.OrdinalIgnoreCase) ||
+            role.Name.Contains("[コンテンツ]", StringComparison.OrdinalIgnoreCase));
 
         return hasRole
             ? Task.FromResult(PreconditionResult.FromSuccess())

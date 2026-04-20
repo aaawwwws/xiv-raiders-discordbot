@@ -34,6 +34,7 @@ public sealed class BotNotificationService : IHostedService, IDisposable
         [property: JsonPropertyName("recipientUserId")] ulong RecipientUserId,
         [property: JsonPropertyName("actorUserId")] ulong ActorUserId,
         [property: JsonPropertyName("actorName")] string ActorName,
+        [property: JsonPropertyName("actorSlug")] string? ActorSlug,
         [property: JsonPropertyName("actorAvatarUrl")] string? ActorAvatarUrl,
         [property: JsonPropertyName("postId")] string PostId,
         [property: JsonPropertyName("emoji")] string? Emoji,
@@ -221,6 +222,13 @@ public sealed class BotNotificationService : IHostedService, IDisposable
             embed.WithThumbnailUrl(notification.ActorAvatarUrl);
         }
 
+        var profileUrl = BuildUserProfileUrl(notification.ActorSlug);
+        if (string.Equals(notification.Type, "follow", StringComparison.OrdinalIgnoreCase) &&
+            !string.IsNullOrWhiteSpace(profileUrl))
+        {
+            embed.AddField("プロフィール", profileUrl, inline: false);
+        }
+
         var postUrl = BuildPostUrl(notification.PostId);
         if (!string.IsNullOrWhiteSpace(postUrl))
         {
@@ -255,6 +263,16 @@ public sealed class BotNotificationService : IHostedService, IDisposable
         }
 
         return $"{_frontendOrigin}/posts/{Uri.EscapeDataString(postId.Trim())}";
+    }
+
+    private string? BuildUserProfileUrl(string? actorSlug)
+    {
+        if (string.IsNullOrWhiteSpace(_frontendOrigin) || string.IsNullOrWhiteSpace(actorSlug))
+        {
+            return null;
+        }
+
+        return $"{_frontendOrigin}/users/{Uri.EscapeDataString(actorSlug.Trim())}";
     }
 
     private static string? NormalizeOrigin(string? origin)

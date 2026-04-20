@@ -1,3 +1,4 @@
+using Discord;
 using Dapper;
 using Microsoft.Extensions.Options;
 using Npgsql;
@@ -361,6 +362,85 @@ ADD COLUMN IF NOT EXISTS runtime_tuning_updated_at TIMESTAMPTZ NULL;";
         await conn.ExecuteAsync(sql);
     }
 
+    public async Task EnsureBotAdminOperationsTableAsync()
+    {
+        const string sql = @"
+CREATE TABLE IF NOT EXISTS bot_admin_operations (
+    id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    operation_type TEXT NOT NULL,
+    guild_id TEXT NULL,
+    status TEXT NOT NULL DEFAULT 'queued',
+    requested_by_discord_id TEXT NULL,
+    requested_by_name TEXT NULL,
+    note TEXT NULL,
+    created_at_utc TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at_utc TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at_utc TIMESTAMPTZ NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_bot_admin_operations_created
+ON bot_admin_operations (created_at_utc DESC);
+
+CREATE INDEX IF NOT EXISTS idx_bot_admin_operations_status
+ON bot_admin_operations (status, created_at_utc DESC);";
+
+        await using var conn = CreateConnection();
+        await conn.ExecuteAsync(sql);
+    }
+
+    public async Task<BotAdminOperation?> ClaimNextBotAdminOperationAsync()
+    {
+        const string sql = @"
+WITH target AS (
+    SELECT id
+    FROM bot_admin_operations
+    WHERE status = 'queued'
+    ORDER BY created_at_utc ASC, id ASC
+    LIMIT 1
+    FOR UPDATE SKIP LOCKED
+)
+UPDATE bot_admin_operations operation
+SET status = 'running',
+    updated_at_utc = NOW()
+FROM target
+WHERE operation.id = target.id
+RETURNING operation.id AS Id,
+          operation.operation_type AS OperationType,
+          operation.status AS Status,
+          operation.note AS Note;";
+
+        await using var conn = CreateConnection();
+        return await conn.QuerySingleOrDefaultAsync<BotAdminOperation>(sql);
+    }
+
+    public async Task CompleteBotAdminOperationAsync(int id, string? note)
+    {
+        const string sql = @"
+UPDATE bot_admin_operations
+SET status = 'completed',
+    note = COALESCE(NULLIF(@Note, ''), note),
+    updated_at_utc = NOW(),
+    completed_at_utc = NOW()
+WHERE id = @Id;";
+
+        await using var conn = CreateConnection();
+        await conn.ExecuteAsync(sql, new { Id = id, Note = note });
+    }
+
+    public async Task FailBotAdminOperationAsync(int id, string note)
+    {
+        const string sql = @"
+UPDATE bot_admin_operations
+SET status = 'failed',
+    note = @Note,
+    updated_at_utc = NOW(),
+    completed_at_utc = NOW()
+WHERE id = @Id;";
+
+        await using var conn = CreateConnection();
+        await conn.ExecuteAsync(sql, new { Id = id, Note = note });
+    }
+
     public async Task EnsureRecruitTemplatesTableAsync()
     {
         const string sql = @"
@@ -381,11 +461,12 @@ CREATE TABLE IF NOT EXISTS public.recruit_templates (
         await conn.ExecuteAsync(sql);
     }
 
-    public async Task EnsureMessageLogPayloadColumnsAsync()
+public async Task EnsureMessageLogPayloadColumnsAsync()
     {
         const string sql = @"
 ALTER TABLE IF EXISTS public.message_logs
 ADD COLUMN IF NOT EXISTS author_display_name TEXT NULL,
+ADD COLUMN IF NOT EXISTS channel_name TEXT NULL,
 ADD COLUMN IF NOT EXISTS attachments_json JSONB NULL,
 ADD COLUMN IF NOT EXISTS embeds_json JSONB NULL;";
 
@@ -400,6 +481,7 @@ CREATE TABLE IF NOT EXISTS public.user_reaction_logs (
     id SERIAL PRIMARY KEY,
     guild_id BIGINT NOT NULL,
     channel_id BIGINT NOT NULL,
+    channel_name TEXT NULL,
     message_id BIGINT NOT NULL,
     user_id BIGINT NOT NULL,
     emoji_key TEXT NOT NULL,
@@ -413,6 +495,16 @@ ON public.user_reaction_logs (guild_id, reacted_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_user_reaction_logs_user
 ON public.user_reaction_logs (user_id);";
+
+        await using var conn = CreateConnection();
+        await conn.ExecuteAsync(sql);
+    }
+
+    public async Task EnsureVoiceSessionColumnsAsync()
+    {
+        const string sql = @"
+ALTER TABLE IF EXISTS public.voice_sessions
+ADD COLUMN IF NOT EXISTS channel_name TEXT NULL;";
 
         await using var conn = CreateConnection();
         await conn.ExecuteAsync(sql);
@@ -1228,6 +1320,7 @@ SET name = EXCLUDED.name,
     public async Task UpsertMessageAsync(
         ulong guildId,
         ulong channelId,
+        string? channelName,
         ulong messageId,
         ulong authorId,
         string authorName,
@@ -1240,12 +1333,13 @@ SET name = EXCLUDED.name,
         DateTimeOffset createdAt)
     {
         const string sql = @"
-INSERT INTO message_logs (message_id, guild_id, channel_id, author_id, author_name, author_display_name, content, attachment_count, embed_count, attachments_json, embeds_json, created_at)
-VALUES (@MessageId, @GuildId, @ChannelId, @AuthorId, @AuthorName, @AuthorDisplayName, @Content, @AttachmentCount, @EmbedCount, CAST(@AttachmentsJson AS JSONB), CAST(@EmbedsJson AS JSONB), @CreatedAt)
+INSERT INTO message_logs (message_id, guild_id, channel_id, channel_name, author_id, author_name, author_display_name, content, attachment_count, embed_count, attachments_json, embeds_json, created_at)
+VALUES (@MessageId, @GuildId, @ChannelId, @ChannelName, @AuthorId, @AuthorName, @AuthorDisplayName, @Content, @AttachmentCount, @EmbedCount, CAST(@AttachmentsJson AS JSONB), CAST(@EmbedsJson AS JSONB), @CreatedAt)
 ON CONFLICT (message_id) DO UPDATE
 SET author_id = EXCLUDED.author_id,
     author_name = EXCLUDED.author_name,
     author_display_name = EXCLUDED.author_display_name,
+    channel_name = COALESCE(EXCLUDED.channel_name, message_logs.channel_name),
     content = EXCLUDED.content,
     attachment_count = EXCLUDED.attachment_count,
     embed_count = EXCLUDED.embed_count,
@@ -1258,6 +1352,7 @@ SET author_id = EXCLUDED.author_id,
             MessageId = ToDbId(messageId),
             GuildId = ToDbId(guildId),
             ChannelId = ToDbId(channelId),
+            ChannelName = NullIfBlank(channelName),
             AuthorId = ToDbId(authorId),
             AuthorName = authorName,
             AuthorDisplayName = NullIfBlank(authorDisplayName),
@@ -1270,13 +1365,14 @@ SET author_id = EXCLUDED.author_id,
         });
     }
 
-    public async Task UpsertReactionAsync(ulong guildId, ulong channelId, ulong messageId, ulong userId, string emojiKey, DateTimeOffset reactedAt)
+    public async Task UpsertReactionAsync(ulong guildId, ulong channelId, string? channelName, ulong messageId, ulong userId, string emojiKey, DateTimeOffset reactedAt)
     {
         const string sql = @"
-INSERT INTO public.user_reaction_logs (guild_id, channel_id, message_id, user_id, emoji_key, reacted_at)
-VALUES (@GuildId, @ChannelId, @MessageId, @UserId, @EmojiKey, @ReactedAt)
+INSERT INTO public.user_reaction_logs (guild_id, channel_id, channel_name, message_id, user_id, emoji_key, reacted_at)
+VALUES (@GuildId, @ChannelId, @ChannelName, @MessageId, @UserId, @EmojiKey, @ReactedAt)
 ON CONFLICT (guild_id, user_id, message_id, emoji_key) DO UPDATE
 SET reacted_at = EXCLUDED.reacted_at,
+    channel_name = COALESCE(EXCLUDED.channel_name, public.user_reaction_logs.channel_name),
     updated_at = NOW();";
 
         await using var conn = CreateConnection();
@@ -1284,6 +1380,7 @@ SET reacted_at = EXCLUDED.reacted_at,
         {
             GuildId = ToDbId(guildId),
             ChannelId = ToDbId(channelId),
+            ChannelName = NullIfBlank(channelName),
             MessageId = ToDbId(messageId),
             UserId = ToDbId(userId),
             EmojiKey = string.IsNullOrWhiteSpace(emojiKey) ? "unknown" : emojiKey,
@@ -1385,14 +1482,15 @@ WHERE created_at < NOW() - (@Days * INTERVAL '1 day');";
         return await conn.ExecuteAsync(sql, new { Days = retentionDays });
     }
 
-    public async Task<VoiceSession> StartVoiceSessionAsync(ulong guildId, ulong channelId, ulong userId, string userName, DateTimeOffset joinedAt)
+    public async Task<VoiceSession> StartVoiceSessionAsync(ulong guildId, ulong channelId, string? channelName, ulong userId, string userName, DateTimeOffset joinedAt)
     {
         const string sql = @"
-INSERT INTO voice_sessions (guild_id, channel_id, user_id, user_name, joined_at)
-VALUES (@GuildId, @ChannelId, @UserId, @UserName, @JoinedAt)
+INSERT INTO voice_sessions (guild_id, channel_id, channel_name, user_id, user_name, joined_at)
+VALUES (@GuildId, @ChannelId, @ChannelName, @UserId, @UserName, @JoinedAt)
 RETURNING id AS Id,
           guild_id AS GuildId,
           channel_id AS ChannelId,
+          channel_name AS ChannelName,
           user_id AS UserId,
           user_name AS UserName,
           joined_at AS JoinedAt,
@@ -1404,6 +1502,7 @@ RETURNING id AS Id,
         {
             GuildId = ToDbId(guildId),
             ChannelId = ToDbId(channelId),
+            ChannelName = NullIfBlank(channelName),
             UserId = ToDbId(userId),
             UserName = userName,
             JoinedAt = joinedAt
@@ -8267,6 +8366,29 @@ WHERE id = @Id;";
     {
         var trimmed = value?.Trim();
         return string.IsNullOrWhiteSpace(trimmed) ? null : trimmed;
+    }
+    public async Task<bool> EnsureMessageLogAsync(IMessage message)
+    {
+        if (message is not IUserMessage userMessage) return false;
+        
+        var guildId = (message.Channel as IGuildChannel)?.GuildId ?? 0;
+        
+        await UpsertMessageAsync(
+            guildId,
+            message.Channel.Id,
+            message.Channel.Name,
+            message.Id,
+            message.Author.Id,
+            message.Author.Username,
+            (message.Author as IGuildUser)?.Nickname,
+            message.Content,
+            message.Attachments.Count,
+            message.Embeds.Count,
+            null,
+            null,
+            message.CreatedAt
+        );
+        return true;
     }
 }
 

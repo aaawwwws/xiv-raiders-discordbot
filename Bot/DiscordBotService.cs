@@ -60,11 +60,18 @@ public sealed class DiscordBotService : IHostedService
     private Task? _recruitScheduleTask;
     private CancellationTokenSource? _activityRoleSyncCts;
     private Task? _activityRoleSyncTask;
+    private CancellationTokenSource? _runtimeTuningSyncCts;
+    private Task? _runtimeTuningSyncTask;
     private CancellationTokenSource? _fflogsPollingCts;
     private Task? _fflogsPollingTask;
     private CancellationTokenSource? _voiceSessionReconcileCts;
     private Task? _voiceSessionReconcileTask;
+    private CancellationTokenSource? _botAdminOperationCts;
+    private Task? _botAdminOperationTask;
     private int _missingTimelineBridgeSecretLogged;
+    private DateTimeOffset? _lastRuntimeTuningUpdatedAtUtc;
+    private static readonly TimeSpan RuntimeTuningRefreshInterval = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan BotAdminOperationPollInterval = TimeSpan.FromSeconds(10);
 
     public DiscordBotService(
         DiscordSocketClient client,
@@ -139,9 +146,11 @@ public sealed class DiscordBotService : IHostedService
         await _db.EnsureSsAlbumFavoritesTableAsync();
         await _db.EnsureLotteryTablesAsync();
         await _db.EnsureGuildSettingsColumnsAsync();
+        await _db.EnsureBotAdminOperationsTableAsync();
         await _db.EnsureRecruitTemplatesTableAsync();
         await _db.EnsureMessageLogPayloadColumnsAsync();
         await _db.EnsureUserReactionLogsTableAsync();
+        await _db.EnsureVoiceSessionColumnsAsync();
         await _db.EnsureInactiveKickRetentionTableAsync();
         await RestoreRuntimeTuningAsync();
         EnsureAttachmentArchiveDirectory();
@@ -168,10 +177,14 @@ public sealed class DiscordBotService : IHostedService
         _recruitScheduleTask = Task.Run(() => RecruitScheduleLoopAsync(_recruitScheduleCts.Token), _recruitScheduleCts.Token);
         _activityRoleSyncCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         _activityRoleSyncTask = Task.Run(() => ActivityRoleSyncLoopAsync(_activityRoleSyncCts.Token), _activityRoleSyncCts.Token);
+        _runtimeTuningSyncCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        _runtimeTuningSyncTask = Task.Run(() => RuntimeTuningSyncLoopAsync(_runtimeTuningSyncCts.Token), _runtimeTuningSyncCts.Token);
         _fflogsPollingCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         _fflogsPollingTask = Task.Run(() => FfLogsPollingLoopAsync(_fflogsPollingCts.Token), _fflogsPollingCts.Token);
         _voiceSessionReconcileCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         _voiceSessionReconcileTask = Task.Run(() => VoiceSessionReconcileLoopAsync(_voiceSessionReconcileCts.Token), _voiceSessionReconcileCts.Token);
+        _botAdminOperationCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        _botAdminOperationTask = Task.Run(() => BotAdminOperationLoopAsync(_botAdminOperationCts.Token), _botAdminOperationCts.Token);
 
         await _client.LoginAsync(TokenType.Bot, _options.Token);
         await _client.StartAsync();
@@ -196,6 +209,7 @@ public sealed class DiscordBotService : IHostedService
             persisted.RuntimeMessageLogRetentionDays ?? current.MessageLogRetentionDays,
             persisted.RuntimeVoiceSessionRetentionDays ?? current.VoiceSessionRetentionDays,
             persisted.RuntimeReactionLogRetentionDays ?? current.ReactionLogRetentionDays);
+        _lastRuntimeTuningUpdatedAtUtc = persisted.RuntimeTuningUpdatedAt;
 
         _logger.LogInformation(
             "Restored runtime tuning from DB. GuildId={GuildId}, CleanupIntervalMinutes={CleanupIntervalMinutes}, RecruitClosedRetentionHours={RecruitClosedRetentionHours}, RecruitCanceledRetentionHours={RecruitCanceledRetentionHours}, MessageLogRetentionDays={MessageLogRetentionDays}, VoiceSessionRetentionDays={VoiceSessionRetentionDays}, ReactionLogRetentionDays={ReactionLogRetentionDays}, RuntimeTuningUpdatedAt={RuntimeTuningUpdatedAt}",
@@ -212,6 +226,73 @@ public sealed class DiscordBotService : IHostedService
             "runtime_tuning.restore",
             success: true,
             note: $"guild={persisted.GuildId},cleanup={updated.CleanupIntervalMinutes}m");
+    }
+
+    private async Task RuntimeTuningSyncLoopAsync(CancellationToken cancellationToken)
+    {
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            try
+            {
+                await Task.Delay(RuntimeTuningRefreshInterval, cancellationToken);
+
+                var persisted = await _db.GetLatestGuildRuntimeTuningAsync();
+                if (persisted is null || persisted.RuntimeTuningUpdatedAt is null)
+                {
+                    _runtimeDiagnostics.Mark("runtime_tuning.refresh", success: true, note: "no_tuning_row");
+                    continue;
+                }
+
+                if (_lastRuntimeTuningUpdatedAtUtc.HasValue &&
+                    _lastRuntimeTuningUpdatedAtUtc.Value == persisted.RuntimeTuningUpdatedAt.Value)
+                {
+                    _runtimeDiagnostics.Mark("runtime_tuning.refresh", success: true, note: "unchanged");
+                    continue;
+                }
+
+                var current = _runtimeTuning.GetSnapshot();
+                var updated = _runtimeTuning.Update(
+                    persisted.RuntimeCleanupIntervalMinutes ?? current.CleanupIntervalMinutes,
+                    persisted.RuntimeRecruitClosedRetentionHours ?? current.RecruitClosedRetentionHours,
+                    persisted.RuntimeRecruitCanceledRetentionHours ?? current.RecruitCanceledRetentionHours,
+                    persisted.RuntimeMessageLogRetentionDays ?? current.MessageLogRetentionDays,
+                    persisted.RuntimeVoiceSessionRetentionDays ?? current.VoiceSessionRetentionDays,
+                    persisted.RuntimeReactionLogRetentionDays ?? current.ReactionLogRetentionDays);
+
+                _lastRuntimeTuningUpdatedAtUtc = persisted.RuntimeTuningUpdatedAt.Value;
+                _runtimeDiagnostics.Mark(
+                    "runtime_tuning.refresh",
+                    success: true,
+                    note: $"guild={persisted.GuildId},cleanup={updated.CleanupIntervalMinutes}m,updated={persisted.RuntimeTuningUpdatedAt:O}");
+                _logger.LogInformation(
+                    "Applied runtime tuning from DB. GuildId={GuildId}, CleanupIntervalMinutes={CleanupIntervalMinutes}, RecruitClosedRetentionHours={RecruitClosedRetentionHours}, RecruitCanceledRetentionHours={RecruitCanceledRetentionHours}, MessageLogRetentionDays={MessageLogRetentionDays}, VoiceSessionRetentionDays={VoiceSessionRetentionDays}, ReactionLogRetentionDays={ReactionLogRetentionDays}, RuntimeTuningUpdatedAt={RuntimeTuningUpdatedAt}",
+                    persisted.GuildId,
+                    updated.CleanupIntervalMinutes,
+                    updated.RecruitClosedRetentionHours,
+                    updated.RecruitCanceledRetentionHours,
+                    updated.MessageLogRetentionDays,
+                    updated.VoiceSessionRetentionDays,
+                    updated.ReactionLogRetentionDays,
+                    persisted.RuntimeTuningUpdatedAt);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                _runtimeDiagnostics.Mark("runtime_tuning.refresh", success: false, note: ex.Message);
+                _logger.LogWarning(ex, "Failed to refresh runtime tuning from DB.");
+                try
+                {
+                    await Task.Delay(RuntimeTuningRefreshInterval, cancellationToken);
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    break;
+                }
+            }
+        }
     }
 
     public async Task StopAsync(CancellationToken cancellationToken)
@@ -264,6 +345,22 @@ public sealed class DiscordBotService : IHostedService
             }
         }
 
+        if (_runtimeTuningSyncCts is not null)
+        {
+            _runtimeTuningSyncCts.Cancel();
+        }
+
+        if (_runtimeTuningSyncTask is not null)
+        {
+            try
+            {
+                await _runtimeTuningSyncTask;
+            }
+            catch (OperationCanceledException)
+            {
+            }
+        }
+
         if (_fflogsPollingCts is not null)
         {
             _fflogsPollingCts.Cancel();
@@ -290,6 +387,22 @@ public sealed class DiscordBotService : IHostedService
             try
             {
                 await _voiceSessionReconcileTask;
+            }
+            catch (OperationCanceledException)
+            {
+            }
+        }
+
+        if (_botAdminOperationCts is not null)
+        {
+            _botAdminOperationCts.Cancel();
+        }
+
+        if (_botAdminOperationTask is not null)
+        {
+            try
+            {
+                await _botAdminOperationTask;
             }
             catch (OperationCanceledException)
             {
@@ -680,6 +793,294 @@ public sealed class DiscordBotService : IHostedService
                 return;
             }
         }
+    }
+
+    private async Task BotAdminOperationLoopAsync(CancellationToken token)
+    {
+        while (!token.IsCancellationRequested)
+        {
+            try
+            {
+                var operation = await _db.ClaimNextBotAdminOperationAsync();
+                if (operation is null)
+                {
+                    await Task.Delay(BotAdminOperationPollInterval, token);
+                    continue;
+                }
+
+                await ExecuteBotAdminOperationAsync(operation, token);
+            }
+            catch (TaskCanceledException)
+            {
+                return;
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+            catch (Exception ex)
+            {
+                _runtimeDiagnostics.Mark("loop.bot_admin_operations", success: false, note: ex.GetType().Name);
+                _logger.LogWarning(ex, "Failed in bot admin operation loop.");
+
+                try
+                {
+                    await Task.Delay(BotAdminOperationPollInterval, token);
+                }
+                catch (TaskCanceledException)
+                {
+                    return;
+                }
+            }
+        }
+    }
+
+    private async Task ExecuteBotAdminOperationAsync(BotAdminOperation operation, CancellationToken token)
+    {
+        var operationType = (operation.OperationType ?? string.Empty).Trim().ToLowerInvariant();
+        try
+        {
+            _logger.LogInformation("Executing bot admin operation. Id={Id}, Type={Type}", operation.Id, operationType);
+
+            var note = operationType switch
+            {
+                "cleanup_now" => await ExecuteCleanupOperationAsync(),
+                "inactive_scan_now" => await ExecuteInactiveRetentionOperationAsync(),
+                "panel_refresh" => await ExecutePanelRefreshOperationAsync(),
+                "recruit_sweep" => await ExecuteRecruitSweepOperationAsync(),
+                "lottery_sweep" => await ExecuteLotterySweepOperationAsync(),
+                "diagnostics_snapshot" => ExecuteDiagnosticsSnapshotOperation(),
+                "member_role_manage" => await ExecuteMemberRoleManageOperationAsync(operation.Note),
+                "message_history_sync" => await ExecuteMessageHistorySyncOperationAsync(operation.Note),
+                "delete_message" => await ExecuteMessageDeleteOperationAsync(operation.Note),
+                _ => throw new InvalidOperationException($"Unsupported bot admin operation: {operation.OperationType}")
+            };
+
+            await _db.CompleteBotAdminOperationAsync(operation.Id, note);
+            _runtimeDiagnostics.Mark("loop.bot_admin_operations", success: true, note: $"{operationType} completed");
+        }
+        catch (Exception ex) when (!token.IsCancellationRequested)
+        {
+            var message = $"{operationType} failed: {ex.GetType().Name}";
+            await _db.FailBotAdminOperationAsync(operation.Id, message);
+            _runtimeDiagnostics.Mark("loop.bot_admin_operations", success: false, note: message);
+            _logger.LogWarning(ex, "Bot admin operation failed. Id={Id}, Type={Type}", operation.Id, operationType);
+        }
+    }
+
+    private async Task<string> ExecuteMemberRoleManageOperationAsync(string? payload)
+    {
+        if (string.IsNullOrWhiteSpace(payload)) throw new InvalidOperationException("Payload is empty");
+        
+        using var doc = System.Text.Json.JsonDocument.Parse(payload);
+        var root = doc.RootElement;
+        
+        var guildIdStr = root.GetProperty("GuildId").GetString();
+        var userIdStr = root.GetProperty("UserId").GetString();
+        var action = root.GetProperty("Action").GetString()?.ToLowerInvariant();
+        var roleType = root.GetProperty("RoleType").GetString()?.ToLowerInvariant();
+        var roleIdStr = root.TryGetProperty("RoleId", out var roleIdNode) ? roleIdNode.GetString() : null;
+        
+        if (!ulong.TryParse(guildIdStr, out var guildId)) throw new InvalidOperationException("Invalid GuildId");
+        if (!ulong.TryParse(userIdStr, out var userId)) throw new InvalidOperationException("Invalid UserId");
+        
+        var guild = _client.GetGuild(guildId);
+        if (guild is null) throw new InvalidOperationException("Guild not found");
+        
+        var user = guild.GetUser(userId);
+        if (user is null) throw new InvalidOperationException("User not found in guild");
+        
+        var settings = await _db.GetGuildSettingsAsync(guildId);
+        ulong targetRoleId = 0;
+        
+        if (!string.IsNullOrWhiteSpace(roleIdStr))
+        {
+            if (!ulong.TryParse(roleIdStr, out targetRoleId))
+            {
+                throw new InvalidOperationException("Invalid RoleId");
+            }
+        }
+        else if (roleType == "member")
+        {
+            targetRoleId = (ulong)(settings?.MemberRoleId ?? 0);
+        }
+        else if (roleType == "provisional")
+        {
+            targetRoleId = (ulong)(settings?.ProvisionalRoleId ?? 0);
+        }
+        else
+        {
+            throw new InvalidOperationException($"Unsupported roleType: {roleType}");
+        }
+        
+        if (targetRoleId == 0) throw new InvalidOperationException($"Role ID for {roleType} is not configured");
+        
+        var role = guild.GetRole(targetRoleId);
+        if (role is null) throw new InvalidOperationException($"Role {targetRoleId} not found in guild");
+        
+        if (action == "grant")
+        {
+            await user.AddRoleAsync(role);
+            return $"Granted {role.Name} role to user {userId}";
+        }
+        else if (action == "revoke")
+        {
+            await user.RemoveRoleAsync(role);
+            return $"Revoked {role.Name} role from user {userId}";
+        }
+        
+        throw new InvalidOperationException($"Unsupported action: {action}");
+    }
+
+    private async Task<string> ExecuteMessageHistorySyncOperationAsync(string? payload)
+    {
+        if (string.IsNullOrWhiteSpace(payload)) throw new InvalidOperationException("Payload is empty");
+
+        using var doc = System.Text.Json.JsonDocument.Parse(payload);
+        var root = doc.RootElement;
+
+        var guildIdStr = root.GetProperty("GuildId").GetString();
+        var channelIdStr = root.GetProperty("ChannelId").GetString();
+
+        if (!ulong.TryParse(guildIdStr, out var guildId)) throw new InvalidOperationException("Invalid GuildId");
+        if (!ulong.TryParse(channelIdStr, out var channelId)) throw new InvalidOperationException("Invalid ChannelId");
+
+        var guild = _client.GetGuild(guildId);
+        if (guild is null) throw new InvalidOperationException("Guild not found");
+
+        var channel = guild.GetTextChannel(channelId);
+        if (channel is null) throw new InvalidOperationException("Channel not found");
+
+        int importedCount = 0;
+        var messages = channel.GetMessagesAsync(limit: 100);
+        await foreach (var page in messages)
+        {
+            foreach (var message in page)
+            {
+                // ここでDBにメッセージを upsert する処理を呼び出す
+                // 既存のログ保存ロジック（例: _db.SaveMessageLogAsync などがあるはず）を流用
+                if (await _db.EnsureMessageLogAsync(message))
+                {
+                    importedCount++;
+                }
+            }
+        }
+
+        return $"History sync completed. Imported {importedCount} messages.";
+    }
+
+    private async Task<string> ExecuteCleanupOperationAsync()
+    {
+        await RunCleanupAsync();
+        return "Cleanup completed by admin operation.";
+    }
+
+    private async Task<string> ExecuteInactiveRetentionOperationAsync()
+    {
+        await CleanupInactiveKickUserDataRetentionsAsync(DateTimeOffset.UtcNow);
+        return "Inactive retention cleanup completed by admin operation.";
+    }
+
+    private async Task<string> ExecutePanelRefreshOperationAsync()
+    {
+        await EnsureGuildResourcesAsync();
+        await RefreshRecruitListPanelsHeartbeatAsync();
+        var statsRefreshCount = 0;
+        foreach (var guild in _client.Guilds)
+        {
+            var result = await _stats.RefreshIfConfiguredAsync(guild);
+            if (result.Updated)
+            {
+                statsRefreshCount++;
+            }
+        }
+
+        return $"Panel refresh completed. StatsPanelsUpdated={statsRefreshCount}.";
+    }
+
+    private async Task<string> ExecuteRecruitSweepOperationAsync()
+    {
+        await RunRecruitScheduleTickAsync();
+        return "Recruit schedule sweep completed by admin operation.";
+    }
+
+    private async Task<string> ExecuteLotterySweepOperationAsync()
+    {
+        var nowUtc = DateTimeOffset.UtcNow;
+        await ProcessLotteryAutoCloseTickAsync(nowUtc);
+        await ProcessLotteryParticipantRoleCleanupTickAsync(nowUtc);
+        return "Lottery sweep completed by admin operation.";
+    }
+
+    private string ExecuteDiagnosticsSnapshotOperation()
+    {
+        var heartbeatCount = _runtimeDiagnostics.Snapshot().Count;
+        return $"Diagnostics snapshot captured. Heartbeats={heartbeatCount}, Guilds={_client.Guilds.Count}.";
+    }
+
+    private async Task<string> ExecuteMessageDeleteOperationAsync(string? payload)
+    {
+        if (string.IsNullOrWhiteSpace(payload))
+        {
+            throw new InvalidOperationException("Payload is empty");
+        }
+
+        using var doc = JsonDocument.Parse(payload);
+        var root = doc.RootElement;
+
+        var guildIdStr = root.GetProperty("GuildId").GetString();
+        var channelIdStr = root.GetProperty("ChannelId").GetString();
+        var messageIdStr = root.GetProperty("MessageId").GetString();
+
+        if (!ulong.TryParse(guildIdStr, out var guildId))
+        {
+            throw new InvalidOperationException("Invalid GuildId");
+        }
+
+        if (!ulong.TryParse(channelIdStr, out var channelId))
+        {
+            throw new InvalidOperationException("Invalid ChannelId");
+        }
+
+        if (!ulong.TryParse(messageIdStr, out var messageId))
+        {
+            throw new InvalidOperationException("Invalid MessageId");
+        }
+
+        var guild = _client.GetGuild(guildId);
+        if (guild is null)
+        {
+            throw new InvalidOperationException("Guild not found");
+        }
+
+        var channel = guild.GetChannel(channelId) as IMessageChannel;
+        if (channel is null)
+        {
+            throw new InvalidOperationException("Channel not found or does not support message deletion");
+        }
+
+        try
+        {
+            _suppressedDeleteLogMessageIds[messageId] = 0;
+            await channel.DeleteMessageAsync(messageId);
+        }
+        catch (Discord.Net.HttpException ex) when (ex.DiscordCode is DiscordErrorCode.UnknownMessage or DiscordErrorCode.UnknownChannel)
+        {
+            _logger.LogInformation("Message already missing when deleting from admin UI. GuildId={GuildId}, ChannelId={ChannelId}, MessageId={MessageId}",
+                guildId, channelId, messageId);
+        }
+        catch
+        {
+            _suppressedDeleteLogMessageIds.TryRemove(messageId, out _);
+            throw;
+        }
+        finally
+        {
+            _suppressedDeleteLogMessageIds.TryRemove(messageId, out _);
+        }
+
+        await _db.MarkMessageDeletedAsync(messageId);
+        return $"Deleted message {messageId} in channel {channelId}.";
     }
 
     private async Task RunVoiceSessionReconcileTickAsync(string source, bool repair)
@@ -2580,6 +2981,11 @@ public sealed class DiscordBotService : IHostedService
             return true;
         }
 
+        if (user.Roles.Any(role => role.Name.Contains("[コンテンツ]", StringComparison.OrdinalIgnoreCase)))
+        {
+            return true;
+        }
+
         if (exemptRoleNames.Count == 0)
         {
             return false;
@@ -4033,7 +4439,7 @@ public sealed class DiscordBotService : IHostedService
         if (beforeChannel is null && afterChannel is not null)
         {
             await CloseOpenVoiceSessionAsync(guild, user, now);
-            await _db.StartVoiceSessionAsync(guild.Id, afterChannel.Id, user.Id, user.ToString() ?? string.Empty, now);
+            await _db.StartVoiceSessionAsync(guild.Id, afterChannel.Id, afterChannel.Name, user.Id, user.ToString() ?? string.Empty, now);
         }
         else if (beforeChannel is not null && afterChannel is null)
         {
@@ -4042,7 +4448,7 @@ public sealed class DiscordBotService : IHostedService
         else if (beforeChannel is not null && afterChannel is not null)
         {
             await CloseVoiceSessionAsync(guild, user, beforeChannel, now);
-            await _db.StartVoiceSessionAsync(guild.Id, afterChannel.Id, user.Id, user.ToString() ?? string.Empty, now);
+            await _db.StartVoiceSessionAsync(guild.Id, afterChannel.Id, afterChannel.Name, user.Id, user.ToString() ?? string.Empty, now);
         }
 
         if (beforeChannel is not null && IsTempVoiceChannel(beforeChannel, lobby) && beforeChannel.ConnectedUsers.Count == 0)
@@ -4263,6 +4669,7 @@ public sealed class DiscordBotService : IHostedService
         await _db.UpsertMessageAsync(
             guildChannel.Guild.Id,
             guildChannel.Id,
+            guildChannel.Name,
             userMessage.Id,
             userMessage.Author.Id,
             userMessage.Author.ToString(),
@@ -4493,6 +4900,7 @@ public sealed class DiscordBotService : IHostedService
             await _db.UpsertReactionAsync(
                 guildChannel.Guild.Id,
                 guildChannel.Id,
+                guildChannel.Name,
                 reaction.MessageId,
                 reaction.UserId,
                 emojiKey,
@@ -5032,7 +5440,8 @@ public sealed class DiscordBotService : IHostedService
 
         var roleName = string.IsNullOrWhiteSpace(_options.AdminRoleName) ? "RaidDC Admin" : _options.AdminRoleName;
         return guildUser.Roles.Any(role =>
-            string.Equals(role.Name, roleName, StringComparison.OrdinalIgnoreCase));
+            string.Equals(role.Name, roleName, StringComparison.OrdinalIgnoreCase) ||
+            role.Name.Contains("[コンテンツ]", StringComparison.OrdinalIgnoreCase));
     }
 
     private static IRole? ResolveRole(SocketGuild guild, long roleId, string? roleName)

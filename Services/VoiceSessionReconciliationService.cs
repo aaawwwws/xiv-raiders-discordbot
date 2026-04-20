@@ -138,6 +138,7 @@ public sealed class VoiceSessionReconciliationService
                     await _db.StartVoiceSessionAsync(
                         guild.Id,
                         presence.ChannelId,
+                        guild.GetVoiceChannel(presence.ChannelId)?.Name ?? guild.GetChannel(presence.ChannelId)?.Name,
                         user.Id,
                         user.ToString() ?? user.Username ?? $"u:{user.Id}",
                         nowUtc);

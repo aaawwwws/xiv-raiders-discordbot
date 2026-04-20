@@ -540,6 +540,11 @@ public sealed class ControlPanelModule : InteractionModuleBase<SocketInteraction
             return true;
         }
 
+        if (user.Roles.Any(role => role.Name.Contains("[コンテンツ]", StringComparison.OrdinalIgnoreCase)))
+        {
+            return true;
+        }
+
         var settings = await _db.GetGuildSettingsAsync(user.Guild.Id);
         if (settings is null || settings.AdminRoleId == 0)
         {

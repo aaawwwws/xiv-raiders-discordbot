@@ -5219,13 +5219,8 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
     private IReadOnlyList<IRole> ResolveLotteryClaimManagerRoles(SocketGuild guild)
     {
         var roleNameSet = _options.BuildManagementRoleNameSet();
-        if (roleNameSet.Count == 0)
-        {
-            return Array.Empty<IRole>();
-        }
-
         return guild.Roles
-            .Where(role => roleNameSet.Contains(role.Name))
+            .Where(role => roleNameSet.Contains(role.Name) || role.Name.Contains("[コンテンツ]", StringComparison.OrdinalIgnoreCase))
             .Cast<IRole>()
             .ToList();
     }
@@ -8814,6 +8809,11 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
     private static bool IsInactiveKickExemptUser(SocketGuildUser user, IReadOnlySet<string> exemptRoleNames)
     {
         if (user.GuildPermissions.Administrator)
+        {
+            return true;
+        }
+
+        if (user.Roles.Any(role => role.Name.Contains("[コンテンツ]", StringComparison.OrdinalIgnoreCase)))
         {
             return true;
         }

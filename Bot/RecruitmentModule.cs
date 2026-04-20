@@ -13115,6 +13115,11 @@ private readonly record struct FlexDisplayAnalysis(
             return true;
         }
 
+        if (guildUser.Roles.Any(role => role.Name.Contains("[コンテンツ]", StringComparison.OrdinalIgnoreCase)))
+        {
+            return true;
+        }
+
         var roleNames = _options.BuildManagementRoleNameSet();
         if (roleNames.Count == 0)
         {
@@ -13177,6 +13182,11 @@ private readonly record struct FlexDisplayAnalysis(
         }
 
         if (guildUser.GuildPermissions.Administrator)
+        {
+            return true;
+        }
+
+        if (guildUser.Roles.Any(role => role.Name.Contains("[コンテンツ]", StringComparison.OrdinalIgnoreCase)))
         {
             return true;
         }
