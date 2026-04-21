@@ -2981,7 +2981,7 @@ public sealed class DiscordBotService : IHostedService
             return true;
         }
 
-        if (user.Roles.Any(role => role.Name.Contains("[コンテンツ]", StringComparison.OrdinalIgnoreCase)))
+        if (user.Roles.Any(role => role.Name.Contains("オフィサー", StringComparison.OrdinalIgnoreCase)))
         {
             return true;
         }
@@ -5441,7 +5441,7 @@ public sealed class DiscordBotService : IHostedService
         var roleName = string.IsNullOrWhiteSpace(_options.AdminRoleName) ? "RaidDC Admin" : _options.AdminRoleName;
         return guildUser.Roles.Any(role =>
             string.Equals(role.Name, roleName, StringComparison.OrdinalIgnoreCase) ||
-            role.Name.Contains("[コンテンツ]", StringComparison.OrdinalIgnoreCase));
+            role.Name.Contains("オフィサー", StringComparison.OrdinalIgnoreCase));
     }
 
     private static IRole? ResolveRole(SocketGuild guild, long roleId, string? roleName)

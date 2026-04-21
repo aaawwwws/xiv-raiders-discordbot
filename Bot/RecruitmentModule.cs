@@ -13115,7 +13115,7 @@ private readonly record struct FlexDisplayAnalysis(
             return true;
         }
 
-        if (guildUser.Roles.Any(role => role.Name.Contains("[コンテンツ]", StringComparison.OrdinalIgnoreCase)))
+        if (guildUser.Roles.Any(role => role.Name.Contains("オフィサー", StringComparison.OrdinalIgnoreCase)))
         {
             return true;
         }
@@ -13186,7 +13186,7 @@ private readonly record struct FlexDisplayAnalysis(
             return true;
         }
 
-        if (guildUser.Roles.Any(role => role.Name.Contains("[コンテンツ]", StringComparison.OrdinalIgnoreCase)))
+        if (guildUser.Roles.Any(role => role.Name.Contains("オフィサー", StringComparison.OrdinalIgnoreCase)))
         {
             return true;
         }

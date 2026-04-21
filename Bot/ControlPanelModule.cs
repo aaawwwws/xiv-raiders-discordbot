@@ -540,7 +540,7 @@ public sealed class ControlPanelModule : InteractionModuleBase<SocketInteraction
             return true;
         }
 
-        if (user.Roles.Any(role => role.Name.Contains("[コンテンツ]", StringComparison.OrdinalIgnoreCase)))
+        if (user.Roles.Any(role => role.Name.Contains("オフィサー", StringComparison.OrdinalIgnoreCase)))
         {
             return true;
         }

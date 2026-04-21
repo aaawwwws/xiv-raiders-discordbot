@@ -5220,7 +5220,8 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
     {
         var roleNameSet = _options.BuildManagementRoleNameSet();
         return guild.Roles
-            .Where(role => roleNameSet.Contains(role.Name) || role.Name.Contains("[コンテンツ]", StringComparison.OrdinalIgnoreCase))
+            .Where(role => roleNameSet.Contains(role.Name) || 
+                role.Name.Contains("オフィサー", StringComparison.OrdinalIgnoreCase))
             .Cast<IRole>()
             .ToList();
     }
@@ -8813,7 +8814,7 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
             return true;
         }
 
-        if (user.Roles.Any(role => role.Name.Contains("[コンテンツ]", StringComparison.OrdinalIgnoreCase)))
+        if (user.Roles.Any(role => role.Name.Contains("オフィサー", StringComparison.OrdinalIgnoreCase)))
         {
             return true;
         }
