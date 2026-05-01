@@ -121,7 +121,7 @@ public sealed class DiscordBotService : IHostedService
             throw new InvalidOperationException("Discord:Token is required.");
         }
 
-        await _db.ApplySchemaAsync();
+        await _db.ApplySchemaAsync(_logger);
         await _db.EnsureRecruitRequiredJobColumnAsync();
         await _db.ApplyRecruitDuplicateJobDiffSqlAsync();
         await _db.EnsureRecruitHostFlexSpecColumnAsync();
@@ -428,16 +428,24 @@ public sealed class DiscordBotService : IHostedService
                 _runtimeDiagnostics.Mark("startup.ready.begin", success: true, note: "OnReadyAsync");
                 await RegisterInteractionModulesAsync();
 
-                if (_options.GuildId != 0)
+                try
                 {
-                    await _interactions.RegisterCommandsToGuildAsync(_options.GuildId, true);
+                    if (_options.GuildId != 0)
+                    {
+                        await _interactions.RegisterCommandsToGuildAsync(_options.GuildId, true);
+                    }
+                    else
+                    {
+                        await _interactions.RegisterCommandsGloballyAsync(true);
+                    }
+                    _logger.LogInformation("Commands registered successfully.");
                 }
-                else
+                catch (Exception ex)
                 {
-                    await _interactions.RegisterCommandsGloballyAsync(true);
+                    _logger.LogError(ex, "Failed to register commands. Bot will continue without command registration. GuildId={GuildId}", _options.GuildId);
                 }
 
-                _logger.LogInformation("Bot ready. Commands registered.");
+                _logger.LogInformation("Bot ready.");
                 
                 await EnsureGuildResourcesAsync();
                 try
@@ -453,8 +461,15 @@ public sealed class DiscordBotService : IHostedService
 
                 foreach (var guild in _client.Guilds)
                 {
-                    await SyncGuildMemberProfilesAsync(guild);
-                    await TrySendStartupRecoveryAuditAsync(guild);
+                    try
+                    {
+                        await SyncGuildMemberProfilesAsync(guild);
+                        await TrySendStartupRecoveryAuditAsync(guild);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Failed to process guild startup. GuildId={GuildId}", guild.Id);
+                    }
                 }
                 if (ShouldRunActivityMaintenance())
                 {

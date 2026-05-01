@@ -1,5 +1,6 @@
 using Discord;
 using Dapper;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Npgsql;
 using RaidDcBot.Models;
@@ -559,30 +560,42 @@ ON public.inactive_kick_user_data_retentions (delete_after ASC);";
         await conn.ExecuteAsync(sql);
     }
 
-    public async Task ApplySchemaAsync()
+    public async Task ApplySchemaAsync(ILogger? logger = null)
     {
         var sql = DbSchema.Sql;
 
         // Phase 1: ensure all columns from CREATE TABLE blocks exist on existing tables
         var columnAlters = ExtractColumnAltersFromSchema(sql);
+        logger?.LogInformation("ApplySchema Phase 1: {Count} column alters extracted.", columnAlters.Count);
         await using var conn = CreateConnection();
         await conn.OpenAsync();
 
+        int alterSuccess = 0;
+        int alterSkipped = 0;
         foreach (var alter in columnAlters)
         {
             try
             {
                 await using var cmd = new NpgsqlCommand(alter, conn);
                 await cmd.ExecuteNonQueryAsync();
+                alterSuccess++;
+                logger?.LogDebug("Applied schema alter: {Sql}", alter);
             }
             catch (PostgresException ex) when (
                 ex.SqlState == "42701" ||
                 ex.SqlState == "42710" ||
                 ex.SqlState == "42P01")
             {
-                // ignore: duplicate_column, duplicate_object, undefined_table
+                alterSkipped++;
+                logger?.LogDebug("Skipped schema alter (already exists or table missing): {Sql} SqlState={SqlState}", alter, ex.SqlState);
+            }
+            catch (PostgresException ex)
+            {
+                logger?.LogWarning(ex, "Failed schema alter: {Sql} SqlState={SqlState}", alter, ex.SqlState);
+                throw;
             }
         }
+        logger?.LogInformation("ApplySchema Phase 1 complete. Applied={Applied}, Skipped={Skipped}", alterSuccess, alterSkipped);
 
         // Phase 2: run rest of schema (tables, sequences, indexes, constraints)
         var statements = new List<string>();
@@ -611,12 +624,15 @@ ON public.inactive_kick_user_data_retentions (delete_after ASC);";
                 statements.Add(stmt);
         }
 
+        int stmtSuccess = 0;
+        int stmtSkipped = 0;
         foreach (var stmt in statements)
         {
             try
             {
                 await using var cmd = new NpgsqlCommand(stmt, conn);
                 await cmd.ExecuteNonQueryAsync();
+                stmtSuccess++;
             }
             catch (PostgresException ex) when (
                 ex.SqlState == "42P07" ||
@@ -624,9 +640,16 @@ ON public.inactive_kick_user_data_retentions (delete_after ASC);";
                 ex.SqlState == "42710" ||
                 ex.SqlState == "42P16")
             {
-                // ignore idempotent errors
+                stmtSkipped++;
+                logger?.LogDebug("Skipped schema statement (already exists): SqlState={SqlState}", ex.SqlState);
+            }
+            catch (PostgresException ex)
+            {
+                logger?.LogWarning(ex, "Failed schema statement: {Sql} SqlState={SqlState}", stmt, ex.SqlState);
+                throw;
             }
         }
+        logger?.LogInformation("ApplySchema Phase 2 complete. Applied={Applied}, Skipped={Skipped}", stmtSuccess, stmtSkipped);
     }
 
     private static List<string> ExtractColumnAltersFromSchema(string schemaSql)
