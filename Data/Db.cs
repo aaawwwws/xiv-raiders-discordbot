@@ -562,6 +562,29 @@ ON public.inactive_kick_user_data_retentions (delete_after ASC);";
     public async Task ApplySchemaAsync()
     {
         var sql = DbSchema.Sql;
+
+        // Phase 1: ensure all columns from CREATE TABLE blocks exist on existing tables
+        var columnAlters = ExtractColumnAltersFromSchema(sql);
+        await using var conn = CreateConnection();
+        await conn.OpenAsync();
+
+        foreach (var alter in columnAlters)
+        {
+            try
+            {
+                await using var cmd = new NpgsqlCommand(alter, conn);
+                await cmd.ExecuteNonQueryAsync();
+            }
+            catch (PostgresException ex) when (
+                ex.SqlState == "42701" ||
+                ex.SqlState == "42710" ||
+                ex.SqlState == "42P01")
+            {
+                // ignore: duplicate_column, duplicate_object, undefined_table
+            }
+        }
+
+        // Phase 2: run rest of schema (tables, sequences, indexes, constraints)
         var statements = new List<string>();
         var buffer = new System.Text.StringBuilder();
 
@@ -588,9 +611,6 @@ ON public.inactive_kick_user_data_retentions (delete_after ASC);";
                 statements.Add(stmt);
         }
 
-        await using var conn = CreateConnection();
-        await conn.OpenAsync();
-
         foreach (var stmt in statements)
         {
             try
@@ -607,6 +627,75 @@ ON public.inactive_kick_user_data_retentions (delete_after ASC);";
                 // ignore idempotent errors
             }
         }
+    }
+
+    private static List<string> ExtractColumnAltersFromSchema(string schemaSql)
+    {
+        var alters = new List<string>();
+        var lines = schemaSql.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None);
+        string? currentTable = null;
+        bool inCreateTable = false;
+        int parenDepth = 0;
+
+        for (int i = 0; i < lines.Length; i++)
+        {
+            var line = lines[i];
+            var trimmed = line.TrimStart();
+
+            if (trimmed.StartsWith("CREATE TABLE", StringComparison.OrdinalIgnoreCase))
+            {
+                var match = System.Text.RegularExpressions.Regex.Match(
+                    trimmed,
+                    "CREATE TABLE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?(?<table>(?:\"[^\"]+\"\\.)?(?:\"[^\"]+\"|[\\w\\.]+))",
+                    System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                if (match.Success)
+                {
+                    currentTable = match.Groups["table"].Value;
+                }
+                inCreateTable = true;
+                parenDepth = line.Count(c => c == '(') - line.Count(c => c == ')');
+                continue;
+            }
+
+            if (!inCreateTable || currentTable is null) continue;
+
+            parenDepth += line.Count(c => c == '(') - line.Count(c => c == ')');
+
+            if (parenDepth <= 0)
+            {
+                inCreateTable = false;
+                currentTable = null;
+                continue;
+            }
+
+            // skip empty, comments, constraints, closing
+            if (string.IsNullOrWhiteSpace(trimmed) ||
+                trimmed.StartsWith("--") ||
+                trimmed.StartsWith(")"))
+                continue;
+
+            var upper = trimmed.ToUpperInvariant();
+            if (upper.StartsWith("CONSTRAINT ") ||
+                upper.StartsWith("PRIMARY KEY") ||
+                upper.StartsWith("UNIQUE ") ||
+                upper.StartsWith("CHECK ") ||
+                upper.StartsWith("FOREIGN KEY"))
+                continue;
+
+            var colMatch = System.Text.RegularExpressions.Regex.Match(
+                trimmed,
+                "^\"(?<col>[^\"]+)\"\\s+(?<def>.+)$");
+            if (!colMatch.Success) continue;
+
+            var colName = colMatch.Groups["col"].Value;
+            var colDef = colMatch.Groups["def"].Value.TrimEnd();
+            if (colDef.EndsWith(","))
+                colDef = colDef[..^1].TrimEnd();
+
+            alters.Add($"ALTER TABLE IF EXISTS {currentTable} ADD COLUMN IF NOT EXISTS \"{colName}\" {colDef};");
+        }
+
+        return alters;
     }
 
     public async Task EnsureInquiryTicketsTableAsync()
