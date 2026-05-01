@@ -914,9 +914,20 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
         try
         {
             var embed = await BuildMemberRegistrationReviewEmbedAsync(guildUser, completedProfile);
-            await reviewChannel.SendMessageAsync(
+            var message = await reviewChannel.SendMessageAsync(
                 embed: embed,
                 components: BuildMemberRegistrationReviewComponents(guildUser.Id));
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await _db.UpdateDiscordUserRegistrationReviewMessageIdAsync(guildUser.Id, message.Id);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to save registration review message id. GuildId={GuildId}, UserId={UserId}", Context.Guild.Id, guildUser.Id);
+                }
+            });
         }
         catch (Exception ex)
         {

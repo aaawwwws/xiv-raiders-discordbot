@@ -121,6 +121,7 @@ public sealed class DiscordBotService : IHostedService
             throw new InvalidOperationException("Discord:Token is required.");
         }
 
+        await _db.ApplySchemaAsync();
         await _db.EnsureRecruitRequiredJobColumnAsync();
         await _db.ApplyRecruitDuplicateJobDiffSqlAsync();
         await _db.EnsureRecruitHostFlexSpecColumnAsync();
@@ -133,6 +134,8 @@ public sealed class DiscordBotService : IHostedService
         await _db.EnsureDiscordUserProfileCharacterColumnsAsync();
         await _db.EnsureDiscordUserVoiceNotificationColumnAsync();
         await _db.EnsureDiscordUserVoiceTextAutoDeleteColumnsAsync();
+        await _db.EnsureDiscordUserStoryProgressionColumnAsync();
+        await _db.EnsureDiscordUserRegistrationReviewMessageIdColumnAsync();
         await _db.EnsureGuildLodestonePanelTableAsync();
         await _db.EnsureLodestoneCharacterExtrasCacheColumnsAsync();
         await _db.EnsureGuildAdminControlPanelTableAsync();

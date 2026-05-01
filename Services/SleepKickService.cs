@@ -471,6 +471,9 @@ public sealed class SleepKickService
 
         await LogVoteResultToDbAsync(vote, success ? "kicked" : "rejected", success ? "disconnected" : "vote_rejected");
 
+        if (success)
+            await DeleteRegistrationReviewMessageAsync(vote.GuildId, vote.TargetUserId);
+
         await UpdateVoteMessageAsync(vote, guildObj, component, messageText, success);
 
         if (guildObj != null)
@@ -553,6 +556,8 @@ public sealed class SleepKickService
 
             await UpdateLogMessageAsync(vote, guildObj, $"切断済み（管理者: {component.User.GlobalName ?? component.User.Username}）");
         }
+
+        await DeleteRegistrationReviewMessageAsync(vote.GuildId, vote.TargetUserId);
 
         _ = Task.Run(async () =>
         {
@@ -723,6 +728,8 @@ public sealed class SleepKickService
                         Color.Blue);
 
         await LogVoteResultToDbAsync(vote, "cancelled", reason);
+
+                    await DeleteRegistrationReviewMessageAsync(vote.GuildId, vote.TargetUserId);
 
                     await ModifyVoteMessageInChannelAsync(guild, vote, BuildResultEmbed(vote, false, reason), null);
 
@@ -1139,6 +1146,36 @@ public sealed class SleepKickService
             .WithColor(success ? Color.Green : Color.Blue)
             .WithCurrentTimestamp()
             .Build();
+    }
+
+    private async Task DeleteRegistrationReviewMessageAsync(ulong guildId, ulong targetUserId)
+    {
+        try
+        {
+            var profile = await _db.GetDiscordUserProfileAsync(targetUserId);
+            if (profile?.RegistrationReviewMessageId is not { } msgId || msgId == 0)
+                return;
+
+            var guild = _client.GetGuild(guildId);
+            if (guild == null) return;
+
+            var settings = await _db.GetGuildSettingsAsync(guildId);
+            if (settings?.RegistrationReviewChannelId == 0) return;
+
+            var channel = guild.GetTextChannel((ulong)settings.RegistrationReviewChannelId);
+            if (channel == null) return;
+
+            var msg = await channel.GetMessageAsync((ulong)msgId);
+            if (msg != null)
+            {
+                await msg.DeleteAsync();
+                await _db.UpdateDiscordUserRegistrationReviewMessageIdAsync(targetUserId, null);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to delete registration review message. GuildId={GuildId}, UserId={UserId}", guildId, targetUserId);
+        }
     }
 
     private static DateTimeOffset? GetEstimatedJoinTime(SocketGuildUser user)

@@ -155,6 +155,26 @@ ADD COLUMN IF NOT EXISTS discord_avatar_url TEXT NULL;";
         await conn.ExecuteAsync(sql);
     }
 
+    public async Task EnsureDiscordUserStoryProgressionColumnAsync()
+    {
+        const string sql = @"
+ALTER TABLE IF EXISTS discord_users
+ADD COLUMN IF NOT EXISTS story_progression TEXT NULL;";
+
+        await using var conn = CreateConnection();
+        await conn.ExecuteAsync(sql);
+    }
+
+    public async Task EnsureDiscordUserRegistrationReviewMessageIdColumnAsync()
+    {
+        const string sql = @"
+ALTER TABLE IF EXISTS discord_users
+ADD COLUMN IF NOT EXISTS registration_review_message_id BIGINT NULL;";
+
+        await using var conn = CreateConnection();
+        await conn.ExecuteAsync(sql);
+    }
+
     public async Task EnsureGuildLodestonePanelTableAsync()
     {
         const string sql = @"
@@ -539,6 +559,56 @@ ON public.inactive_kick_user_data_retentions (delete_after ASC);";
         await conn.ExecuteAsync(sql);
     }
 
+    public async Task ApplySchemaAsync()
+    {
+        var sql = DbSchema.Sql;
+        var statements = new List<string>();
+        var buffer = new System.Text.StringBuilder();
+
+        foreach (var rawLine in sql.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None))
+        {
+            var line = rawLine.TrimEnd();
+            if (string.IsNullOrWhiteSpace(line) || line.TrimStart().StartsWith("--"))
+                continue;
+
+            buffer.AppendLine(line);
+            if (line.TrimEnd().EndsWith(";"))
+            {
+                var stmt = buffer.ToString().Trim();
+                if (!string.IsNullOrWhiteSpace(stmt))
+                    statements.Add(stmt);
+                buffer.Clear();
+            }
+        }
+
+        if (buffer.Length > 0)
+        {
+            var stmt = buffer.ToString().Trim();
+            if (!string.IsNullOrWhiteSpace(stmt))
+                statements.Add(stmt);
+        }
+
+        await using var conn = CreateConnection();
+        await conn.OpenAsync();
+
+        foreach (var stmt in statements)
+        {
+            try
+            {
+                await using var cmd = new NpgsqlCommand(stmt, conn);
+                await cmd.ExecuteNonQueryAsync();
+            }
+            catch (PostgresException ex) when (
+                ex.SqlState == "42P07" ||
+                ex.SqlState == "42701" ||
+                ex.SqlState == "42710" ||
+                ex.SqlState == "42P16")
+            {
+                // ignore idempotent errors
+            }
+        }
+    }
+
     public async Task EnsureInquiryTicketsTableAsync()
     {
         const string sql = @"
@@ -794,6 +864,22 @@ SET display_name = EXCLUDED.display_name,
             DisplayName = displayName,
             DiscordName = discordName,
             DiscordAvatarUrl = NullIfBlank(discordAvatarUrl)
+        });
+    }
+
+    public async Task UpdateDiscordUserRegistrationReviewMessageIdAsync(ulong userId, ulong? messageId)
+    {
+        const string sql = @"
+UPDATE discord_users
+SET registration_review_message_id = @MessageId,
+    updated_at = NOW()
+WHERE discord_user_id = @UserId;";
+
+        await using var conn = CreateConnection();
+        await conn.ExecuteAsync(sql, new
+        {
+            UserId = ToDbId(userId),
+            MessageId = messageId.HasValue ? (long?)ToDbId(messageId.Value) : null
         });
     }
 
@@ -1188,6 +1274,7 @@ SELECT discord_user_id AS DiscordUserId,
        bluesky_handle AS BlueskyHandle,
        bio AS Bio,
        story_progression AS StoryProgression,
+       registration_review_message_id AS RegistrationReviewMessageId,
        updated_at AS UpdatedAt
 FROM discord_users
 WHERE discord_user_id = @UserId
@@ -1215,6 +1302,7 @@ SELECT discord_user_id AS DiscordUserId,
        bluesky_handle AS BlueskyHandle,
        bio AS Bio,
        story_progression AS StoryProgression,
+       registration_review_message_id AS RegistrationReviewMessageId,
        updated_at AS UpdatedAt
 FROM discord_users
 WHERE discord_user_id = ANY(@UserIds);";
@@ -1238,6 +1326,7 @@ SELECT discord_user_id AS DiscordUserId,
        bluesky_handle AS BlueskyHandle,
        bio AS Bio,
        story_progression AS StoryProgression,
+       registration_review_message_id AS RegistrationReviewMessageId,
        updated_at AS UpdatedAt
 FROM discord_users
 WHERE COALESCE(TRIM(ffxiv_name), '') <> ''
