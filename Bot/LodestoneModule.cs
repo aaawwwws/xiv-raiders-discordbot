@@ -23,6 +23,7 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
     private const string MemberRegistrationSubmitWithVoiceCustomId = "member_registration_submit_with_voice";
     private const string MemberRegistrationSubmitWithoutVoiceCustomId = "member_registration_submit_without_voice";
     private const string MemberProfileEditModalCustomId = "member_profile_edit_modal";
+    private const string MemberRegistrationStoryPrefix = "member_registration_story";
     private const string MemberRegistrationApprovePrefix = "member_registration_review_approve";
     private const string MemberRegistrationRejectPrefix = "member_registration_review_reject";
     private const string MemberRegistrationPendingPrefix = "member_registration_review_pending";
@@ -35,6 +36,16 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
     private const string MemberRegistrationAddNoteModalPrefix = "member_registration_review_add_note_modal";
     private const string CwlsChannelName = "cwls";
     private static readonly TimeSpan MemberRegistrationDraftTimeout = TimeSpan.FromMinutes(15);
+
+    private static readonly IReadOnlyDictionary<string, string> StoryProgressionOptions = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+    {
+        ["arr_hw"] = "新生〜蒼天",
+        ["sb"] = "紅蓮",
+        ["shb"] = "漆黒",
+        ["ew"] = "暁月",
+        ["dt"] = "黄金",
+        ["completed"] = "最新パッチ済み"
+    };
 
     private enum MemberRegistrationReviewAction
     {
@@ -427,7 +438,8 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
             currentDataCenter,
             xHandle,
             blueskyHandle,
-            bio);
+            bio,
+            storyProgression: null);
 
         await UpdateNicknameAsync(guildUser, ffxivName, currentWorld);
         await FollowupAsync("プロフィールを更新しました。", ephemeral: true);
@@ -564,7 +576,8 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
             dataCenterName,
             currentProfile.XHandle,
             currentProfile.BlueskyHandle,
-            currentProfile.Bio ?? string.Empty);
+            currentProfile.Bio ?? string.Empty,
+            storyProgression: null);
 
         await GrantDcRoleAsync(guildUser, dataCenterName);
         await UpdateNicknameAsync(guildUser, currentProfile.FfxivName ?? string.Empty, worldName);
@@ -610,6 +623,55 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
     public async Task HandleMemberRegistrationWorldSelectAsync(string dataCenterToken, string worldToken)
     {
         _memberRegistrationDrafts.PruneExpired(DateTimeOffset.UtcNow, MemberRegistrationDraftTimeout);
+        if (!_memberRegistrationDrafts.TryGet(Context.User.Id, out var draft))
+        {
+            await LogInvalidOperationAsync("メンバー登録期限切れ", $"👤 ユーザー: {FormatUser(Context.User)}");
+            await RespondAsync("登録情報の有効期限が切れました。もう一度「メンバー登録」から入力してください。", ephemeral: true);
+            return;
+        }
+
+        if (!TryResolveDataCenterFromToken(dataCenterToken, out var dataCenterName))
+        {
+            await LogInvalidOperationAsync(
+                "メンバー登録DC不正",
+                $"👤 ユーザー: {FormatUser(Context.User)}\n🏷️ token: {TruncateForLog(dataCenterToken, 80)}");
+            await RespondAsync("選択したDCを判定できませんでした。もう一度やり直してください。", ephemeral: true);
+            return;
+        }
+
+        if (!DcResolver.TryGetWorlds(dataCenterName, out var worlds) || worlds.Count == 0)
+        {
+            await LogFailureAsync(
+                "メンバー登録DCワールド取得失敗",
+                $"👤 ユーザー: {FormatUser(Context.User)}\n🌐 DC: {dataCenterName}");
+            await RespondAsync("このDCのサーバー一覧を取得できませんでした。", ephemeral: true);
+            return;
+        }
+
+        var worldName = worlds.FirstOrDefault(world =>
+            string.Equals(ToWorldToken(world), worldToken, StringComparison.OrdinalIgnoreCase));
+        if (string.IsNullOrWhiteSpace(worldName))
+        {
+            await LogInvalidOperationAsync(
+                "メンバー登録ワールド不正",
+                $"👤 ユーザー: {FormatUser(Context.User)}\n🌐 DC: {dataCenterName}\n🏷️ token: {TruncateForLog(worldToken, 80)}");
+            await RespondAsync("選択したサーバーを判定できませんでした。もう一度やり直してください。", ephemeral: true);
+            return;
+        }
+
+        _memberRegistrationDrafts.Set(Context.User.Id, draft with { StoryProgression = $"{dataCenterToken}:{worldToken}" });
+
+        await RespondAsync(
+            $"サーバーを選択しました: {worldName} [{dataCenterName}]\n" +
+            "現在のメインストーリーの進行度を選択してください。",
+            components: BuildStoryProgressionSelectComponents(dataCenterToken, worldToken),
+            ephemeral: true);
+    }
+
+    [ComponentInteraction("member_registration_story:*:*:*", ignoreGroupNames: true)]
+    public async Task HandleMemberRegistrationStorySelectAsync(string dataCenterToken, string worldToken, string storyKey)
+    {
+        _memberRegistrationDrafts.PruneExpired(DateTimeOffset.UtcNow, MemberRegistrationDraftTimeout);
         if (!_memberRegistrationDrafts.TryRemove(Context.User.Id, out var draft))
         {
             await LogInvalidOperationAsync("メンバー登録期限切れ", $"👤 ユーザー: {FormatUser(Context.User)}");
@@ -646,6 +708,8 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
             return;
         }
 
+        var storyProgression = StoryProgressionOptions.TryGetValue(storyKey, out var _) ? storyKey : null;
+
         await _db.EnsureDiscordUserAsync(Context.User.Id);
 
         var displayName = (Context.User as SocketGuildUser)?.DisplayName ?? Context.User.GlobalName ?? Context.User.Username;
@@ -657,12 +721,14 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
             dataCenterName,
             draft.XHandle,
             draft.BlueskyHandle,
-            draft.Bio);
+            draft.Bio,
+            storyProgression);
 
         var contentRoleDefinitions = await LoadMemberContentRoleDefinitionsAsync(Context.Guild!.Id);
         var contentRoleComponents = MemberContentRolePanel.BuildComponents(contentRoleDefinitions);
         var completedMessage =
             $"登録情報を受け付けました: {draft.FfxivName}@{worldName} [{dataCenterName}]\n" +
+            $"ストーリー進行度: {FormatStoryProgression(storyProgression)}\n" +
             "プレイ中のコンテンツロールを選択し、最後に「登録申請を送信」を押してください。";
         await RespondAsync(completedMessage, components: contentRoleComponents, ephemeral: true);
         await FollowupAsync(
@@ -936,7 +1002,15 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
             return RespondAsync("操作種別が不正です。", ephemeral: true);
         }
 
-        return HandleMemberRegistrationReviewAsync(userIdToken, action, skipDangerConfirmation: true);
+        ulong? originalMessageId = null;
+        var parts = userIdToken.Split(':', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length >= 2 && ulong.TryParse(parts[1], out var msgId))
+        {
+            originalMessageId = msgId;
+        }
+
+        var targetUserId = parts.Length >= 1 ? parts[0] : userIdToken;
+        return HandleMemberRegistrationReviewAsync(targetUserId, action, skipDangerConfirmation: true, originalMessageId: originalMessageId);
     }
 
     [RequireBotAdmin]
@@ -1024,7 +1098,8 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
     private async Task HandleMemberRegistrationReviewAsync(
         string userIdToken,
         MemberRegistrationReviewAction action,
-        bool skipDangerConfirmation = false)
+        bool skipDangerConfirmation = false,
+        ulong? originalMessageId = null)
     {
         if (Context.Guild is null)
         {
@@ -1206,6 +1281,37 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
             markError: false,
             targetUserId: targetUserId);
 
+        // Danger Confirmから呼ばれた場合、元のレビューメッセージも更新してボタンを消す
+        if (originalMessageId.HasValue && Context.Guild is not null && Context.Channel is ITextChannel textChannel)
+        {
+            try
+            {
+                var originalMessage = await textChannel.GetMessageAsync(originalMessageId.Value);
+                if (originalMessage is IUserMessage userMessage)
+                {
+                    var state = action switch
+                    {
+                        MemberRegistrationReviewAction.Approve => "承認済み",
+                        MemberRegistrationReviewAction.Reject => "拒否済み",
+                        MemberRegistrationReviewAction.Pending => "保留中",
+                        MemberRegistrationReviewAction.Kick => "キック済み",
+                        MemberRegistrationReviewAction.Ban => "BAN済み",
+                        _ => "処理済み"
+                    };
+                    var content = $"[{state}]\n対応: {GetMemberRegistrationActionLabel(action)}\n対象: {FormatUser(targetUser)}\n対応者: {FormatUser(Context.User)}";
+                    await userMessage.ModifyAsync(props =>
+                    {
+                        props.Content = content;
+                        props.Components = new ComponentBuilder().Build();
+                    });
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to update original review message. MessageId={MessageId}", originalMessageId.Value);
+            }
+        }
+
         await FollowupAsync(followupMessage, ephemeral: true);
     }
 
@@ -1228,6 +1334,12 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
         var target = Context.Guild.GetUser(targetUserId);
         var targetText = target is null ? $"<@{targetUserId}>" : $"{target.Mention} ({target})";
 
+        var payload = $"{targetUserId}";
+        if (Context.Interaction is SocketMessageComponent component && component.Message is IUserMessage msg)
+        {
+            payload = $"{targetUserId}:{msg.Id}";
+        }
+
         var embed = new EmbedBuilder()
             .WithTitle($"登録申請レビュー: {actionLabel}確認")
             .WithColor(Color.Red)
@@ -1237,7 +1349,7 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
         var components = new ComponentBuilder()
             .WithButton(
                 $"はい、{actionLabel}します",
-                $"{MemberRegistrationDangerConfirmPrefix}:{actionToken}:{targetUserId}",
+                $"{MemberRegistrationDangerConfirmPrefix}:{actionToken}:{payload}",
                 ButtonStyle.Danger,
                 row: 0)
             .WithButton(
@@ -1377,6 +1489,19 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
             .WithButton("付与しない", MemberRegistrationSubmitWithoutVoiceCustomId, ButtonStyle.Secondary, row: 0)
             .Build();
 
+    private static MessageComponent BuildStoryProgressionSelectComponents(string dataCenterToken, string worldToken)
+        => ProfileUI.BuildStoryProgressionSelect(key => $"{MemberRegistrationStoryPrefix}:{dataCenterToken}:{worldToken}:{key}");
+
+    private static string FormatStoryProgression(string? storyProgression)
+    {
+        if (string.IsNullOrWhiteSpace(storyProgression))
+        {
+            return "未設定";
+        }
+
+        return StoryProgressionOptions.TryGetValue(storyProgression, out var label) ? label : storyProgression;
+    }
+
     private static MessageComponent BuildMemberRegistrationReviewComponents(ulong userId)
         => new ComponentBuilder()
             .WithButton("許可", $"{MemberRegistrationApprovePrefix}:{userId}", ButtonStyle.Success, row: 0)
@@ -1389,37 +1514,10 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
             .Build();
 
     private static MessageComponent BuildDataCenterSelectComponents(string prefix)
-    {
-        var builder = new ComponentBuilder();
-        var names = DcResolver.KnownDcNames;
-        for (var i = 0; i < names.Count; i++)
-        {
-            var dcName = names[i];
-            builder.WithButton(
-                dcName,
-                $"{prefix}:{ToDataCenterToken(dcName)}",
-                ButtonStyle.Primary,
-                row: i / 5);
-        }
-
-        return builder.Build();
-    }
+        => ProfileUI.BuildDataCenterSelect(dcName => $"{prefix}:{ToDataCenterToken(dcName)}");
 
     private static MessageComponent BuildWorldSelectComponents(string prefix, string dataCenterName, IReadOnlyList<string> worlds)
-    {
-        var builder = new ComponentBuilder();
-        for (var i = 0; i < worlds.Count; i++)
-        {
-            var world = worlds[i];
-            builder.WithButton(
-                world,
-                $"{prefix}:{ToDataCenterToken(dataCenterName)}:{ToWorldToken(world)}",
-                ButtonStyle.Secondary,
-                row: i / 5);
-        }
-
-        return builder.Build();
-    }
+        => ProfileUI.BuildWorldSelect(worlds, world => $"{prefix}:{ToDataCenterToken(dataCenterName)}:{ToWorldToken(world)}");
 
     private static bool TryResolveDataCenterFromToken(string token, out string dataCenterName)
     {
@@ -1536,9 +1634,9 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
             }
         }
 
-        var channelName = string.IsNullOrWhiteSpace(_options.RegistrationReviewChannelName)
-            ? "登録確認"
-            : _options.RegistrationReviewChannelName;
+        var channelName = string.IsNullOrWhiteSpace(_options.AdminConfirmChannelName)
+            ? "管理-確認"
+            : _options.AdminConfirmChannelName;
         return guild.TextChannels.FirstOrDefault(channel =>
             string.Equals(channel.Name, channelName, StringComparison.OrdinalIgnoreCase));
     }
@@ -1671,6 +1769,7 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
         }
 
         var avatar = guildUser.GetAvatarUrl() ?? guildUser.GetDisplayAvatarUrl();
+        var storyText = FormatStoryProgression(profile.StoryProgression);
         var embed = new EmbedBuilder()
             .WithTitle(title)
             .WithColor(color)
@@ -1680,6 +1779,7 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
             .AddField("FFXIV", $"{ffxivName}@{ffxivWorld} [{dataCenter}]", false)
             .AddField("SNS", $"𝕏: {TruncateForLog(xText, 120)}\nBluesky: {TruncateForLog(blueskyText, 120)}", false)
             .AddField("一言", bio, false)
+            .AddField("ストーリー進行度", storyText, false)
             .AddField("コンテンツロール", selectedRoleText, false);
 
         if (includeDiscordDateFields)

@@ -30,6 +30,20 @@ public sealed class LodestoneClient
         _allowedHosts = hosts.ToHashSet(StringComparer.OrdinalIgnoreCase);
     }
 
+    public async Task<bool> IsAvailableAsync(CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Head, "https://jp.finalfantasyxiv.com/lodestone/");
+            var response = await _httpClient.SendAsync(request, cancellationToken);
+            return response.IsSuccessStatusCode;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     public bool TryExtractLodestoneId(string url, out long lodestoneId, out string error)
     {
         lodestoneId = 0;
@@ -344,8 +358,9 @@ public sealed class LodestoneClient
         {
             throw;
         }
-        catch
+        catch (Exception ex)
         {
+            System.Console.WriteLine($"[LodestoneDebug] TryFetchOptionalHtmlAsync FAILED for {url}: {ex.Message}");
             return null;
         }
     }
@@ -1398,8 +1413,18 @@ public sealed class LodestoneClient
 
     private static bool IsUnsupportedBrowser(string html)
     {
-        return html.Contains("unsupported_browser", StringComparison.OrdinalIgnoreCase)
-            || html.Contains("Your browser is not supported", StringComparison.OrdinalIgnoreCase)
-            || html.Contains("ご利用のブラウザ", StringComparison.OrdinalIgnoreCase);
+        if (html.Contains("Your browser is not supported", StringComparison.OrdinalIgnoreCase)
+            || html.Contains("ご利用のブラウザ", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        if (html.Contains("unsupported_browser", StringComparison.OrdinalIgnoreCase))
+        {
+            return html.Contains("/lodestone/error/unsupported_browser", StringComparison.OrdinalIgnoreCase)
+                && !html.Contains("entry__achievement", StringComparison.OrdinalIgnoreCase);
+        }
+
+        return false;
     }
 }

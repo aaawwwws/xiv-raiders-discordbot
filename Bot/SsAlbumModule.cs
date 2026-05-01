@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Globalization;
 using System.Text.Json;
 using Discord;
 using Discord.Interactions;
@@ -70,6 +71,48 @@ public sealed class SsAlbumModule : InteractionModuleBase<SocketInteractionConte
         await DeferAsync(ephemeral: true);
         var message = await EnsurePanelMessageAsync(channel);
         await FollowupAsync($"このチャンネルにSSアルバムパネルを設置しました。(message: {message.Id})", ephemeral: true);
+    }
+
+    [RequireBotAdmin]
+    [SlashCommand("scan", "#ssチャンネルの過去画像をスキャンしてアルバムに登録します")]
+    public async Task ScanAsync([Summary("max_messages", "スキャンする最大メッセージ数（既定: 5000）")] int maxMessages = 5000)
+    {
+        if (Context.Guild is null)
+        {
+            await RespondAsync("このコマンドはサーバー内でのみ使えます。", ephemeral: true);
+            return;
+        }
+
+        var ssChannel = ResolveSsChannel(Context.Guild);
+        if (ssChannel is null)
+        {
+            await RespondAsync("`#ss` チャンネルが見つかりません。", ephemeral: true);
+            return;
+        }
+
+        await DeferAsync(ephemeral: true);
+        _logger.LogInformation("SS album scan started. GuildId={GuildId}, ChannelId={ChannelId}, MaxMessages={MaxMessages}", Context.Guild.Id, ssChannel.Id, maxMessages);
+
+        var limit = Math.Clamp(maxMessages, 100, 20000);
+        var result = await ScanSsChannelAsync(Context.Guild, ssChannel, limit);
+
+        _logger.LogInformation("SS album scan completed. GuildId={GuildId}, Scanned={Scanned}, Images={Images}, Archived={Archived}, Errors={Errors}",
+            Context.Guild.Id, result.ScannedMessages, result.ImageCount, result.ArchivedCount, result.ErrorCount);
+
+        var embed = new EmbedBuilder()
+            .WithTitle("SSアルバムスキャン完了")
+            .WithColor(result.ErrorCount > 0 ? Discord.Color.Orange : Discord.Color.Green)
+            .AddField("スキャン対象", $"{MentionUtils.MentionChannel(ssChannel.Id)}", true)
+            .AddField("走査メッセージ", $"{result.ScannedMessages} 件", true)
+            .AddField("登録画像", $"{result.ImageCount} 枚", true)
+            .AddField("アーカイブ成功", $"{result.ArchivedCount} 枚", true)
+            .AddField("スキップ（既存）", $"{result.SkippedCount} 件", true)
+            .AddField("エラー", $"{result.ErrorCount} 件", true)
+            .WithFooter($"上限: {limit} 件")
+            .WithCurrentTimestamp()
+            .Build();
+
+        await FollowupAsync(embed: embed, ephemeral: true);
     }
 
     [SlashCommand("me", "自分のSSアルバムを表示します")]
@@ -604,6 +647,222 @@ public sealed class SsAlbumModule : InteractionModuleBase<SocketInteractionConte
         var builtEmbed = embed.Build();
         var components = BuildAlbumPagingComponents(state, page, totalPages, entries.Count, pageEntries, favoriteKeys);
         return AlbumRenderResult.Ok(builtEmbed, components, collagePng, collageFileName);
+    }
+
+    private async Task<ScanResult> ScanSsChannelAsync(SocketGuild guild, SocketTextChannel channel, int maxMessages)
+    {
+        var scanned = 0;
+        var imageCount = 0;
+        var archivedCount = 0;
+        var skippedCount = 0;
+        var errorCount = 0;
+        ulong? lastMessageId = null;
+        const int batchSize = 100;
+
+        while (scanned < maxMessages)
+        {
+            var remaining = maxMessages - scanned;
+            var currentBatch = Math.Min(batchSize, remaining);
+            IAsyncEnumerable<IReadOnlyCollection<IMessage>> messageBatches;
+            try
+            {
+                messageBatches = lastMessageId.HasValue
+                    ? channel.GetMessagesAsync(lastMessageId.Value, Direction.Before, currentBatch)
+                    : channel.GetMessagesAsync(currentBatch);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to fetch message batch for SS scan. GuildId={GuildId}, ChannelId={ChannelId}", guild.Id, channel.Id);
+                errorCount++;
+                break;
+            }
+
+            var batchMessages = new List<IMessage>();
+            await foreach (var batch in messageBatches)
+            {
+                batchMessages.AddRange(batch);
+            }
+
+            if (batchMessages.Count == 0)
+            {
+                break;
+            }
+
+            foreach (var message in batchMessages)
+            {
+                if (message is not IUserMessage userMessage || message.Author.IsBot)
+                {
+                    continue;
+                }
+
+                scanned++;
+                var imageAttachments = userMessage.Attachments.Where(a => IsImageLike(a.ContentType, a.Filename)).ToList();
+                if (imageAttachments.Count == 0)
+                {
+                    continue;
+                }
+
+                var archivedPaths = await ScanArchiveAttachmentsAsync(guild.Id, channel.Id, message.Id, message.Timestamp, imageAttachments);
+                archivedCount += archivedPaths.Count;
+
+                var attachmentsJson = BuildScanAttachmentsJson(imageAttachments, archivedPaths);
+                var embedsJson = BuildScanEmbedsJson(userMessage.Embeds);
+                var authorDisplayName = userMessage.Author is SocketGuildUser gu ? gu.DisplayName : null;
+                var authorName = message.Author.ToString() ?? "unknown";
+
+                try
+                {
+                    await _db.UpsertMessageAsync(
+                        guild.Id,
+                        channel.Id,
+                        channel.Name,
+                        message.Id,
+                        message.Author.Id,
+                        authorName,
+                        authorDisplayName,
+                        userMessage.Content ?? string.Empty,
+                        userMessage.Attachments.Count,
+                        userMessage.Embeds.Count,
+                        attachmentsJson,
+                        embedsJson,
+                        message.Timestamp);
+                    imageCount += imageAttachments.Count;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to upsert message during SS scan. MessageId={MessageId}", message.Id);
+                    errorCount++;
+                }
+            }
+
+            lastMessageId = batchMessages.Last().Id;
+            if (batchMessages.Count < currentBatch)
+            {
+                break;
+            }
+
+            await Task.Delay(250);
+        }
+
+        return new ScanResult(scanned, imageCount, archivedCount, skippedCount, errorCount);
+    }
+
+    private async Task<IReadOnlyDictionary<ulong, string>> ScanArchiveAttachmentsAsync(
+        ulong guildId,
+        ulong channelId,
+        ulong messageId,
+        DateTimeOffset messageTimestamp,
+        IReadOnlyCollection<IAttachment> attachments)
+    {
+        if (attachments.Count == 0 || string.IsNullOrWhiteSpace(_attachmentArchiveRootPath))
+        {
+            return new Dictionary<ulong, string>();
+        }
+
+        var messageDir = Path.Combine(
+            _attachmentArchiveRootPath,
+            guildId.ToString(CultureInfo.InvariantCulture),
+            messageTimestamp.ToString("yyyy", CultureInfo.InvariantCulture),
+            messageTimestamp.ToString("MM", CultureInfo.InvariantCulture),
+            messageTimestamp.ToString("dd", CultureInfo.InvariantCulture),
+            channelId.ToString(CultureInfo.InvariantCulture),
+            messageId.ToString(CultureInfo.InvariantCulture));
+        Directory.CreateDirectory(messageDir);
+
+        var archivedPaths = new Dictionary<ulong, string>();
+        foreach (var attachment in attachments)
+        {
+            var fileName = $"{attachment.Id}_{attachment.Filename}";
+            var absolutePath = Path.Combine(messageDir, fileName);
+            if (File.Exists(absolutePath))
+            {
+                archivedPaths[attachment.Id] = absolutePath;
+                continue;
+            }
+
+            var sourceUrl = !string.IsNullOrWhiteSpace(attachment.Url) ? attachment.Url : attachment.ProxyUrl;
+            if (string.IsNullOrWhiteSpace(sourceUrl))
+            {
+                continue;
+            }
+
+            try
+            {
+                using var response = await SsAlbumImageHttpClient.GetAsync(sourceUrl, HttpCompletionOption.ResponseHeadersRead);
+                if (!response.IsSuccessStatusCode)
+                {
+                    continue;
+                }
+
+                await using var input = await response.Content.ReadAsStreamAsync();
+                await using var output = new FileStream(absolutePath, FileMode.Create, FileAccess.Write, FileShare.Read, 81920, useAsync: true);
+                await input.CopyToAsync(output);
+                archivedPaths[attachment.Id] = absolutePath;
+            }
+            catch
+            {
+                TryDeleteFile(absolutePath);
+            }
+        }
+
+        return archivedPaths;
+    }
+
+    private static string? BuildScanAttachmentsJson(IReadOnlyCollection<IAttachment> attachments, IReadOnlyDictionary<ulong, string> archivedPaths)
+    {
+        if (attachments.Count == 0)
+        {
+            return null;
+        }
+
+        var snapshots = attachments.Select(attachment => new ScanAttachmentSnapshot(
+            attachment.Id,
+            attachment.Url,
+            attachment.ProxyUrl,
+            attachment.Filename,
+            attachment.Size,
+            attachment.ContentType,
+            attachment.Height,
+            attachment.Width,
+            attachment.IsSpoiler(),
+            archivedPaths.TryGetValue(attachment.Id, out var path) ? path : null)).ToList();
+
+        return JsonSerializer.Serialize(snapshots);
+    }
+
+    private static string? BuildScanEmbedsJson(IReadOnlyCollection<Discord.IEmbed> embeds)
+    {
+        if (embeds.Count == 0)
+        {
+            return null;
+        }
+
+        var snapshots = embeds.Select(embed => new ScanEmbedSnapshot(
+            embed.Type.ToString(),
+            embed.Title,
+            embed.Description,
+            embed.Url,
+            embed.Author?.Name,
+            embed.Footer?.Text,
+            embed.Image?.Url,
+            embed.Thumbnail?.Url)).ToList();
+
+        return JsonSerializer.Serialize(snapshots);
+    }
+
+    private static void TryDeleteFile(string path)
+    {
+        try
+        {
+            if (File.Exists(path))
+            {
+                File.Delete(path);
+            }
+        }
+        catch
+        {
+            // ignored
+        }
     }
 
     private async Task<IUserMessage> EnsurePanelMessageAsync(IMessageChannel channel)
@@ -1592,6 +1851,35 @@ public sealed class SsAlbumModule : InteractionModuleBase<SocketInteractionConte
         public static AlbumDetailResult Fail(string message)
             => new() { Success = false, ErrorMessage = message };
     }
+
+    private sealed record ScanResult(
+        int ScannedMessages,
+        int ImageCount,
+        int ArchivedCount,
+        int SkippedCount,
+        int ErrorCount);
+
+    private sealed record ScanAttachmentSnapshot(
+        ulong Id,
+        string? Url,
+        string? ProxyUrl,
+        string? Filename,
+        int Size,
+        string? ContentType,
+        int? Height,
+        int? Width,
+        bool IsSpoiler,
+        string? LocalPath);
+
+    private sealed record ScanEmbedSnapshot(
+        string? Type,
+        string? Title,
+        string? Description,
+        string? Url,
+        string? AuthorName,
+        string? FooterText,
+        string? ImageUrl,
+        string? ThumbnailUrl);
 }
 
 public sealed class SsAlbumFilterModal : IModal

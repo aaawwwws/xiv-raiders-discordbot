@@ -12,13 +12,36 @@ public sealed class ControlPanelModule : InteractionModuleBase<SocketInteraction
 {
     private readonly Db _db;
     private readonly VoiceChannelTextService _voiceTextService;
+    private readonly SleepKickService _sleepKickService;
     private readonly DiscordOptions _options;
 
-    public ControlPanelModule(Db db, VoiceChannelTextService voiceTextService, IOptions<DiscordOptions> options)
+    public ControlPanelModule(Db db, VoiceChannelTextService voiceTextService, SleepKickService sleepKickService, IOptions<DiscordOptions> options)
     {
         _db = db;
         _voiceTextService = voiceTextService;
+        _sleepKickService = sleepKickService;
         _options = options.Value;
+    }
+
+    [SlashCommand("vc-status", "現在のVCにステータスプロンプトを表示します")]
+    [CommandContextType(InteractionContextType.Guild)]
+    public async Task VcStatusAsync()
+    {
+        if (Context.User is not SocketGuildUser guildUser)
+        {
+            await RespondAsync("このコマンドはサーバー内でのみ使えます。", ephemeral: true);
+            return;
+        }
+
+        var channel = guildUser.VoiceChannel;
+        if (channel is null)
+        {
+            await RespondAsync("VCに参加してから実行してください。", ephemeral: true);
+            return;
+        }
+
+        await _voiceTextService.UpsertStatusPromptAsync(channel, guildUser);
+        await RespondAsync("VCステータスプロンプトを表示しました。", ephemeral: true);
     }
 
     [ComponentInteraction("voice_rename", ignoreGroupNames: true)]
@@ -186,6 +209,144 @@ public sealed class ControlPanelModule : InteractionModuleBase<SocketInteraction
         await channel.SetStatusAsync(string.Empty);
         await _voiceTextService.UpsertStatusPromptAsync(channel, guildUser, "VCステータスをクリアしました。");
         await FollowupAsync("VCステータスをクリアしました。", ephemeral: true);
+    }
+
+    [ComponentInteraction(VoiceChannelTextService.StatusPromptSleepKickCustomId, ignoreGroupNames: true)]
+    public async Task OpenSleepKickSelectAsync()
+    {
+        if (Context.Guild is null || Context.User is not SocketGuildUser guildUser)
+        {
+            await RespondAsync("この操作はサーバー内でのみ使えます。", ephemeral: true);
+            return;
+        }
+
+        var (channel, error) = TryGetVoiceChannelFromPromptContext(guildUser);
+        if (channel is null)
+        {
+            await RespondAsync(error ?? "このVCテキストからのみ操作できます。", ephemeral: true);
+            return;
+        }
+
+        var candidates = channel.ConnectedUsers
+            .Where(u => !u.IsBot && u.Id != guildUser.Id)
+            .OrderBy(u => u.DisplayName ?? u.GlobalName ?? u.Username, StringComparer.OrdinalIgnoreCase)
+            .Take(25)
+            .ToList();
+
+        if (candidates.Count == 0)
+        {
+            await RespondAsync("投票対象がいません。", ephemeral: true);
+            return;
+        }
+
+        var menu = new SelectMenuBuilder()
+            .WithCustomId(VoiceChannelTextService.StatusPromptSleepKickSelectCustomId)
+            .WithPlaceholder("寝落ち対象を選択")
+            .WithMinValues(1)
+            .WithMaxValues(1);
+
+        foreach (var candidate in candidates)
+        {
+            var label = BuildUserLabel(candidate);
+            var suffix = candidate.IsSelfMuted || candidate.IsMuted ? " 🔇" : "";
+            menu.AddOption(label + suffix, candidate.Id.ToString(), $"{candidate.Username}");
+        }
+
+        var component = new ComponentBuilder()
+            .WithSelectMenu(menu)
+            .Build();
+
+        await RespondAsync("寝落ち投票の対象を選んでください。", components: component, ephemeral: true);
+    }
+
+    [ComponentInteraction(VoiceChannelTextService.StatusPromptSleepKickSelectCustomId, ignoreGroupNames: true)]
+    public async Task HandleSleepKickSelectAsync(string[] values)
+    {
+        if (Context.Guild is null || Context.User is not SocketGuildUser guildUser)
+        {
+            await RespondAsync("この操作はサーバー内でのみ使えます。", ephemeral: true);
+            return;
+        }
+
+        var targetId = values is { Length: > 0 } && ulong.TryParse(values[0], out var parsed)
+            ? parsed
+            : (ulong?)null;
+
+        if (!targetId.HasValue)
+        {
+            await RespondAsync("対象ユーザーを選択してください。", ephemeral: true);
+            return;
+        }
+
+        var targetUser = Context.Guild.GetUser(targetId.Value);
+        if (targetUser is null || targetUser.VoiceChannel is null)
+        {
+            await RespondAsync("対象ユーザーがVCに接続していません。", ephemeral: true);
+            return;
+        }
+
+        var vcName = targetUser.VoiceChannel.Name;
+        var isMuted = targetUser.IsSelfMuted || targetUser.IsMuted;
+        var embed = new EmbedBuilder()
+            .WithTitle("😴 寝落ち投票の確認")
+            .WithDescription(
+                $"対象: {MentionUtils.MentionUser(targetUser.Id)}\n" +
+                $"VC: {vcName}\n" +
+                $"ミュート: {(isMuted ? "あり" : "なし")}")
+            .AddField(
+                "⚠️ 注意",
+                "この機能は相手に対して切断を伴う操作です。対象が本当に寝落ちしているか確認してから投票してください。",
+                false)
+            .WithColor(Color.Orange)
+            .WithCurrentTimestamp()
+            .Build();
+
+        var components = new ComponentBuilder()
+            .WithButton("投票開始", $"{VoiceChannelTextService.StatusPromptSleepKickConfirmCustomId}:{targetUser.Id}", ButtonStyle.Success)
+            .WithButton("キャンセル", $"{VoiceChannelTextService.StatusPromptSleepKickConfirmCustomId}:0", ButtonStyle.Secondary)
+            .Build();
+
+        await RespondAsync(embed: embed, components: components, ephemeral: true);
+    }
+
+    [ComponentInteraction($"{VoiceChannelTextService.StatusPromptSleepKickConfirmCustomId}:*", ignoreGroupNames: true)]
+    public async Task HandleSleepKickConfirmAsync(string payload)
+    {
+        if (Context.Guild is null || Context.User is not SocketGuildUser guildUser)
+        {
+            await RespondAsync("この操作はサーバー内でのみ使えます。", ephemeral: true);
+            return;
+        }
+
+        if (Context.Interaction is SocketMessageComponent component && component.Message is IUserMessage msg)
+        {
+            try { await msg.DeleteAsync(); } catch { }
+        }
+
+        await DeferAsync(ephemeral: true);
+
+        if (!ulong.TryParse(payload, out var targetId) || targetId == 0)
+        {
+            await FollowupAsync("キャンセルしました。", ephemeral: true);
+            return;
+        }
+
+        var targetUser = Context.Guild.GetUser(targetId);
+        if (targetUser is null || targetUser.VoiceChannel is null)
+        {
+            await FollowupAsync("対象ユーザーがVCに接続していません。", ephemeral: true);
+            return;
+        }
+
+        var started = await _sleepKickService.StartVoteAsync(Context.Guild, null, targetUser, guildUser.Id);
+        if (started)
+        {
+            await FollowupAsync($"{MentionUtils.MentionUser(targetUser.Id)} の寝落ち切断投票を開始しました。", ephemeral: true);
+        }
+        else
+        {
+            await FollowupAsync("投票の開始に失敗しました。クールダウン中か設定が無効です。", ephemeral: true);
+        }
     }
 
     [ModalInteraction("voice_rename_modal", ignoreGroupNames: true)]

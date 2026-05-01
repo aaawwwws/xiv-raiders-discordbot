@@ -2,6 +2,7 @@ using Discord;
 using Discord.WebSocket;
 using Microsoft.Extensions.Logging;
 using RaidDcBot.Bot;
+using RaidDcBot.Data;
 using System.Collections.Concurrent;
 
 namespace RaidDcBot.Services;
@@ -11,21 +12,28 @@ public sealed class VoiceChannelTextService
     public const string StatusPromptSetCustomId = "voice_status_prompt_set";
     public const string StatusPromptClearCustomId = "voice_status_prompt_clear";
     public const string StatusPromptModalCustomId = "voice_status_prompt_modal";
+    public const string StatusPromptSleepKickCustomId = "voice_status_sleep_kick";
+    public const string StatusPromptSleepKickSelectCustomId = "voice_status_sleep_kick_select";
+    public const string StatusPromptSleepKickConfirmCustomId = "voice_status_sleep_kick_confirm";
 
     private readonly DiscordSocketClient _client;
     private readonly VoiceTransferTracker _tracker;
     private readonly ILogger<VoiceChannelTextService> _logger;
+    private readonly Db _db;
     private readonly ConcurrentDictionary<ulong, ulong> _statusPromptMessageIds = new();
     private readonly ConcurrentDictionary<ulong, DateTimeOffset> _statusPromptTouchedAt = new();
+    private static readonly ConcurrentDictionary<ulong, DateTimeOffset> _spoilerWarningCooldowns = new();
 
     public VoiceChannelTextService(
         DiscordSocketClient client,
         VoiceTransferTracker tracker,
-        ILogger<VoiceChannelTextService> logger)
+        ILogger<VoiceChannelTextService> logger,
+        Db db)
     {
         _client = client;
         _tracker = tracker;
         _logger = logger;
+        _db = db;
     }
 
     public async Task<IMessageChannel?> ResolveAsync(SocketVoiceChannel channel)
@@ -270,6 +278,7 @@ public sealed class VoiceChannelTextService
         return new ComponentBuilder()
             .WithButton("ステータス設定", StatusPromptSetCustomId, ButtonStyle.Primary, row: 0)
             .WithButton("クリア", StatusPromptClearCustomId, ButtonStyle.Danger, row: 0)
+            .WithButton("😴 寝落ち投票", StatusPromptSleepKickCustomId, ButtonStyle.Secondary, row: 0)
             .Build();
     }
 
@@ -286,4 +295,86 @@ public sealed class VoiceChannelTextService
     }
 
     private static string MentionUser(ulong userId) => $"<@{userId}>";
+
+    public async Task TrySendSpoilerWarningAsync(SocketGuildUser user, SocketVoiceChannel channel)
+    {
+        try
+        {
+            _logger.LogInformation("SpoilerWarning start. UserId={UserId}, ChannelId={ChannelId}", user.Id, channel.Id);
+
+            var profile = await _db.GetDiscordUserProfileAsync(user.Id);
+            var storyProgression = profile?.StoryProgression;
+            _logger.LogInformation("SpoilerWarning profile. UserId={UserId}, StoryProgression={StoryProgression}", user.Id, storyProgression);
+
+            if (string.IsNullOrWhiteSpace(storyProgression) || storyProgression == "completed")
+            {
+                _logger.LogInformation("SpoilerWarning skipped (no progression or completed). UserId={UserId}", user.Id);
+                return;
+            }
+
+            var now = DateTimeOffset.UtcNow;
+            if (_spoilerWarningCooldowns.TryGetValue(user.Id, out var lastWarning) &&
+                now - lastWarning < TimeSpan.FromHours(1))
+            {
+                _logger.LogInformation("SpoilerWarning skipped (cooldown). UserId={UserId}, LastWarning={LastWarning}", user.Id, lastWarning);
+                return;
+            }
+
+            var textChannel = await ResolveAsync(channel);
+            if (textChannel is null)
+            {
+                _logger.LogWarning("SpoilerWarning skipped (no text channel). UserId={UserId}, ChannelId={ChannelId}", user.Id, channel.Id);
+                return;
+            }
+
+            var label = storyProgression switch
+            {
+                "arr_hw" => "新生〜蒼天",
+                "sb" => "紅蓮",
+                "shb" => "漆黒",
+                "ew" => "暁月",
+                "dt" => "黄金",
+                _ => storyProgression
+            };
+
+            var allMentions = channel.ConnectedUsers
+                .Where(u => !u.IsBot && u.Id != user.Id)
+                .Select(u => MentionUser(u.Id))
+                .ToList();
+            var mentionText = allMentions.Count > 0
+                ? string.Join(" ", allMentions)
+                : "@here";
+
+            var guildUser = channel.Guild.GetUser(user.Id);
+            var displayName = guildUser?.DisplayName ?? guildUser?.GlobalName ?? user.GlobalName ?? user.Username;
+
+            var embed = new EmbedBuilder()
+                .WithTitle("⚠️ ネタバレ注意")
+                .WithDescription(
+                    $"{displayName}さんが入室しました。\n" +
+                    $"この人は現在 **{label}** までの進行度です。\n" +
+                    "最新ストーリーのネタバレにご注意ください。")
+                .WithColor(Color.Orange)
+                .WithCurrentTimestamp()
+                .Build();
+
+            var components = new ComponentBuilder()
+                .WithButton("📖 進行度を変更", SettingsPanel.ChangeSelfStoryProgressionCustomId, ButtonStyle.Secondary)
+                .Build();
+
+            _logger.LogInformation("SpoilerWarning sending. UserId={UserId}, TextChannelId={TextChannelId}, MentionCount={MentionCount}", user.Id, textChannel.Id, allMentions.Count);
+
+            await textChannel.SendMessageAsync(
+                text: mentionText,
+                embed: embed,
+                components: components);
+
+            _spoilerWarningCooldowns[user.Id] = now;
+            _logger.LogInformation("SpoilerWarning sent successfully. UserId={UserId}", user.Id);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to send spoiler warning for user {UserId}", user.Id);
+        }
+    }
 }

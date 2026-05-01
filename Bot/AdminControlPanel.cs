@@ -27,7 +27,14 @@ public static class AdminControlPanel
     public const string RegistrationPendingListCustomId = "admin_registration_pending_list";
     public const string ToggleRegistrationApprovalCustomId = "admin_toggle_registration_approval";
     public const string ToggleInactiveAutoKickCustomId = "admin_toggle_inactive_auto_kick";
+    public const string ToggleSleepKickAdminConfirmCustomId = "admin_toggle_sleep_kick_admin_confirm";
     public const string ResyncPanelsCustomId = "settings_panels_resync";
+    public const string OpenContentRoleCategoryCustomId = "admin_category_content_role";
+    public const string ContentRoleListCustomId = "admin_content_role_list";
+    public const string ContentRoleAddCustomId = "admin_content_role_add";
+    public const string ContentRoleRemoveSelectCustomId = "admin_content_role_remove_select";
+    public const string ContentRoleResyncCustomId = "admin_content_role_resync";
+    public const string ContentRoleBackCustomId = "admin_content_role_back";
 
     public static MessageComponent BuildComponents(bool registrationApprovalRequired, bool inactiveAutoKickEnabled)
     {
@@ -63,16 +70,19 @@ public static class AdminControlPanel
             .Build();
     }
 
-    public static MessageComponent BuildSettingsCategoryComponents(bool registrationApprovalRequired, bool inactiveAutoKickEnabled)
+    public static MessageComponent BuildSettingsCategoryComponents(bool registrationApprovalRequired, bool inactiveAutoKickEnabled, bool sleepKickAdminConfirm)
     {
         var approvalToggleLabel = registrationApprovalRequired ? "登録確認をOFF" : "登録確認をON";
         var approvalToggleStyle = registrationApprovalRequired ? ButtonStyle.Danger : ButtonStyle.Success;
         var autoKickToggleLabel = inactiveAutoKickEnabled ? "自動キックをOFF" : "自動キックをON";
         var autoKickToggleStyle = inactiveAutoKickEnabled ? ButtonStyle.Danger : ButtonStyle.Success;
+        var sleepKickToggleLabel = sleepKickAdminConfirm ? "寝落ち管理者確認をOFF" : "寝落ち管理者確認をON";
+        var sleepKickToggleStyle = sleepKickAdminConfirm ? ButtonStyle.Danger : ButtonStyle.Success;
 
         return new ComponentBuilder()
             .WithButton(approvalToggleLabel, ToggleRegistrationApprovalCustomId, approvalToggleStyle, row: 0)
             .WithButton(autoKickToggleLabel, ToggleInactiveAutoKickCustomId, autoKickToggleStyle, row: 0)
+            .WithButton(sleepKickToggleLabel, ToggleSleepKickAdminConfirmCustomId, sleepKickToggleStyle, row: 0)
             .WithButton("運用設定編集", RuntimeTuningCustomId, ButtonStyle.Secondary, row: 1)
             .WithButton("パネル再同期", ResyncPanelsCustomId, ButtonStyle.Secondary, row: 1)
             .Build();
@@ -83,6 +93,18 @@ public static class AdminControlPanel
         return new ComponentBuilder()
             .WithButton("抽選管理", LotteryCustomId, ButtonStyle.Success, row: 0)
             .WithButton("問い合わせ管理", InquiryDashboardCustomId, ButtonStyle.Secondary, row: 0)
+            .WithButton("コンテンツロール管理", OpenContentRoleCategoryCustomId, ButtonStyle.Primary, row: 0)
+            .Build();
+    }
+
+    public static MessageComponent BuildContentRoleCategoryComponents()
+    {
+        return new ComponentBuilder()
+            .WithButton("ロール一覧", ContentRoleListCustomId, ButtonStyle.Primary, row: 0)
+            .WithButton("ロール追加", ContentRoleAddCustomId, ButtonStyle.Success, row: 0)
+            .WithButton("ロール削除", ContentRoleRemoveSelectCustomId, ButtonStyle.Danger, row: 0)
+            .WithButton("パネル再設置", ContentRoleResyncCustomId, ButtonStyle.Secondary, row: 1)
+            .WithButton("戻る", ContentRoleBackCustomId, ButtonStyle.Secondary, row: 1)
             .Build();
     }
 
@@ -93,7 +115,7 @@ public static class AdminControlPanel
             .Build();
     }
 
-    public static Embed BuildStatusEmbed(bool approvalRequired, bool inactiveAutoKickEnabled, bool includeReactionLabelInAutoKickNote = false)
+    public static Embed BuildStatusEmbed(bool approvalRequired, bool inactiveAutoKickEnabled, bool sleepKickAdminConfirm, bool includeReactionLabelInAutoKickNote = false)
     {
         var approvalState = approvalRequired ? "ON（管理者確認あり）" : "OFF（即時付与）";
         var approvalDetail = approvalRequired
@@ -105,16 +127,22 @@ public static class AdminControlPanel
                 ? "毎日 00:00 (JST) に30日非アクティブを判定して自動キックします。（判定対象: メッセージ / VC / リアクション）"
                 : "毎日 00:00 (JST) に30日非アクティブを判定して自動キックします。"
             : "30日非アクティブ自動キックは無効です。";
+        var sleepKickState = sleepKickAdminConfirm ? "ON（管理者確認あり）" : "OFF（投票通過で即時切断）";
+        var sleepKickDetail = sleepKickAdminConfirm
+            ? "寝落ち投票可決後、管理者・オフィサーが切断を承認/拒否できます。"
+            : "寝落ち投票可決後、60秒で自動切断します。";
 
         return new EmbedBuilder()
-            .WithTitle("ADMIN設定パネル")
+            .WithTitle("ADMINコントロールパネル")
             .WithDescription("状態確認はこのEmbed、操作はカテゴリボタン -> サブメニューで実行します。")
             .WithColor(inactiveAutoKickEnabled ? Color.Orange : Color.Green)
             .WithCurrentTimestamp()
             .AddField("登録確認フロー", approvalState, true)
             .AddField("30日非アクティブ自動キック", autoKickState, true)
+            .AddField("寝落ち管理者確認", sleepKickState, true)
             .AddField("登録確認の動作", approvalDetail, false)
             .AddField("自動キックの動作", autoKickDetail, false)
+            .AddField("寝落ち管理者確認の動作", sleepKickDetail, false)
             .AddField("メニュー分類", "監視/統計 | メンバー運用 | 設定/保守 | 管理機能 | 補助/エクスポート", false)
             .AddField("ボタン色の意味", "緑: 有効化/開始  |  赤: 無効化/停止  |  灰: 設定/診断/補助", false)
             .Build();

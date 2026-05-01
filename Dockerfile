@@ -11,7 +11,7 @@ FROM mcr.microsoft.com/dotnet/runtime:10.0 AS runtime
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends fontconfig fonts-noto-cjk \
+    && apt-get install -y --no-install-recommends fontconfig fonts-noto-cjk libopus0 \
     && rm -rf /var/lib/apt/lists/*
 
 ENV DOTNET_ENVIRONMENT=Production

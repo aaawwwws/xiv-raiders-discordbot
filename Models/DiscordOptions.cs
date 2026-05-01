@@ -10,7 +10,7 @@ public sealed class DiscordOptions
     public string AdminRoleName { get; init; } = "RaidDC Admin";
     public string MemberRoleName { get; init; } = "メンバー";
     public string ProvisionalRoleName { get; init; } = "仮登録";
-    public string RegistrationReviewChannelName { get; init; } = "登録確認";
+    public string AdminConfirmChannelName { get; init; } = "管理-確認";
     public bool AutoCreateDcRoles { get; init; } = true;
     public string LogChannelName { get; init; } = "log";
     public string NotificationChannelName { get; init; } = "通知";
@@ -24,6 +24,8 @@ public sealed class DiscordOptions
     public int LodestoneVerifyWindowMinutes { get; init; } = 10;
     public int LodestoneFetchCooldownMinutes { get; init; } = 30;
     public bool VoiceProfileEmbedEnabled { get; init; } = true;
+    public bool VoiceJoinTimePatternEnabled { get; init; } = true;
+    public int VoiceJoinTimePatternDays { get; init; } = 30;
     public int VoiceProfileMaxBioLength { get; init; } = 250;
     public bool LogIncludeMessageContent { get; init; } = true;
     public string[] LogIgnoreChannelNames { get; init; } = Array.Empty<string>();
@@ -78,6 +80,14 @@ public sealed class DiscordOptions
     public string WebTimelineFrontendOrigin { get; init; } = "http://localhost:5173";
     public string WebTimelineBridgeSecret { get; init; } = string.Empty;
     public int WebTimelinePollingIntervalSeconds { get; init; } = 5;
+
+    public bool SleepKickEnabled { get; init; } = true;
+    public int SleepKickDetectMinutes { get; init; } = 120;
+    public int SleepKickRequiredVotes { get; init; } = 3;
+    public int SleepKickCooldownMinutes { get; init; } = 60;
+    public string SleepKickChannelName { get; init; } = "vc-status";
+    public bool AutoCreateSleepKickChannel { get; init; } = true;
+    public bool SleepKickRequiresAdminConfirmation { get; init; }
 
     public HashSet<string> BuildManagementRoleNameSet()
     {

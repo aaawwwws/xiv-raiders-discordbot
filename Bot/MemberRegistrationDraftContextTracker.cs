@@ -7,7 +7,8 @@ public sealed record MemberRegistrationDraftContext(
     string Bio,
     string? XHandle,
     string? BlueskyHandle,
-    DateTimeOffset CreatedAt);
+    DateTimeOffset CreatedAt,
+    string? StoryProgression = null);
 
 public sealed class MemberRegistrationDraftContextTracker
 {

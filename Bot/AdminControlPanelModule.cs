@@ -1,9 +1,11 @@
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Security.Cryptography;
 using System.Collections.Concurrent;
 using Discord;
 using Discord.Interactions;
 using Discord.WebSocket;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using RaidDcBot.Data;
 using RaidDcBot.Models;
@@ -28,9 +30,11 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
     private readonly VoiceSessionReconciliationService _voiceSessionReconciliation;
     private readonly RecruitmentListService _recruitListService;
     private readonly UserProfileEmbedService _profileEmbeds;
+    private readonly ILogger<AdminControlPanelModule> _logger;
     private readonly ConcurrentDictionary<string, MemberManageDangerActionContext> _memberDangerContexts = new();
     private readonly ConcurrentDictionary<ulong, MemberManageBulkSelectionContext> _memberBulkSelections = new();
     private readonly ConcurrentDictionary<ulong, MemberManageLookbackPreference> _memberManageLookbackByActor = new();
+    private readonly ConcurrentDictionary<ulong, ulong> _memberProfileEditTargets = new();
     private const int LotteryCreateSchedulePageSize = 7;
     private const int LotteryCreateCloseMaxDayOffset = 60;
     private static readonly TimeSpan JapanTimeOffset = TimeSpan.FromHours(9);
@@ -108,6 +112,13 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
     private const string MemberManageFreezeToggleCustomIdPrefix = "admin_member_manage_freeze_toggle:";
     private const string MemberManageAddNoteCustomIdPrefix = "admin_member_manage_add_note:";
     private const string MemberManageAddNoteModalCustomIdPrefix = "admin_member_manage_add_note_modal:";
+    private const string MemberManageProfileMenuCustomIdPrefix = "admin_member_manage_profile_menu:";
+    private const string MemberManageChangeDcCustomIdPrefix = "admin_member_manage_change_dc:";
+    private const string MemberManageChangeWorldCustomIdPrefix = "admin_member_manage_change_world:";
+    private const string MemberManageChangeStoryCustomIdPrefix = "admin_member_manage_change_story:";
+    private const string MemberManageChangeDcButtonPrefix = "admin_member_manage_dc_btn:";
+    private const string MemberManageChangeWorldButtonPrefix = "admin_member_manage_world_btn:";
+    private const string MemberManageChangeStoryButtonPrefix = "admin_member_manage_story_btn:";
     private const string MemberManageOpenBulkCustomId = "admin_member_manage_open_bulk";
     private const string MemberManageBulkUserSelectCustomId = "admin_member_manage_bulk_user_select";
     private const string MemberManageBulkSetMemberCustomId = "admin_member_manage_bulk_set_member";
@@ -119,6 +130,8 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
     private const string MemberManageBulkDangerConfirmCustomIdPrefix = "admin_member_manage_bulk_danger_confirm:";
     private const string MemberManageBulkDangerCancelCustomId = "admin_member_manage_bulk_danger_cancel";
     private const string MemberManageDangerReasonModalCustomIdPrefix = "admin_member_manage_danger_reason_modal:";
+    private const string MemberManageEditProfileCustomIdPrefix = "admin_member_manage_edit_profile:";
+    private const string MemberManageEditProfileModalCustomId = "admin_member_manage_edit_profile_modal";
     private const string ModerationTimelinePageCustomIdPrefix = "admin_moderation_timeline_page:";
     private const string FreezeRoleName = "凍結";
     private const int MemberManageTimeoutMaxMinutes = 28 * 24 * 60;
@@ -147,7 +160,8 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
         RuntimeTuningService runtimeTuning,
         VoiceSessionReconciliationService voiceSessionReconciliation,
         RecruitmentListService recruitListService,
-        UserProfileEmbedService profileEmbeds)
+        UserProfileEmbedService profileEmbeds,
+        ILogger<AdminControlPanelModule> logger)
     {
         _db = db;
         _options = options.Value;
@@ -157,6 +171,7 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
         _runtimeTuning = runtimeTuning;
         _voiceSessionReconciliation = voiceSessionReconciliation;
         _recruitListService = recruitListService;
+        _logger = logger;
         _profileEmbeds = profileEmbeds;
     }
 
@@ -368,9 +383,10 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
         var settings = await _db.GetGuildSettingsAsync(Context.Guild.Id);
         var approvalRequired = settings?.RegistrationApprovalRequired ?? true;
         var inactiveAutoKickEnabled = settings?.InactiveAutoKickEnabled ?? _options.InactiveAutoKickEnabled;
+        var sleepKickAdminConfirm = settings?.SleepKickAdminConfirmationRequired ?? _options.SleepKickRequiresAdminConfirmation;
         await RespondAsync(
             "設定/保守メニュー",
-            components: AdminControlPanel.BuildSettingsCategoryComponents(approvalRequired, inactiveAutoKickEnabled),
+            components: AdminControlPanel.BuildSettingsCategoryComponents(approvalRequired, inactiveAutoKickEnabled, sleepKickAdminConfirm),
             ephemeral: true);
     }
 
@@ -393,6 +409,192 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
     [RequireBotAdmin]
     [ComponentInteraction(AdminControlPanel.OpenSpecialCategoryCustomId, ignoreGroupNames: true)]
     public async Task OpenSpecialCategoryMenuAsync()
+    {
+        if (Context.Guild is null)
+        {
+            await RespondAsync("この操作はサーバー内でのみ使えます。", ephemeral: true);
+            return;
+        }
+
+        await RespondAsync(
+            "管理機能メニュー",
+            components: AdminControlPanel.BuildSpecialCategoryComponents(),
+            ephemeral: true);
+    }
+
+    [RequireBotAdmin]
+    [ComponentInteraction(AdminControlPanel.OpenContentRoleCategoryCustomId, ignoreGroupNames: true)]
+    public async Task OpenContentRoleCategoryAsync()
+    {
+        if (Context.Guild is null)
+        {
+            await RespondAsync("この操作はサーバー内でのみ使えます。", ephemeral: true);
+            return;
+        }
+
+        await RespondAsync(
+            "コンテンツロール管理メニュー",
+            components: AdminControlPanel.BuildContentRoleCategoryComponents(),
+            ephemeral: true);
+    }
+
+    [RequireBotAdmin]
+    [ComponentInteraction(AdminControlPanel.ContentRoleListCustomId, ignoreGroupNames: true)]
+    public async Task ShowContentRoleListAsync()
+    {
+        if (Context.Guild is null)
+        {
+            await RespondAsync("この操作はサーバー内でのみ使えます。", ephemeral: true);
+            return;
+        }
+
+        var settings = await _db.ListMemberContentRoleSettingsAsync(Context.Guild.Id);
+        var embed = new EmbedBuilder()
+            .WithTitle("コンテンツロール一覧")
+            .WithColor(Color.Blue)
+            .WithCurrentTimestamp();
+        if (settings.Count == 0)
+        {
+            embed.WithDescription("設定されているコンテンツロールはありません。");
+        }
+        else
+        {
+            var lines = settings.Select(s =>
+            {
+                var styleLabel = s.ButtonStyle switch
+                {
+                    1 => "Primary",
+                    2 => "Secondary",
+                    3 => "Success",
+                    4 => "Danger",
+                    _ => "Unknown"
+                };
+                var rowLabel = s.ButtonRow >= 0 ? $"Row {s.ButtonRow}" : "非表示";
+                var activeLabel = s.IsActive ? "有効" : "無効";
+                return $"- `{s.RoleKey}` | {s.Label} ({s.RoleName}) | {styleLabel} | {rowLabel} | {activeLabel}";
+            });
+            embed.WithDescription(string.Join('\n', lines));
+        }
+        await RespondAsync(embed: embed.Build(), components: AdminControlPanel.BuildContentRoleCategoryComponents(), ephemeral: true);
+    }
+
+    [RequireBotAdmin]
+    [ComponentInteraction(AdminControlPanel.ContentRoleAddCustomId, ignoreGroupNames: true)]
+    public async Task OpenContentRoleAddModalAsync()
+    {
+        if (Context.Guild is null)
+        {
+            await RespondAsync("この操作はサーバー内でのみ使えます。", ephemeral: true);
+            return;
+        }
+
+        await RespondWithModalAsync<ContentRoleAddModal>("admin_content_role_add_modal");
+    }
+
+    [RequireBotAdmin]
+    [ModalInteraction("admin_content_role_add_modal", ignoreGroupNames: true)]
+    public async Task HandleContentRoleAddModalAsync(ContentRoleAddModal modal)
+    {
+        if (Context.Guild is null)
+        {
+            await RespondAsync("この操作はサーバー内でのみ使えます。", ephemeral: true);
+            return;
+        }
+
+        var roleName = modal.RoleName.Trim();
+        var label = string.IsNullOrWhiteSpace(modal.Label) ? roleName : modal.Label.Trim();
+        if (string.IsNullOrWhiteSpace(roleName))
+        {
+            await RespondAsync("ロール名を入力してください。", ephemeral: true);
+            return;
+        }
+
+        var style = int.TryParse(modal.Style, out var s) ? Math.Clamp(s, 1, 4) : 2;
+        var row = int.TryParse(modal.Row, out var r) ? Math.Clamp(r, -1, 4) : 0;
+        var roleKey = Regex.Replace(roleName.ToLowerInvariant().Replace(" ", "_").Replace("-", "_"), @"[^a-z0-9_]", "");
+        if (string.IsNullOrWhiteSpace(roleKey))
+        {
+            await RespondAsync("ロールキーが生成できません。別のロール名を試してください。", ephemeral: true);
+            return;
+        }
+
+        await _db.UpsertMemberContentRoleSettingAsync(Context.Guild.Id, roleKey, label, roleName, style, row);
+        await RespondAsync($"コンテンツロール `{roleKey}` ({label}) を追加/更新しました。", ephemeral: true);
+        await _audit.SendAsync(Context.Guild, "コンテンツロール追加", $"ロール: {label} ({roleName})\nキー: `{roleKey}`\nスタイル: {style}\n行: {row}", Color.Blue, Context.User);
+    }
+
+    [RequireBotAdmin]
+    [ComponentInteraction(AdminControlPanel.ContentRoleRemoveSelectCustomId, ignoreGroupNames: true)]
+    public async Task ShowContentRoleRemoveSelectAsync()
+    {
+        if (Context.Guild is null)
+        {
+            await RespondAsync("この操作はサーバー内でのみ使えます。", ephemeral: true);
+            return;
+        }
+
+        var settings = await _db.ListMemberContentRoleSettingsAsync(Context.Guild.Id);
+        if (settings.Count == 0)
+        {
+            await RespondAsync("削除可能なコンテンツロールがありません。", ephemeral: true);
+            return;
+        }
+
+        var select = new SelectMenuBuilder()
+            .WithCustomId("admin_content_role_remove_exec")
+            .WithPlaceholder("削除するロールを選択")
+            .WithMinValues(1)
+            .WithMaxValues(1);
+        foreach (var s in settings)
+        {
+            select.AddOption(s.Label ?? s.RoleName, s.RoleKey, s.RoleName);
+        }
+        var components = new ComponentBuilder()
+            .WithSelectMenu(select)
+            .WithButton("キャンセル", AdminControlPanel.ContentRoleBackCustomId, ButtonStyle.Secondary, row: 1)
+            .Build();
+        await RespondAsync("削除するコンテンツロールを選択してください。", components: components, ephemeral: true);
+    }
+
+    [RequireBotAdmin]
+    [ComponentInteraction("admin_content_role_remove_exec", ignoreGroupNames: true)]
+    public async Task ExecuteContentRoleRemoveAsync(string[] selected)
+    {
+        if (Context.Guild is null)
+        {
+            await RespondAsync("この操作はサーバー内でのみ使えます。", ephemeral: true);
+            return;
+        }
+
+        var roleKey = selected.FirstOrDefault();
+        if (string.IsNullOrWhiteSpace(roleKey))
+        {
+            await RespondAsync("ロールが選択されていません。", ephemeral: true);
+            return;
+        }
+
+        await _db.DisableMemberContentRoleSettingAsync(Context.Guild.Id, roleKey);
+        await RespondAsync($"コンテンツロール `{roleKey}` を無効化しました。", ephemeral: true);
+        await _audit.SendAsync(Context.Guild, "コンテンツロール削除", $"キー: `{roleKey}`", Color.Red, Context.User);
+    }
+
+    [RequireBotAdmin]
+    [ComponentInteraction(AdminControlPanel.ContentRoleResyncCustomId, ignoreGroupNames: true)]
+    public async Task ResyncContentRolePanelsAsync()
+    {
+        if (Context.Guild is null)
+        {
+            await RespondAsync("この操作はサーバー内でのみ使えます。", ephemeral: true);
+            return;
+        }
+
+        var count = await RefreshContentRolePanelsByScanAsync(Context.Guild);
+        await RespondAsync($"コンテンツロールパネルを {count} 件再設置しました。", ephemeral: true);
+    }
+
+    [RequireBotAdmin]
+    [ComponentInteraction(AdminControlPanel.ContentRoleBackCustomId, ignoreGroupNames: true)]
+    public async Task BackFromContentRoleCategoryAsync()
     {
         if (Context.Guild is null)
         {
@@ -712,6 +914,375 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
 
         var embed = await _profileEmbeds.BuildProfileEmbedAsync(target, Context.Guild, "メンバープロフィール", Color.Blue);
         await RespondAsync(embed: embed, ephemeral: true);
+    }
+
+    [RequireBotAdmin]
+    [ComponentInteraction(MemberManageEditProfileCustomIdPrefix + "*", ignoreGroupNames: true)]
+    public async Task OpenMemberManageEditProfileModalAsync(string userIdRaw)
+    {
+        if (Context.Guild is null)
+        {
+            await RespondAsync("この操作はサーバー内でのみ使えます。", ephemeral: true);
+            return;
+        }
+
+        if (!TryParseUserId(userIdRaw, out var targetUserId))
+        {
+            await RespondAsync("対象ユーザー情報が不正です。", ephemeral: true);
+            return;
+        }
+
+        var profile = await _db.GetDiscordUserProfileAsync(targetUserId);
+        if (profile is null)
+        {
+            await RespondAsync("対象ユーザーのプロフィールが見つかりません。", ephemeral: true);
+            return;
+        }
+
+        _memberProfileEditTargets[Context.User.Id] = targetUserId;
+        await RespondWithModalAsync<MemberProfileEditModal>(MemberManageEditProfileModalCustomId);
+    }
+
+    [RequireBotAdmin]
+    [ModalInteraction(MemberManageEditProfileModalCustomId, ignoreGroupNames: true)]
+    public async Task HandleMemberManageEditProfileModalAsync(MemberProfileEditModal modal)
+    {
+        if (Context.Guild is null)
+        {
+            await RespondAsync("この操作はサーバー内でのみ使えます。", ephemeral: true);
+            return;
+        }
+
+        if (!_memberProfileEditTargets.TryRemove(Context.User.Id, out var targetUserId))
+        {
+            await RespondAsync("編集セッションが無効です。もう一度やり直してください。", ephemeral: true);
+            return;
+        }
+
+        var target = Context.Guild.GetUser(targetUserId);
+        if (target is null)
+        {
+            await RespondAsync("対象ユーザーが見つかりません。", ephemeral: true);
+            return;
+        }
+
+        var currentProfile = await _db.GetDiscordUserProfileAsync(targetUserId);
+        if (currentProfile is null)
+        {
+            await RespondAsync("対象ユーザーのプロフィールが見つかりません。", ephemeral: true);
+            return;
+        }
+
+        var inputFfxivName = modal.FfxivName?.Trim() ?? string.Empty;
+        var inputBio = modal.Bio?.Trim() ?? string.Empty;
+        var inputX = modal.XHandle?.Trim() ?? string.Empty;
+        var inputBluesky = modal.BlueskyHandle?.Trim() ?? string.Empty;
+
+        if (string.IsNullOrWhiteSpace(inputFfxivName) &&
+            string.IsNullOrWhiteSpace(inputBio) &&
+            string.IsNullOrWhiteSpace(inputX) &&
+            string.IsNullOrWhiteSpace(inputBluesky))
+        {
+            await RespondAsync("更新項目がありませんでした。", ephemeral: true);
+            return;
+        }
+
+        if (!string.IsNullOrWhiteSpace(inputFfxivName) && inputFfxivName.Length > 40)
+        {
+            await RespondAsync("FFXIV名は40文字以内で入力してください。", ephemeral: true);
+            return;
+        }
+
+        var currentFfxivName = currentProfile.FfxivName ?? string.Empty;
+        var currentWorld = currentProfile.FfxivWorld ?? string.Empty;
+        var currentDataCenter = currentProfile.FfxivDataCenter ?? string.Empty;
+        var currentBio = currentProfile.Bio ?? string.Empty;
+        var currentX = currentProfile.XHandle;
+        var currentBluesky = currentProfile.BlueskyHandle;
+
+        var ffxivName = string.IsNullOrWhiteSpace(inputFfxivName) ? currentFfxivName : inputFfxivName;
+        var bio = string.IsNullOrWhiteSpace(inputBio) ? currentBio : inputBio;
+        var xHandle = string.IsNullOrWhiteSpace(inputX) ? currentX : SocialLinkService.NormalizeX(inputX);
+        var blueskyHandle = string.IsNullOrWhiteSpace(inputBluesky) ? currentBluesky : SocialLinkService.NormalizeBluesky(inputBluesky);
+
+        var changed =
+            !string.Equals(ffxivName, currentFfxivName, StringComparison.Ordinal) ||
+            !string.Equals(bio, currentBio, StringComparison.Ordinal) ||
+            !string.Equals(xHandle ?? string.Empty, currentX ?? string.Empty, StringComparison.Ordinal) ||
+            !string.Equals(blueskyHandle ?? string.Empty, currentBluesky ?? string.Empty, StringComparison.Ordinal);
+        if (!changed)
+        {
+            await RespondAsync("変更はありませんでした。", ephemeral: true);
+            return;
+        }
+
+        await _db.UpdateUserRegistrationProfileAsync(
+            targetUserId,
+            ffxivName,
+            currentWorld,
+            currentDataCenter,
+            xHandle,
+            blueskyHandle,
+            bio,
+            currentProfile.StoryProgression);
+
+        await _db.AddAdminMemberNoteAsync(
+            Context.Guild.Id,
+            targetUserId,
+            Context.User.Id,
+            Context.User.Username,
+            $"管理者によるプロフィール編集: FFXIV名={ffxivName}, Bio={bio}, X={xHandle}, Bluesky={blueskyHandle}");
+
+        await RespondAsync($"{target.Mention} のプロフィールを更新しました。", ephemeral: true);
+        await _audit.SendAsync(Context.Guild, "プロフィール編集", $"対象: {target.Mention}\nFFXIV名: {ffxivName}\nBio: {bio}\nX: {xHandle}\nBluesky: {blueskyHandle}", Color.Blue, Context.User);
+    }
+
+    [ComponentInteraction(MemberManageChangeDcCustomIdPrefix + "*", ignoreGroupNames: true)]
+    public async Task OpenMemberManageChangeDcMenuAsync(string userIdRaw)
+    {
+        if (Context.Guild is null)
+        {
+            await RespondAsync("この操作はサーバー内でのみ使えます。", ephemeral: true);
+            return;
+        }
+
+        if (!TryParseUserId(userIdRaw, out var targetUserId))
+        {
+            await RespondAsync("対象ユーザー情報が不正です。", ephemeral: true);
+            return;
+        }
+
+        var profile = await _db.GetDiscordUserProfileAsync(targetUserId);
+        if (profile is null)
+        {
+            await RespondAsync("対象ユーザーのプロフィールが見つかりません。", ephemeral: true);
+            return;
+        }
+
+        var components = ProfileUI.BuildDataCenterSelect(dcName => $"{MemberManageChangeDcButtonPrefix}{targetUserId}:{ToDcToken(dcName)}");
+
+        await RespondAsync($"<@{targetUserId}> のDCを選択してください。", components: components, ephemeral: true);
+    }
+
+    [RequireBotAdmin]
+    [ComponentInteraction(MemberManageChangeDcButtonPrefix + "*:*", ignoreGroupNames: true)]
+    public async Task HandleDcButtonAsync(string userIdRaw, string dcToken)
+    {
+        if (Context.Guild is null)
+        {
+            await RespondAsync("この操作はサーバー内でのみ使えます。", ephemeral: true);
+            return;
+        }
+
+        if (Context.Interaction is not SocketMessageComponent component)
+        {
+            await RespondAsync("この操作はパネルから実行してください。", ephemeral: true);
+            return;
+        }
+
+        if (!TryParseUserId(userIdRaw, out var targetUserId))
+        {
+            await RespondAsync("対象ユーザー情報が不正です。", ephemeral: true);
+            return;
+        }
+
+        if (!TryResolveDcFromToken(dcToken, out var dcName))
+        {
+            await RespondAsync("選択したDCを判定できませんでした。", ephemeral: true);
+            return;
+        }
+
+        if (!DcResolver.TryGetWorlds(dcName, out var worlds) || worlds.Count == 0)
+        {
+            await RespondAsync("このDCのサーバー一覧を取得できませんでした。", ephemeral: true);
+            return;
+        }
+
+        var components = ProfileUI.BuildWorldSelect(worlds, world => $"{MemberManageChangeWorldButtonPrefix}{targetUserId}:{ToDcToken(dcName)}:{ToWorldToken(world)}");
+
+        await component.UpdateAsync(props =>
+        {
+            props.Content = $"<@{targetUserId}> のDCは **{dcName}** です。Worldを選択してください。";
+            props.Components = components;
+        });
+    }
+
+    [RequireBotAdmin]
+    [ComponentInteraction(MemberManageChangeWorldButtonPrefix + "*:*:*", ignoreGroupNames: true)]
+    public async Task HandleWorldButtonAsync(string userIdRaw, string dcToken, string worldToken)
+    {
+        if (Context.Guild is null)
+        {
+            await RespondAsync("この操作はサーバー内でのみ使えます。", ephemeral: true);
+            return;
+        }
+
+        if (!TryParseUserId(userIdRaw, out var targetUserId))
+        {
+            await RespondAsync("対象ユーザー情報が不正です。", ephemeral: true);
+            return;
+        }
+
+        if (!TryResolveDcFromToken(dcToken, out var dcName))
+        {
+            await RespondAsync("選択したDCを判定できませんでした。", ephemeral: true);
+            return;
+        }
+
+        if (!DcResolver.TryGetWorlds(dcName, out var worlds) || worlds.Count == 0)
+        {
+            await RespondAsync("このDCのサーバー一覧を取得できませんでした。", ephemeral: true);
+            return;
+        }
+
+        var worldName = worlds.FirstOrDefault(w => string.Equals(ToWorldToken(w), worldToken, StringComparison.OrdinalIgnoreCase));
+        if (string.IsNullOrWhiteSpace(worldName))
+        {
+            await RespondAsync("選択したWorldを判定できませんでした。", ephemeral: true);
+            return;
+        }
+
+        var target = Context.Guild.GetUser(targetUserId);
+        if (target is null)
+        {
+            await RespondAsync("対象ユーザーが見つかりません。", ephemeral: true);
+            return;
+        }
+
+        var currentProfile = await _db.GetDiscordUserProfileAsync(targetUserId);
+        if (currentProfile is null)
+        {
+            await RespondAsync("対象ユーザーのプロフィールが見つかりません。", ephemeral: true);
+            return;
+        }
+
+        var currentDc = currentProfile.FfxivDataCenter ?? string.Empty;
+        var currentWorld = currentProfile.FfxivWorld ?? string.Empty;
+        var newDc = string.IsNullOrWhiteSpace(dcName) ? currentDc : dcName;
+        var newWorld = string.IsNullOrWhiteSpace(worldName) ? currentWorld : worldName;
+
+        var changed = !string.Equals(newDc, currentDc, StringComparison.Ordinal) || !string.Equals(newWorld, currentWorld, StringComparison.Ordinal);
+        if (!changed)
+        {
+            await RespondAsync("変更はありませんでした。", ephemeral: true);
+            return;
+        }
+
+        await _db.UpdateUserRegistrationProfileAsync(
+            targetUserId,
+            currentProfile.FfxivName ?? string.Empty,
+            newWorld,
+            newDc,
+            currentProfile.XHandle,
+            currentProfile.BlueskyHandle,
+            currentProfile.Bio ?? string.Empty,
+            currentProfile.StoryProgression);
+
+        await _db.AddAdminMemberNoteAsync(
+            Context.Guild.Id,
+            targetUserId,
+            Context.User.Id,
+            Context.User.Username,
+            $"管理者によるDC/World変更: DC={newDc}, World={newWorld}");
+
+        await RespondAsync($"{target.Mention} のDC/Worldを **{newDc} / {newWorld}** に更新しました。", ephemeral: true);
+        await _audit.SendAsync(Context.Guild, "DC/World変更", $"対象: {target.Mention}\nDC: {newDc}\nWorld: {newWorld}", Color.Blue, Context.User);
+    }
+
+    [RequireBotAdmin]
+    [ComponentInteraction(MemberManageChangeStoryCustomIdPrefix + "*", ignoreGroupNames: true)]
+    public async Task OpenMemberManageChangeStoryMenuAsync(string userIdRaw)
+    {
+        if (Context.Guild is null)
+        {
+            await RespondAsync("この操作はサーバー内でのみ使えます。", ephemeral: true);
+            return;
+        }
+
+        if (!TryParseUserId(userIdRaw, out var targetUserId))
+        {
+            await RespondAsync("対象ユーザー情報が不正です。", ephemeral: true);
+            return;
+        }
+
+        var profile = await _db.GetDiscordUserProfileAsync(targetUserId);
+        if (profile is null)
+        {
+            await RespondAsync("対象ユーザーのプロフィールが見つかりません。", ephemeral: true);
+            return;
+        }
+
+        var components = ProfileUI.BuildStoryProgressionSelect(key => $"{MemberManageChangeStoryButtonPrefix}{targetUserId}:{key}");
+
+        await RespondAsync($"<@{targetUserId}> のストーリー進行度を選択してください。", components: components, ephemeral: true);
+    }
+
+    [RequireBotAdmin]
+    [ComponentInteraction(MemberManageChangeStoryButtonPrefix + "*:*", ignoreGroupNames: true)]
+    public async Task HandleMemberManageStoryButtonAsync(string userIdRaw, string storyKey)
+    {
+        if (Context.Guild is null)
+        {
+            await RespondAsync("この操作はサーバー内でのみ使えます。", ephemeral: true);
+            return;
+        }
+
+        if (!TryParseUserId(userIdRaw, out var targetUserId))
+        {
+            await RespondAsync("対象ユーザー情報が不正です。", ephemeral: true);
+            return;
+        }
+
+        var inputStory = storyKey?.Trim()?.ToLowerInvariant() ?? string.Empty;
+        if (string.IsNullOrWhiteSpace(inputStory))
+        {
+            await RespondAsync("選択が無効です。", ephemeral: true);
+            return;
+        }
+
+        var target = Context.Guild.GetUser(targetUserId);
+        if (target is null)
+        {
+            await RespondAsync("対象ユーザーが見つかりません。", ephemeral: true);
+            return;
+        }
+
+        var currentProfile = await _db.GetDiscordUserProfileAsync(targetUserId);
+        if (currentProfile is null)
+        {
+            await RespondAsync("対象ユーザーのプロフィールが見つかりません。", ephemeral: true);
+            return;
+        }
+
+        var currentStory = currentProfile.StoryProgression ?? string.Empty;
+        if (string.Equals(inputStory, currentStory, StringComparison.OrdinalIgnoreCase))
+        {
+            await RespondAsync("変更はありませんでした。", ephemeral: true);
+            return;
+        }
+
+        await _db.UpdateUserStoryProgressionAsync(targetUserId, inputStory);
+
+        await _db.AddAdminMemberNoteAsync(
+            Context.Guild.Id,
+            targetUserId,
+            Context.User.Id,
+            Context.User.Username,
+            $"管理者によるストーリー進行度変更: {inputStory}");
+
+        var label = inputStory switch
+        {
+            "arr_hw" => "新生〜蒼天",
+            "sb" => "紅蓮",
+            "shb" => "漆黒",
+            "ew" => "暁月",
+            "dt" => "黄金",
+            "completed" => "最新パッチ済み",
+            _ => inputStory
+        };
+
+        await RespondAsync($"{target.Mention} のストーリー進行度を **{label}** に更新しました。", ephemeral: true);
+        await _audit.SendAsync(Context.Guild, "ストーリー進行度変更", $"対象: {target.Mention}\n進行度: {label}", Color.Blue, Context.User);
     }
 
     [RequireBotAdmin]
@@ -5952,8 +6523,8 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
         return false;
     }
 
-    private static Embed BuildAdminStatusEmbed(bool approvalRequired, bool inactiveAutoKickEnabled)
-        => AdminControlPanel.BuildStatusEmbed(approvalRequired, inactiveAutoKickEnabled);
+    private static Embed BuildAdminStatusEmbed(bool approvalRequired, bool inactiveAutoKickEnabled, bool sleepKickAdminConfirm = false)
+        => AdminControlPanel.BuildStatusEmbed(approvalRequired, inactiveAutoKickEnabled, sleepKickAdminConfirm);
 
     private int GetMemberManageLookbackDays(ulong guildId, ulong actorUserId)
     {
@@ -6109,7 +6680,10 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
             return new ComponentBuilder()
                 .WithSelectMenu(emptySelect, row: 0)
                 .WithButton("期間設定", $"{MemberManagePeriodOpenCustomIdPrefix}{currentTargetUserId}", ButtonStyle.Secondary, row: 1)
-                .WithButton("非アクティブ一覧", MemberManageInactiveListCustomId, ButtonStyle.Secondary, row: 1);
+                .WithButton("非アクティブ一覧", MemberManageInactiveListCustomId, ButtonStyle.Secondary, row: 1)
+                .WithButton("プロフィール編集", $"{MemberManageEditProfileCustomIdPrefix}{currentTargetUserId}", ButtonStyle.Secondary, row: 1, disabled: currentTargetUserId == 0)
+                .WithButton("DC/World変更", $"{MemberManageChangeDcCustomIdPrefix}{currentTargetUserId}", ButtonStyle.Secondary, row: 1, disabled: currentTargetUserId == 0)
+                .WithButton("ストーリー進行度", $"{MemberManageChangeStoryCustomIdPrefix}{currentTargetUserId}", ButtonStyle.Secondary, row: 1, disabled: currentTargetUserId == 0);
         }
 
         var select = new SelectMenuBuilder
@@ -6124,7 +6698,10 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
         return new ComponentBuilder()
             .WithSelectMenu(select, row: 0)
             .WithButton("期間設定", $"{MemberManagePeriodOpenCustomIdPrefix}{currentTargetUserId}", ButtonStyle.Secondary, row: 1)
-            .WithButton("非アクティブ一覧", MemberManageInactiveListCustomId, ButtonStyle.Secondary, row: 1);
+            .WithButton("非アクティブ一覧", MemberManageInactiveListCustomId, ButtonStyle.Secondary, row: 1)
+            .WithButton("プロフィール編集", $"{MemberManageEditProfileCustomIdPrefix}{currentTargetUserId}", ButtonStyle.Secondary, row: 1, disabled: currentTargetUserId == 0)
+            .WithButton("DC/World変更", $"{MemberManageChangeDcCustomIdPrefix}{currentTargetUserId}", ButtonStyle.Secondary, row: 1, disabled: currentTargetUserId == 0)
+            .WithButton("ストーリー進行度", $"{MemberManageChangeStoryCustomIdPrefix}{currentTargetUserId}", ButtonStyle.Secondary, row: 1, disabled: currentTargetUserId == 0);
     }
 
     private async Task<(Embed Embed, MessageComponent Components)> BuildMemberManageTargetPayloadAsync(
@@ -7592,32 +8169,31 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
         }
 
         const int width = 1600;
-        const int height = 1920;
-        const float marginX = 70f;
+        const int height = 1200;
+        const float marginX = 60f;
+        const float gap = 24f;
         var panelWidth = width - (marginX * 2f);
-        var cardsY = 130f;
-        var cardsHeight = 150f;
-        var usersPanelY = 320f;
-        var panelHeight = 300f;
-        var vcTimePanelY = 670f;
-        var heatmapPanelY = 1020f;
-        var heatmapPanelHeight = 410f;
-        var regularPanelY = 1480f;
-        var regularPanelHeight = 390f;
+        var halfPanelWidth = (panelWidth - gap) / 2f;
+        var cardsY = 128f;
+        var cardsHeight = 140f;
+        var barPanelY = 300f;
+        var barPanelHeight = 360f;
+        var heatmapPanelY = 692f;
+        var heatmapPanelHeight = 468f;
         var maxUsers = Math.Max(1, rows.Max(x => x.ActiveUsers));
         var maxHours = Math.Max(1.0, rows.Max(x => x.TotalSeconds / 3600.0));
 
         using var image = new SixLabors.ImageSharp.Image<Rgba32>(width, height, new Rgba32(246, 248, 251, 255));
         image.Mutate(ctx =>
         {
-            var titleFont = ResolveChartFont(48, FontStyle.Bold);
-            var subFont = ResolveChartFont(24, FontStyle.Regular);
-            var axisFont = ResolveChartFont(20, FontStyle.Regular);
-            var captionFont = ResolveChartFont(24, FontStyle.Bold);
-            var infoFont = ResolveChartFont(19, FontStyle.Regular);
+            var titleFont = ResolveChartFont(56, FontStyle.Bold);
+            var subFont = ResolveChartFont(28, FontStyle.Regular);
+            var axisFont = ResolveChartFont(26, FontStyle.Regular);
+            var captionFont = ResolveChartFont(32, FontStyle.Bold);
+            var infoFont = ResolveChartFont(24, FontStyle.Regular);
 
-            ctx.DrawText("VC時間帯ダッシュボード", titleFont, SixLabors.ImageSharp.Color.Black, new SixLabors.ImageSharp.PointF(marginX, 44));
-            ctx.DrawText($"直近{lookbackDays}日 / JST / 注目時間: {highlightHourJst:00}:00", subFont, SixLabors.ImageSharp.Color.FromRgb(78, 83, 91), new SixLabors.ImageSharp.PointF(marginX + 2f, 98));
+            ctx.DrawText("VCアクティビティ統計", titleFont, SixLabors.ImageSharp.Color.Black, new SixLabors.ImageSharp.PointF(marginX, 36));
+            ctx.DrawText($"直近{lookbackDays}日間 / JST / 現在 {highlightHourJst:00}:00", subFont, SixLabors.ImageSharp.Color.FromRgb(78, 83, 91), new SixLabors.ImageSharp.PointF(marginX + 2f, 104));
 
             DrawVoiceMetricCards(
                 ctx,
@@ -7630,12 +8206,12 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
             DrawHourlyBarPanel(
                 ctx,
                 rows,
-                new SixLabors.ImageSharp.RectangleF(marginX, usersPanelY, panelWidth, panelHeight),
+                new SixLabors.ImageSharp.RectangleF(marginX, barPanelY, halfPanelWidth, barPanelHeight),
                 valueSelector: row => row.ActiveUsers,
                 maxValue: maxUsers,
                 barColor: new Rgba32(46, 134, 222, 255),
-                panelTitle: "時間帯別アクティブ人数",
-                peakLabelPrefix: "最多人数",
+                panelTitle: "参加者数（人）",
+                peakLabelPrefix: "最多",
                 highlightHourJst: highlightHourJst,
                 axisFont: axisFont,
                 captionFont: captionFont,
@@ -7644,12 +8220,12 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
             DrawHourlyBarPanel(
                 ctx,
                 rows,
-                new SixLabors.ImageSharp.RectangleF(marginX, vcTimePanelY, panelWidth, panelHeight),
+                new SixLabors.ImageSharp.RectangleF(marginX + halfPanelWidth + gap, barPanelY, halfPanelWidth, barPanelHeight),
                 valueSelector: row => row.TotalSeconds / 3600.0,
                 maxValue: maxHours,
                 barColor: new Rgba32(239, 143, 47, 255),
-                panelTitle: "時間帯別VC滞在時間 (時間)",
-                peakLabelPrefix: "最長VC滞在",
+                panelTitle: "VC滞在時間（時間）",
+                peakLabelPrefix: "最長",
                 highlightHourJst: highlightHourJst,
                 axisFont: axisFont,
                 captionFont: captionFont,
@@ -7659,14 +8235,6 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
                 ctx,
                 weekdayHourSeconds,
                 new SixLabors.ImageSharp.RectangleF(marginX, heatmapPanelY, panelWidth, heatmapPanelHeight),
-                axisFont,
-                captionFont);
-
-            DrawHourRegularsPanel(
-                ctx,
-                regularItems,
-                highlightHourJst,
-                new SixLabors.ImageSharp.RectangleF(marginX, regularPanelY, panelWidth, regularPanelHeight),
                 axisFont,
                 captionFont);
         });
@@ -7697,9 +8265,9 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
             .First();
         var focus = safeRows[Math.Clamp(highlightHourJst, 0, 23)];
 
-        var cardGap = 16f;
+        var cardGap = 18f;
         var cardWidth = (area.Width - (cardGap * 4f)) / 3f;
-        var cardHeight = area.Height - 12f;
+        var cardHeight = area.Height - 10f;
         var titleColor = new Rgba32(56, 61, 70, 255);
         var valueColor = new Rgba32(18, 23, 31, 255);
         var borderColor = new Rgba32(196, 204, 216, 255);
@@ -7708,7 +8276,7 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
         {
             ("最多人数", $"{byUsers.Hour:00}:00  ({byUsers.ActiveUsers}人)"),
             ("最長VC滞在", $"{byTime.Hour:00}:00  ({FormatDurationJa((int)Math.Min(int.MaxValue, byTime.TotalSeconds))})"),
-            ("注目時間", $"{focus.Hour:00}:00  ({focus.ActiveUsers}人 / {FormatDurationJa((int)Math.Min(int.MaxValue, focus.TotalSeconds))})")
+            ("現在の時間", $"{focus.Hour:00}:00  ({focus.ActiveUsers}人 / {FormatDurationJa((int)Math.Min(int.MaxValue, focus.TotalSeconds))})")
         };
 
         for (var i = 0; i < cards.Length; i++)
@@ -7718,8 +8286,8 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
             var cardRect = new SixLabors.ImageSharp.RectangleF(x, y, cardWidth, cardHeight);
             ctx.Fill(SixLabors.ImageSharp.Color.White, cardRect);
             ctx.Draw(Pens.Solid(SixLabors.ImageSharp.Color.FromPixel(borderColor), 1.2f), cardRect);
-            ctx.DrawText(cards[i].Item1, titleFont, titleColor, new SixLabors.ImageSharp.PointF(x + 14f, y + 16f));
-            ctx.DrawText(cards[i].Item2, valueFont, valueColor, new SixLabors.ImageSharp.PointF(x + 14f, y + 64f));
+            ctx.DrawText(cards[i].Item1, titleFont, titleColor, new SixLabors.ImageSharp.PointF(x + 16f, y + 14f));
+            ctx.DrawText(cards[i].Item2, valueFont, valueColor, new SixLabors.ImageSharp.PointF(x + 16f, y + 60f));
         }
     }
 
@@ -7742,10 +8310,10 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
         var labelColor = new Rgba32(58, 64, 74, 255);
         var titleColor = new Rgba32(27, 31, 36, 255);
         var panelBg = new Rgba32(255, 255, 255, 255);
-        var marginLeft = 74f;
-        var marginBottom = 54f;
-        var marginTop = 56f;
-        var marginRight = 16f;
+        var marginLeft = 62f;
+        var marginBottom = 56f;
+        var marginTop = 60f;
+        var marginRight = 12f;
         var plot = new SixLabors.ImageSharp.RectangleF(
             area.X + marginLeft,
             area.Y + marginTop,
@@ -7761,11 +8329,8 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
             .OrderByDescending(x => x.Value)
             .ThenBy(x => x.Hour)
             .First();
-        ctx.DrawText(
-            $"{peakLabelPrefix}: {peak.Hour:00}:00 ({valueFormatter(peak.Value)})",
-            axisFont,
-            labelColor,
-            new SixLabors.ImageSharp.PointF(area.X + area.Width - 460f, area.Y + 18f));
+        var peakText = $"{peakLabelPrefix}: {peak.Hour:00}:00 ({valueFormatter(peak.Value)})";
+        ctx.DrawText(peakText, axisFont, labelColor, new SixLabors.ImageSharp.PointF(area.X + area.Width - 14f - MeasureTextWidth(peakText, axisFont), area.Y + 16f));
 
         var slotWidth = plot.Width / 24f;
         var focusHour = Math.Clamp(highlightHourJst, 0, 23);
@@ -7782,7 +8347,7 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
             var y = plot.Bottom - (plot.Height * ratio);
             ctx.DrawLine(Pens.Solid(gridColor, 1f), new SixLabors.ImageSharp.PointF(plot.Left, y), new SixLabors.ImageSharp.PointF(plot.Right, y));
             var valueLabel = valueFormatter(maxValue * ratio);
-            ctx.DrawText(valueLabel, axisFont, labelColor, new SixLabors.ImageSharp.PointF(area.X + 10f, y - 10f));
+            ctx.DrawText(valueLabel, axisFont, labelColor, new SixLabors.ImageSharp.PointF(area.X + 8f, y - 12f));
         }
 
         for (var hour = 0; hour < 24; hour += 2)
@@ -7791,7 +8356,7 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
             ctx.DrawLine(Pens.Solid(gridColor, 0.8f), new SixLabors.ImageSharp.PointF(x, plot.Top), new SixLabors.ImageSharp.PointF(x, plot.Bottom));
         }
 
-        var barWidth = Math.Max(8f, slotWidth * 0.62f);
+        var barWidth = Math.Max(10f, slotWidth * 0.72f);
         var safeMax = Math.Max(1e-9, maxValue);
         for (var hour = 0; hour < 24; hour++)
         {
@@ -7811,7 +8376,7 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
 
             if (hour % 3 == 0)
             {
-                ctx.DrawText($"{hour:00}", axisFont, labelColor, new SixLabors.ImageSharp.PointF(barX - 4f, plot.Bottom + 10f));
+                ctx.DrawText($"{hour:00}", axisFont, labelColor, new SixLabors.ImageSharp.PointF(barX - 4f, plot.Bottom + 12f));
             }
         }
     }
@@ -8053,6 +8618,25 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
             Blend(from.G, to.G),
             Blend(from.B, to.B),
             Blend(from.A, to.A));
+    }
+
+    private static float MeasureTextWidth(string text, Font font)
+    {
+        return TextMeasurer.MeasureBounds(text, new TextOptions(font)).Width;
+    }
+
+    private static string ToDcToken(string dataCenterName)
+        => dataCenterName.Trim().ToLowerInvariant();
+
+    private static string ToWorldToken(string worldName)
+        => worldName.Trim().ToLowerInvariant();
+
+    private static bool TryResolveDcFromToken(string token, out string dataCenterName)
+    {
+        dataCenterName = DcResolver.KnownDcNames
+            .FirstOrDefault(dc => string.Equals(ToDcToken(dc), token, StringComparison.OrdinalIgnoreCase))
+            ?? string.Empty;
+        return !string.IsNullOrWhiteSpace(dataCenterName);
     }
 
     private static Font ResolveChartFont(float size, FontStyle style)
@@ -8948,6 +9532,119 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
 
 private static ulong ToUlong(long value) => unchecked((ulong)value);
 private static long ToDbId(ulong value) => unchecked((long)value);
+
+    private async Task<int> RefreshContentRolePanelsByScanAsync(SocketGuild guild)
+    {
+        var definitions = await LoadContentRoleDefinitionsAsync(guild.Id);
+        var components = MemberContentRolePanel.BuildComponents(definitions);
+        return await RefreshPanelsByScanAsync(
+            guild,
+            match: message =>
+                MemberContentRolePanel.LooksLikePanelMessage(message.Content) ||
+                MemberContentRolePanel.LooksLikePanelComponents(message.Components),
+            update: message => message.ModifyAsync(props =>
+            {
+                props.Content = null;
+                props.Components = components;
+            }),
+            panelName: "content-role");
+    }
+
+    private async Task<IReadOnlyList<ContentRoleDefinition>> LoadContentRoleDefinitionsAsync(ulong guildId)
+    {
+        var defaults = MemberContentRolePanel.DefaultDefinitions.ToList();
+        var indexByKey = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        for (var i = 0; i < defaults.Count; i++)
+        {
+            indexByKey[defaults[i].Key] = i;
+        }
+
+        var custom = await _db.ListMemberContentRoleSettingsAsync(guildId);
+        foreach (var row in custom)
+        {
+            var definition = new ContentRoleDefinition(
+                row.RoleKey,
+                row.Label,
+                row.RoleName,
+                NormalizeButtonStyle(row.ButtonStyle),
+                Math.Clamp(row.ButtonRow, 0, 4));
+
+            if (indexByKey.TryGetValue(definition.Key, out var existingIndex))
+            {
+                defaults[existingIndex] = definition;
+                continue;
+            }
+
+            indexByKey[definition.Key] = defaults.Count;
+            defaults.Add(definition);
+        }
+
+        return defaults
+            .OrderBy(x => x.Row)
+            .ThenBy(x => x.Key, StringComparer.OrdinalIgnoreCase)
+            .Take(25)
+            .ToList();
+    }
+
+    private static ButtonStyle NormalizeButtonStyle(int style)
+    {
+        return style switch
+        {
+            1 => ButtonStyle.Primary,
+            2 => ButtonStyle.Secondary,
+            3 => ButtonStyle.Success,
+            4 => ButtonStyle.Danger,
+            _ => ButtonStyle.Secondary
+        };
+    }
+
+    private async Task<int> RefreshPanelsByScanAsync(
+        SocketGuild guild,
+        Func<IUserMessage, bool> match,
+        Func<IUserMessage, Task> update,
+        string panelName)
+    {
+        var updated = 0;
+        foreach (var channel in guild.TextChannels.OrderBy(ch => ch.Position))
+        {
+            IEnumerable<IMessage> recent;
+            try
+            {
+                recent = await channel.GetMessagesAsync(100).FlattenAsync();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Skip panel scan channel. GuildId={GuildId}, ChannelId={ChannelId}, Panel={PanelName}", guild.Id, channel.Id, panelName);
+                continue;
+            }
+
+            foreach (var message in recent.OfType<IUserMessage>())
+            {
+                if (message.Author.Id != Context.Client.CurrentUser.Id)
+                {
+                    continue;
+                }
+
+                if (!match(message))
+                {
+                    continue;
+                }
+
+                try
+                {
+                    await update(message);
+                    updated++;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to refresh scanned panel message. GuildId={GuildId}, ChannelId={ChannelId}, MessageId={MessageId}, Panel={PanelName}",
+                        guild.Id, channel.Id, message.Id, panelName);
+                }
+            }
+        }
+
+        return updated;
+    }
 }
 
 public sealed class LotteryCreateModal : IModal
@@ -8974,7 +9671,7 @@ public sealed class LotteryCreateModal : IModal
 
 public sealed class LotteryCreateTestModal : IModal
 {
-    public string Title => "テスト抽選を作成";
+    public string Title => "抽選テスト参加";
 
     [InputLabel("タイトル")]
     [ModalTextInput("lottery_create_test_title", maxLength: 80)]
@@ -8988,7 +9685,7 @@ public sealed class LotteryCreateTestModal : IModal
     [ModalTextInput("lottery_create_test_prize_list", maxLength: 300)]
     public string PrizeList { get; set; } = string.Empty;
 
-    [InputLabel("締切まで秒（1-86400）")]
+    [InputLabel("締切までの秒数（1-86400）")]
     [ModalTextInput("lottery_create_test_close_seconds", maxLength: 5)]
     public string CloseSeconds { get; set; } = string.Empty;
 
@@ -9046,6 +9743,36 @@ public sealed class MemberManageTimeoutModal : IModal
     public string? Reason { get; set; }
 }
 
+public sealed class MemberManagePeriodModal : IModal
+{
+    public string Title => "参照期間設定";
+
+    [InputLabel("参照期間（日）")]
+    [ModalTextInput("admin_member_manage_period_days", maxLength: 3)]
+    public string Days { get; set; } = "30";
+}
+
+public sealed class ContentRoleAddModal : IModal
+{
+    public string Title => "コンテンツロール追加";
+
+    [InputLabel("ロール名（Discord上のロール名）")]
+    [ModalTextInput("content_role_name", TextInputStyle.Short, placeholder: "例: レイド", maxLength: 100)]
+    public string RoleName { get; set; } = string.Empty;
+
+    [InputLabel("表示ラベル（ボタンに表示される文字）")]
+    [ModalTextInput("content_role_label", TextInputStyle.Short, placeholder: "例: レイド", maxLength: 80)]
+    public string Label { get; set; } = string.Empty;
+
+    [InputLabel("ボタンスタイル (1=Primary 2=Secondary 3=Success 4=Danger)")]
+    [ModalTextInput("content_role_style", TextInputStyle.Short, placeholder: "2", maxLength: 1)]
+    public string Style { get; set; } = "2";
+
+    [InputLabel("配置行 (0-4, -1で非表示)")]
+    [ModalTextInput("content_role_row", TextInputStyle.Short, placeholder: "0", maxLength: 2)]
+    public string Row { get; set; } = "0";
+}
+
 public sealed class MemberManageDangerReasonModal : IModal
 {
     public string Title => "理由入力（任意）";
@@ -9065,11 +9792,4 @@ public sealed class MemberManageNoteModal : IModal
     public string Note { get; set; } = string.Empty;
 }
 
-public sealed class MemberManagePeriodModal : IModal
-{
-    public string Title => "参照期間設定";
 
-    [InputLabel("参照期間（日）")]
-    [ModalTextInput("admin_member_manage_period_days", maxLength: 3)]
-    public string Days { get; set; } = "30";
-}

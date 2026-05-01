@@ -36,6 +36,7 @@ public sealed class DiscordBotService : IHostedService
     private readonly VoiceStatsService _voiceStats;
     private readonly VoiceSessionReconciliationService _voiceSessionReconciliation;
     private readonly FfLogsReportWatcherService _fflogsWatcher;
+    private readonly SleepKickService _sleepKick;
     private readonly string? _attachmentArchiveRootPath;
     private readonly ConcurrentDictionary<ulong, byte> _tempVoiceChannelIds = new();
     private readonly ConcurrentDictionary<ulong, CancellationTokenSource> _tempVoiceDeleteTokens = new();
@@ -89,7 +90,8 @@ public sealed class DiscordBotService : IHostedService
         StatsEmbedService stats,
         VoiceStatsService voiceStats,
         VoiceSessionReconciliationService voiceSessionReconciliation,
-        FfLogsReportWatcherService fflogsWatcher)
+        FfLogsReportWatcherService fflogsWatcher,
+        SleepKickService sleepKick)
     {
         _client = client;
         _interactions = interactions;
@@ -107,6 +109,7 @@ public sealed class DiscordBotService : IHostedService
         _voiceStats = voiceStats;
         _voiceSessionReconciliation = voiceSessionReconciliation;
         _fflogsWatcher = fflogsWatcher;
+        _sleepKick = sleepKick;
         _attachmentArchiveRootPath = ResolveAttachmentArchiveRootPath(_options);
     }
 
@@ -148,6 +151,7 @@ public sealed class DiscordBotService : IHostedService
         await _db.EnsureGuildSettingsColumnsAsync();
         await _db.EnsureBotAdminOperationsTableAsync();
         await _db.EnsureRecruitTemplatesTableAsync();
+        await _db.EnsureSleepKickLogsTableAsync();
         await _db.EnsureMessageLogPayloadColumnsAsync();
         await _db.EnsureUserReactionLogsTableAsync();
         await _db.EnsureVoiceSessionColumnsAsync();
@@ -412,72 +416,107 @@ public sealed class DiscordBotService : IHostedService
         await _client.StopAsync();
     }
 
-    private async Task OnReadyAsync()
+    private Task OnReadyAsync()
     {
-        _runtimeDiagnostics.Mark("startup.ready.begin", success: true, note: "OnReadyAsync");
-        await RegisterInteractionModulesAsync();
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                _runtimeDiagnostics.Mark("startup.ready.begin", success: true, note: "OnReadyAsync");
+                await RegisterInteractionModulesAsync();
 
-        if (_options.GuildId != 0)
-        {
-            await _interactions.RegisterCommandsToGuildAsync(_options.GuildId, true);
-        }
-        else
-        {
-            await _interactions.RegisterCommandsGloballyAsync(true);
-        }
+                if (_options.GuildId != 0)
+                {
+                    await _interactions.RegisterCommandsToGuildAsync(_options.GuildId, true);
+                }
+                else
+                {
+                    await _interactions.RegisterCommandsGloballyAsync(true);
+                }
 
-        _logger.LogInformation("Bot ready. Commands registered.");
-        await EnsureGuildResourcesAsync();
-        try
-        {
-            await RunVoiceSessionReconcileTickAsync("startup", repair: true);
-            _runtimeDiagnostics.Mark("startup.voice_session_reconcile", success: true, note: "Startup reconciliation completed");
-        }
-        catch (Exception ex)
-        {
-            _runtimeDiagnostics.Mark("startup.voice_session_reconcile", success: false, note: ex.Message);
-            _logger.LogWarning(ex, "Failed to reconcile voice sessions on startup.");
-        }
+                _logger.LogInformation("Bot ready. Commands registered.");
+                
+                await EnsureGuildResourcesAsync();
+                try
+                {
+                    await RunVoiceSessionReconcileTickAsync("startup", repair: true);
+                    _runtimeDiagnostics.Mark("startup.voice_session_reconcile", success: true, note: "Startup reconciliation completed");
+                }
+                catch (Exception ex)
+                {
+                    _runtimeDiagnostics.Mark("startup.voice_session_reconcile", success: false, note: ex.Message);
+                    _logger.LogWarning(ex, "Failed to reconcile voice sessions on startup.");
+                }
 
-        foreach (var guild in _client.Guilds)
-        {
-            await SyncGuildMemberProfilesAsync(guild);
-            await TrySendStartupRecoveryAuditAsync(guild);
-        }
-        if (ShouldRunActivityMaintenance())
-        {
-            await SyncActivityRolesAsync(DateTimeOffset.UtcNow);
-        }
-        _runtimeDiagnostics.Mark("startup.ready.end", success: true, note: "OnReadyAsync completed");
+                foreach (var guild in _client.Guilds)
+                {
+                    await SyncGuildMemberProfilesAsync(guild);
+                    await TrySendStartupRecoveryAuditAsync(guild);
+                }
+                if (ShouldRunActivityMaintenance())
+                {
+                    await SyncActivityRolesAsync(DateTimeOffset.UtcNow);
+                }
+
+                await ResyncAllPanelsOnStartupAsync();
+
+                _runtimeDiagnostics.Mark("startup.ready.end", success: true, note: "OnReadyAsync completed");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error in OnReadyAsync background task.");
+            }
+        });
+        
+        return Task.CompletedTask;
     }
 
-    private async Task OnInteractionCreatedAsync(SocketInteraction interaction)
+    private Task OnInteractionCreatedAsync(SocketInteraction interaction)
     {
-        var context = new SocketInteractionContext(_client, interaction);
-        if (interaction is SocketSlashCommand)
+        _ = Task.Run(async () =>
         {
-            if (context.Guild is null || context.User is not SocketGuildUser guildUser)
+            try
             {
-                await interaction.RespondAsync("このコマンドはサーバー内でのみ使えます。", ephemeral: true);
-                return;
-            }
+                var context = new SocketInteractionContext(_client, interaction);
 
-            if (!IsBotAdmin(guildUser))
+                if (context.Guild != null)
+                {
+                    // Cancel any active sleep kick votes if the target user interacts (slash command, button, etc.)
+                    await _sleepKick.CancelVoteAsync(context.Guild.Id, interaction.User.Id, $"{MentionUtils.MentionUser(interaction.User.Id)} 本人の操作を確認したため、投票をキャンセルしました。");
+                }
+
+                if (interaction is SocketSlashCommand)
+                {
+                    if (context.Guild is null || context.User is not SocketGuildUser guildUser)
+                    {
+                        await interaction.RespondAsync("このコマンドはサーバー内でのみ使えます。", ephemeral: true);
+                        return;
+                    }
+
+                    if (!IsBotAdmin(guildUser))
+                    {
+                        var roleName = string.IsNullOrWhiteSpace(_options.AdminRoleName) ? "RaidDC Admin" : _options.AdminRoleName;
+                        await interaction.RespondAsync($"{roleName} ロールが必要です。", ephemeral: true);
+                        await LogImmediatePermissionDeniedAsync(context, $"{roleName} ロールが必要です。");
+                        return;
+                    }
+                }
+
+                var result = await _interactions.ExecuteCommandAsync(context, _services);
+                await LogCommandExecutionAsync(context, result);
+                if (!result.IsSuccess)
+                {
+                    await TryLogInteractionFailureAsync(context, result);
+                    _logger.LogWarning("Interaction failed: {Error} - {Reason}", result.Error, result.ErrorReason);
+                }
+            }
+            catch (Exception ex)
             {
-                var roleName = string.IsNullOrWhiteSpace(_options.AdminRoleName) ? "RaidDC Admin" : _options.AdminRoleName;
-                await interaction.RespondAsync($"{roleName} ロールが必要です。", ephemeral: true);
-                await LogImmediatePermissionDeniedAsync(context, $"{roleName} ロールが必要です。");
-                return;
+                _logger.LogError(ex, "Error in InteractionCreated background task.");
             }
-        }
-
-        var result = await _interactions.ExecuteCommandAsync(context, _services);
-        await LogCommandExecutionAsync(context, result);
-        if (!result.IsSuccess)
-        {
-            await TryLogInteractionFailureAsync(context, result);
-            _logger.LogWarning("Interaction failed: {Error} - {Reason}", result.Error, result.ErrorReason);
-        }
+        });
+        
+        return Task.CompletedTask;
     }
 
     private async Task TrySendStartupRecoveryAuditAsync(SocketGuild guild)
@@ -628,6 +667,25 @@ public sealed class DiscordBotService : IHostedService
             $"⌨️ コマンド: {commandPath}"
         });
 
+        var parametersJson = BuildCommandParametersJson(slash);
+
+        try
+        {
+            await _db.LogCommandAsync(
+                context.Guild.Id,
+                channel?.Id ?? 0,
+                context.User.Id,
+                context.User.Username,
+                commandPath,
+                parametersJson,
+                result.IsSuccess,
+                result.IsSuccess ? null : result.ErrorReason);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to log command to DB");
+        }
+
         if (result.IsSuccess)
         {
             await _audit.SendAsync(context.Guild, "管理コマンド実行", description, Color.Teal, context.User);
@@ -727,6 +785,20 @@ public sealed class DiscordBotService : IHostedService
             var tuning = _runtimeTuning.GetSnapshot();
             var interval = TimeSpan.FromMinutes(tuning.CleanupIntervalMinutes);
             await RunCleanupAsync();
+
+            try
+            {
+                foreach (var guild in _client.Guilds)
+                {
+                    var logChannel = await ResolveLogChannelAsync(guild);
+                    await _sleepKick.DetectAndNotifyAsync(guild, logChannel as ITextChannel);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to run sleep kick detection.");
+            }
+
             _runtimeDiagnostics.Mark("loop.cleanup", success: true, note: $"interval={interval.TotalMinutes:0}m");
 
             try
@@ -2029,7 +2101,7 @@ public sealed class DiscordBotService : IHostedService
         var notificationChannelName = string.IsNullOrWhiteSpace(_options.NotificationChannelName) ? "通知" : _options.NotificationChannelName;
         var activityRankingChannelName = string.IsNullOrWhiteSpace(_options.ActivityRankingChannelName) ? "ランキング" : _options.ActivityRankingChannelName;
         var voiceNotificationRoleName = string.IsNullOrWhiteSpace(_options.VoiceNotificationRoleName) ? "通話通知" : _options.VoiceNotificationRoleName;
-        var registrationReviewChannelName = string.IsNullOrWhiteSpace(_options.RegistrationReviewChannelName) ? "登録確認" : _options.RegistrationReviewChannelName;
+        var registrationReviewChannelName = string.IsNullOrWhiteSpace(_options.AdminConfirmChannelName) ? "管理-確認" : _options.AdminConfirmChannelName;
         var controlChannelName = string.IsNullOrWhiteSpace(_options.ControlChannelName) ? "bot-control" : _options.ControlChannelName;
         var autoOps = new List<string>();
 
@@ -2099,16 +2171,35 @@ public sealed class DiscordBotService : IHostedService
         {
             registrationReviewChannel = guild.GetTextChannel(ToUlong(settings.RegistrationReviewChannelId));
         }
+
         registrationReviewChannel ??= guild.TextChannels.FirstOrDefault(channel =>
             string.Equals(channel.Name, registrationReviewChannelName, StringComparison.OrdinalIgnoreCase));
+
+        registrationReviewChannel ??= guild.TextChannels.FirstOrDefault(channel =>
+            string.Equals(channel.Name, "登録確認", StringComparison.OrdinalIgnoreCase));
+
+        if (registrationReviewChannel is ITextChannel textChannel && string.Equals(textChannel.Name, "登録確認", StringComparison.OrdinalIgnoreCase))
+        {
+            try
+            {
+                await textChannel.ModifyAsync(props => props.Name = registrationReviewChannelName);
+                _logger.LogInformation("Legacy registration review channel renamed to {NewName} in guild {GuildId}.", registrationReviewChannelName, guild.Id);
+                autoOps.Add($"🛠️ チャンネル名自動変更: `登録確認` ➡️ `{registrationReviewChannelName}` (<#{textChannel.Id}>)");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to rename legacy registration review channel in guild {GuildId}.", guild.Id);
+            }
+        }
+
         if (registrationReviewChannel is null)
         {
             registrationReviewChannel = await guild.CreateTextChannelAsync(registrationReviewChannelName, props =>
             {
-                props.Topic = "メンバー登録申請の確認・許可/拒否を行います。";
+                props.Topic = "メンバー登録申請の確認・許可/拒否、および各種管理者確認（寝落ち投票など）を行います。";
             });
             _logger.LogInformation("Registration review channel created in guild {GuildId}.", guild.Id);
-            autoOps.Add($"🛠️ 登録確認チャンネル作成: <#{registrationReviewChannel.Id}>");
+            autoOps.Add($"🛠️ 管理・確認用チャンネル作成: <#{registrationReviewChannel.Id}>");
         }
 
         IMessageChannel? logChannel = null;
@@ -2610,7 +2701,7 @@ public sealed class DiscordBotService : IHostedService
 
             try
             {
-                var embed = await _voiceStats.BuildActivityRankingEmbedAsync(guild, fromUtc, nowUtc, topCount, "今日のアクティビティランキング");
+                var embed = await _voiceStats.BuildActivityRankingEmbedAsync(guild, fromUtc, nowUtc, topCount, ActivityRankingPanel.DailyMessageHeader);
                 var message = await UpsertDailyActivityRankingMessageAsync(guild, channel, panel.MessageId == 0 ? 0 : ToUlong(panel.MessageId), nowJst, embed);
                 await _db.UpsertGuildDailyActivityPanelAsync(guild.Id, channel.Id, message.Id);
                 _dailyActivityRankingPosted[guild.Id] = slotKey;
@@ -3782,6 +3873,101 @@ public sealed class DiscordBotService : IHostedService
         await TrySelfHealContentRolePanelFromCacheAsync(guild, deletedChannel, deletedMessage);
     }
 
+    private async Task ResyncAllPanelsOnStartupAsync()
+    {
+        foreach (var guild in _client.Guilds)
+        {
+            try
+            {
+                // メンバー登録パネル
+                var panel = await _db.GetGuildPanelAsync(guild.Id);
+                if (panel is not null && panel.ChannelId != 0)
+                {
+                    var channel = guild.GetTextChannel(ToUlong(panel.ChannelId));
+                    if (channel is not null)
+                    {
+                        await EnsurePanelMessageAsync(guild.Id, channel, ToUlong(panel.MessageId));
+                    }
+                }
+
+                // Lodestoneパネル
+                var lodestonePanel = await _db.GetGuildLodestonePanelAsync(guild.Id);
+                if (lodestonePanel is not null && lodestonePanel.ChannelId != 0)
+                {
+                    var channel = guild.GetTextChannel(ToUlong(lodestonePanel.ChannelId));
+                    if (channel is not null)
+                    {
+                        await EnsureLodestonePanelMessageAsync(guild.Id, channel, ToUlong(lodestonePanel.MessageId));
+                    }
+                }
+
+                // コントロールパネル
+                var controlPanel = await _db.GetGuildControlPanelAsync(guild.Id);
+                if (controlPanel is not null && controlPanel.ChannelId != 0)
+                {
+                    var channel = guild.GetTextChannel(ToUlong(controlPanel.ChannelId));
+                    if (channel is not null)
+                    {
+                        await EnsureControlPanelMessageAsync(guild.Id, channel);
+                    }
+                }
+
+                // ADMINパネル
+                var adminPanel = await _db.GetGuildAdminControlPanelAsync(guild.Id);
+                if (adminPanel is not null && adminPanel.ChannelId != 0)
+                {
+                    var channel = guild.GetTextChannel(ToUlong(adminPanel.ChannelId));
+                    if (channel is not null)
+                    {
+                        await EnsureAdminControlPanelMessageAsync(guild.Id, channel, ToUlong(adminPanel.MessageId));
+                    }
+                }
+
+                // 募集パネル
+                var recruitPanel = await _db.GetGuildRecruitPanelAsync(guild.Id);
+                if (recruitPanel is not null && recruitPanel.ChannelId != 0)
+                {
+                    var channel = guild.GetTextChannel(ToUlong(recruitPanel.ChannelId));
+                    if (channel is not null)
+                    {
+                        await EnsureRecruitPanelMessageAsync(guild.Id, channel, ToUlong(recruitPanel.MessageId));
+                    }
+                }
+
+                // 設定パネル（チャンネルスキャン）
+                var settingsPanelCount = 0;
+                foreach (var textChannel in guild.TextChannels)
+                {
+                    try
+                    {
+                        var messages = await textChannel.GetMessagesAsync(limit: 50).FlattenAsync();
+                        foreach (var message in messages.OfType<IUserMessage>())
+                        {
+                            if (SettingsPanel.LooksLikePanelMessage(message.Content) || message.Embeds.Any(e => e.Title == "⚙️ 設定パネル"))
+                            {
+                                await message.ModifyAsync(props =>
+                                {
+                                    props.Content = SettingsPanel.PanelMessage;
+                                    props.Embed = SettingsPanel.BuildEmbed();
+                                    props.Components = SettingsPanel.BuildComponents();
+                                });
+                                settingsPanelCount++;
+                                break;
+                            }
+                        }
+                    }
+                    catch { }
+                }
+
+                _logger.LogInformation("Resynced all panels on startup. GuildId={GuildId}, SettingsPanels={SettingsPanelCount}", guild.Id, settingsPanelCount);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to resync panels on startup. GuildId={GuildId}", guild.Id);
+            }
+        }
+    }
+
     private async Task TrySelfHealTrackedPanelAsync(
         SocketGuild guild,
         SocketGuildChannel deletedChannel,
@@ -3943,7 +4129,8 @@ public sealed class DiscordBotService : IHostedService
         var settings = await _db.GetGuildSettingsAsync(guildId);
         var approvalRequired = settings?.RegistrationApprovalRequired ?? true;
         var inactiveAutoKickEnabled = settings?.InactiveAutoKickEnabled ?? _options.InactiveAutoKickEnabled;
-        var embed = BuildAdminPanelStatusEmbed(approvalRequired, inactiveAutoKickEnabled);
+        var sleepKickAdminConfirm = settings?.SleepKickAdminConfirmationRequired ?? _options.SleepKickRequiresAdminConfirmation;
+        var embed = BuildAdminPanelStatusEmbed(approvalRequired, inactiveAutoKickEnabled, sleepKickAdminConfirm);
         var components = AdminControlPanel.BuildComponents(approvalRequired, inactiveAutoKickEnabled);
 
         if (existing is not null)
@@ -4040,8 +4227,8 @@ public sealed class DiscordBotService : IHostedService
             _ => ButtonStyle.Secondary
         };
 
-    private static Embed BuildAdminPanelStatusEmbed(bool approvalRequired, bool inactiveAutoKickEnabled)
-        => AdminControlPanel.BuildStatusEmbed(approvalRequired, inactiveAutoKickEnabled, includeReactionLabelInAutoKickNote: true);
+    private static Embed BuildAdminPanelStatusEmbed(bool approvalRequired, bool inactiveAutoKickEnabled, bool sleepKickAdminConfirm = false)
+        => AdminControlPanel.BuildStatusEmbed(approvalRequired, inactiveAutoKickEnabled, sleepKickAdminConfirm, includeReactionLabelInAutoKickNote: true);
 
     private async Task EnsureVisibilityAsync(
         SocketGuild guild,
@@ -4336,6 +4523,23 @@ public sealed class DiscordBotService : IHostedService
             return;
         }
 
+        // Track VC join/leave for sleep kick detection
+        if (beforeChannel is null && afterChannel is not null)
+        {
+            SleepKickJoinTracker.SetJoinTime(user.Id, DateTimeOffset.UtcNow);
+            if (user is SocketGuildUser guildUser)
+            {
+                await _voiceTextService.TrySendSpoilerWarningAsync(guildUser, afterChannel);
+            }
+        }
+        else if (beforeChannel is not null && afterChannel is null)
+        {
+            SleepKickJoinTracker.RemoveJoinTime(user.Id);
+        }
+
+        // Cancel any active sleep kick votes if the target user changes their voice state (e.g. unmuting)
+        await _sleepKick.CancelVoteAsync(guild.Id, user.Id, $"{MentionUtils.MentionUser(user.Id)} 本人のアクティビティを確認したため、投票をキャンセルしました。");
+
         await MarkUserActiveNowAsync(guild, user.Id);
 
         var now = DateTimeOffset.UtcNow;
@@ -4370,10 +4574,19 @@ public sealed class DiscordBotService : IHostedService
 
         string title;
         Color color;
+        DiscordUserProfile? joinProfile = null;
         if (beforeChannel is null && afterChannel is not null)
         {
             title = "VC参加";
-            color = Color.Green;
+            try
+            {
+                joinProfile = await _db.GetDiscordUserProfileAsync(user.Id);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Failed to fetch user profile for voice join color. UserId={UserId}", user.Id);
+            }
+            color = ResolveStoryProgressionColor(joinProfile?.StoryProgression);
         }
         else if (beforeChannel is not null && afterChannel is null)
         {
@@ -4394,7 +4607,19 @@ public sealed class DiscordBotService : IHostedService
 
         if (shouldNotifyUserVoiceActivity && isFirstJoinInChannel && afterChannel is not null)
         {
-            var firstJoinEmbed = CreateLogEmbedBase(guild, "通話開始", Color.Green, user, preferGuildDisplayName: true)
+            if (joinProfile is null && beforeChannel is not null)
+            {
+                try
+                {
+                    joinProfile = await _db.GetDiscordUserProfileAsync(user.Id);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "Failed to fetch user profile for first join color. UserId={UserId}", user.Id);
+                }
+            }
+            var firstJoinColor = ResolveStoryProgressionColor(joinProfile?.StoryProgression);
+            var firstJoinEmbed = CreateLogEmbedBase(guild, "通話開始", firstJoinColor, user, preferGuildDisplayName: true)
                 .WithDescription(BuildVoiceFirstJoinSummary(guild, user, afterChannel, now))
                 .Build();
             await SendNotificationEmbedAsync(guild, firstJoinEmbed, mentionVoiceRole: true);
@@ -4588,6 +4813,9 @@ public sealed class DiscordBotService : IHostedService
             return;
         }
 
+        // Cancel any active sleep kick votes if the target user edits a message.
+        await _sleepKick.CancelVoteAsync(guildChannel.Guild.Id, after.Author.Id, $"{MentionUtils.MentionUser(after.Author.Id)} 本人の発言編集を確認したため、投票をキャンセルしました。");
+
         var stored = await _db.GetMessageAsync(after.Id);
         var before = beforeCache.HasValue ? beforeCache.Value.Content : stored?.Content ?? "(内容取得不可)";
         var afterContent = string.IsNullOrWhiteSpace(after.Content) ? "(内容取得不可)" : after.Content;
@@ -4655,6 +4883,9 @@ public sealed class DiscordBotService : IHostedService
             return;
         }
 
+        // Cancel any active sleep kick votes if the target user sends a message.
+        await _sleepKick.CancelVoteAsync(guildChannel.Guild.Id, message.Author.Id, $"{MentionUtils.MentionUser(message.Author.Id)} 本人の発言を確認したため、投票をキャンセルしました。");
+
         if (message is not SocketUserMessage userMessage)
         {
             return;
@@ -4683,6 +4914,7 @@ public sealed class DiscordBotService : IHostedService
         await _db.TouchInquiryTicketActivityAsync(guildChannel.Id, userMessage.Timestamp);
         await MarkUserActiveNowAsync(guildChannel.Guild, userMessage.Author.Id);
         await TryScheduleVoiceTextAutoDeleteAsync(guildChannel, userMessage);
+        await TryScheduleFflogsAutoDeleteAsync(guildChannel, userMessage);
     }
 
     private async Task TryScheduleVoiceTextAutoDeleteAsync(SocketGuildChannel guildChannel, SocketUserMessage message)
@@ -4731,6 +4963,31 @@ public sealed class DiscordBotService : IHostedService
             catch (Exception ex)
             {
                 _logger.LogWarning(ex, "VC text auto-delete task failed. GuildId={GuildId}, ChannelId={ChannelId}, MessageId={MessageId}",
+                    guildChannel.Guild.Id, guildChannel.Id, message.Id);
+            }
+        });
+    }
+
+    private async Task TryScheduleFflogsAutoDeleteAsync(SocketGuildChannel guildChannel, SocketUserMessage message)
+    {
+        var content = message.Content ?? string.Empty;
+        if (!content.Contains("fflogs.com/", StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        var delay = TimeSpan.FromMinutes(3);
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await Task.Delay(delay);
+                await TryExecuteVoiceTextAutoDeleteAsync(guildChannel.Guild.Id, guildChannel.Id, message.Id, message.Author.Id);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "FFLogs auto-delete task failed. GuildId={GuildId}, ChannelId={ChannelId}, MessageId={MessageId}",
                     guildChannel.Guild.Id, guildChannel.Id, message.Id);
             }
         });
@@ -4893,6 +5150,9 @@ public sealed class DiscordBotService : IHostedService
         {
             return;
         }
+
+        // Cancel any active sleep kick votes if the target user adds a reaction.
+        await _sleepKick.CancelVoteAsync(guildChannel.Guild.Id, reaction.UserId, $"{MentionUtils.MentionUser(reaction.UserId)} 本人のリアクションを確認したため、投票をキャンセルしました。");
 
         try
         {
@@ -5242,6 +5502,23 @@ public sealed class DiscordBotService : IHostedService
         var parts = new List<string> { slash.CommandName };
         AppendSlashCommandPathParts(slash.Data.Options, parts);
         return "/" + string.Join(' ', parts);
+    }
+
+    private static string? BuildCommandParametersJson(SocketSlashCommand slash)
+    {
+        try
+        {
+            var dict = new Dictionary<string, object?>();
+            foreach (var opt in slash.Data.Options)
+            {
+                dict[opt.Name] = opt.Value;
+            }
+            return System.Text.Json.JsonSerializer.Serialize(dict);
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     private static string BuildInteractionRoute(SocketInteraction interaction)
@@ -6366,6 +6643,20 @@ public sealed class DiscordBotService : IHostedService
             _logger.LogWarning(ex, "Failed to load ranking podium counts. GuildId={GuildId}, UserId={UserId}", channel.Guild.Id, user.Id);
         }
 
+        string? timePatternHint = null;
+        if (_options.VoiceJoinTimePatternEnabled)
+        {
+            try
+            {
+                var jstNow = TimeZoneInfo.ConvertTimeBySystemTimeZoneId(DateTimeOffset.UtcNow, "Tokyo Standard Time");
+                timePatternHint = await BuildVoiceTimePatternHintAsync(channel.Guild.Id, user.Id, jstNow.Hour, _options.VoiceJoinTimePatternDays);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to build voice time pattern hint. GuildId={GuildId}, UserId={UserId}", channel.Guild.Id, user.Id);
+            }
+        }
+
         var embed = await _profileEmbeds.BuildProfileEmbedAsync(
             user,
             channel.Guild,
@@ -6381,8 +6672,98 @@ public sealed class DiscordBotService : IHostedService
                     "💬 発言数 TOP3回数",
                     FormatPodiumCounts(messagePodiumCounts),
                     true);
+                if (!string.IsNullOrWhiteSpace(timePatternHint))
+                {
+                    builder.AddField(
+                        "🕐 時間帯の傾向",
+                        timePatternHint,
+                        false);
+                }
             });
         await textChannel.SendMessageAsync(embed: embed);
+    }
+
+    private async Task<string?> BuildVoiceTimePatternHintAsync(ulong guildId, ulong userId, int currentHourJst, int lookbackDays)
+    {
+        if (lookbackDays <= 0)
+        {
+            return null;
+        }
+
+        var nowUtc = DateTimeOffset.UtcNow;
+        var fromUtc = nowUtc.AddDays(-lookbackDays);
+        var activity = await _db.ListVoiceHourlyActivityByUserAsync(guildId, userId, fromUtc, nowUtc);
+        if (activity.Count == 0)
+        {
+            return null;
+        }
+
+        var sorted = activity
+            .Where(a => a.TotalSeconds > 0)
+            .OrderByDescending(a => a.TotalSeconds)
+            .ToList();
+        if (sorted.Count == 0)
+        {
+            return null;
+        }
+
+        var hourLabel = $"{currentHourJst}時台";
+        var current = sorted.FirstOrDefault(a => a.Hour == currentHourJst);
+
+        var textHint = BuildTextHint(sorted, currentHourJst, current);
+        return textHint;
+    }
+
+    private static string BuildTextHint(List<VoiceHourlyActivity> sorted, int currentHourJst, VoiceHourlyActivity? current)
+    {
+        var hourLabel = $"{currentHourJst}時台";
+
+        if (sorted.Count == 0)
+        {
+            return "VC活動データがまだありません";
+        }
+
+        var maxSeconds = sorted[0].TotalSeconds;
+        var totalSeconds = sorted.Sum(a => a.TotalSeconds);
+        var avgSeconds = totalSeconds / sorted.Count;
+
+        // Build peak time range
+        var peakHours = sorted.Take(3).Select(a => a.Hour).OrderBy(h => h).ToList();
+        var peakRange = string.Join("時・", peakHours) + "時";
+
+        var peakLine = sorted.Count switch
+        {
+            1 => $"よくいる時間帯: {sorted[0].Hour}時のみ",
+            _ => $"よくいる時間帯: {peakRange}"
+        };
+
+        if (current == null)
+        {
+            return $"{peakLine}\n{hourLabel}はまだVCに来たことがないようです 🆕";
+        }
+
+        var rank = sorted.FindIndex(a => a.Hour == currentHourJst) + 1;
+
+        string currentLine;
+        if (current.TotalSeconds == maxSeconds)
+        {
+            var pct = totalSeconds > 0 ? (int)(current.TotalSeconds * 100 / totalSeconds) : 100;
+            currentLine = $"{hourLabel}が一番よくVCにいる時間帯です！ 🎉（全VC時間の{Math.Clamp(pct, 0, 100)}%）";
+        }
+        else if (rank <= 3)
+        {
+            currentLine = $"よくVCにいる時間帯です！ ✨（{rank}番目）";
+        }
+        else if (current.TotalSeconds >= avgSeconds)
+        {
+            currentLine = $"{hourLabel}、わりとよくいますね 👀";
+        }
+        else
+        {
+            currentLine = $"{hourLabel}もたまにVCに来てますね 👣";
+        }
+
+        return $"{peakLine}\n{currentLine}";
     }
 
     private static string FormatPodiumCounts(ActivityRankingPodiumCount counts)
@@ -6757,6 +7138,20 @@ public sealed class DiscordBotService : IHostedService
         }
 
         return null;
+    }
+
+    private static Color ResolveStoryProgressionColor(string? storyProgression)
+    {
+        return storyProgression?.ToLowerInvariant() switch
+        {
+            "arr_hw" => Color.Green,
+            "sb" => Color.Teal,
+            "shb" => Color.Purple,
+            "ew" => Color.Blue,
+            "dt" => Color.Gold,
+            "completed" => Color.Orange,
+            _ => Color.Green
+        };
     }
 
     private sealed record MessageAttachmentSnapshot(

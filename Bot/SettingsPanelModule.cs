@@ -15,10 +15,22 @@ public sealed class SettingsPanelModule : InteractionModuleBase<SocketInteractio
     private const string SsSourceChannelName = "ss";
     private const string InquiryOpenButtonCustomId = "inquiry_open";
     private const string VoiceTextAutoDeleteSetCustomIdPrefix = "voice_text_autodelete_set:";
+    private const string SelfStorySelectCustomIdPrefix = "settings_self_story_select:";
+
+    private static readonly IReadOnlyDictionary<string, string> StoryProgressionOptions = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+    {
+        ["arr_hw"] = "新生〜蒼天",
+        ["sb"] = "紅蓮",
+        ["shb"] = "漆黒",
+        ["ew"] = "暁月",
+        ["dt"] = "黄金",
+        ["completed"] = "最新パッチ済み"
+    };
 
     private readonly Db _db;
     private readonly RecruitmentListService _recruitListService;
     private readonly UserProfileEmbedService _profileEmbeds;
+    private readonly GuildAuditLogService _audit;
     private readonly ILogger<SettingsPanelModule> _logger;
     private readonly DiscordOptions _options;
 
@@ -26,12 +38,14 @@ public sealed class SettingsPanelModule : InteractionModuleBase<SocketInteractio
         Db db,
         RecruitmentListService recruitListService,
         UserProfileEmbedService profileEmbeds,
+        GuildAuditLogService audit,
         ILogger<SettingsPanelModule> logger,
         IOptions<DiscordOptions> options)
     {
         _db = db;
         _recruitListService = recruitListService;
         _profileEmbeds = profileEmbeds;
+        _audit = audit;
         _logger = logger;
         _options = options.Value;
     }
@@ -54,6 +68,7 @@ public sealed class SettingsPanelModule : InteractionModuleBase<SocketInteractio
 
         await DeferAsync(ephemeral: true);
         var message = await EnsureSettingsPanelMessageAsync(channel);
+        await _audit.SendAsync(Context.Guild, "設定パネル設置", $"<#{Context.Channel.Id}> に設定パネルを設置しました。", Color.Blue, Context.User);
         await FollowupAsync($"このチャンネルに設定パネルを設置しました。(message: {message.Id})", ephemeral: true);
     }
 
@@ -67,10 +82,13 @@ public sealed class SettingsPanelModule : InteractionModuleBase<SocketInteractio
         }
 
         await DeferAsync(ephemeral: true);
+        _logger.LogInformation("Toggle self voice notify. UserId={UserId}, GuildId={GuildId}", Context.User.Id, Context.Guild.Id);
 
         try
         {
             var enabled = await _db.ToggleVoiceNotificationEnabledAsync(Context.User.Id);
+            _logger.LogInformation("Self voice notify toggled. UserId={UserId}, Enabled={Enabled}", Context.User.Id, enabled);
+            await _audit.SendAsync(Context.Guild, "自己設定変更", $"VC通知を **{(enabled ? "ON" : "OFF")}** に変更しました。", Color.Green, Context.User);
             var embed = await BuildSelfSettingsEmbedAsync(guildUser, "設定を更新しました", enabled);
             await FollowupAsync(embed: embed, ephemeral: true);
         }
@@ -126,6 +144,7 @@ public sealed class SettingsPanelModule : InteractionModuleBase<SocketInteractio
             var notice = updated.Enabled
                 ? $"VC内テキスト自動削除を ON ({Math.Clamp(updated.RetentionHours <= 0 ? 6 : updated.RetentionHours, 1, 168)}時間) に設定しました。"
                 : "VC内テキスト自動削除を OFF に設定しました。";
+            await _audit.SendAsync(Context.Guild, "自己設定変更", notice, Color.Green, Context.User);
             var embed = BuildVoiceTextAutoDeleteConfigEmbed(guildUser, updated, notice);
             var components = BuildVoiceTextAutoDeleteConfigComponents(updated);
 
@@ -149,30 +168,6 @@ public sealed class SettingsPanelModule : InteractionModuleBase<SocketInteractio
         }
     }
 
-    [ComponentInteraction(SettingsPanel.ShowSelfStatusCustomId, ignoreGroupNames: true)]
-    public async Task ShowSelfSettingsAsync()
-    {
-        if (Context.Guild is null || Context.User is not SocketGuildUser guildUser)
-        {
-            await RespondAsync("この操作はサーバー内でのみ使えます。", ephemeral: true);
-            return;
-        }
-
-        await DeferAsync(ephemeral: true);
-
-        try
-        {
-            var current = await _db.GetVoiceNotificationEnabledAsync(Context.User.Id);
-            var embed = await BuildSelfSettingsEmbedAsync(guildUser, "現在の設定", current);
-            await FollowupAsync(embed: embed, ephemeral: true);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Failed to show self settings. UserId={UserId}", Context.User.Id);
-            await FollowupAsync("設定の取得に失敗しました。時間をおいて再試行してください。", ephemeral: true);
-        }
-    }
-
     [ComponentInteraction(SettingsPanel.ShowMyPageCustomId, ignoreGroupNames: true)]
     public async Task ShowMyPageAsync()
     {
@@ -183,10 +178,12 @@ public sealed class SettingsPanelModule : InteractionModuleBase<SocketInteractio
         }
 
         await DeferAsync(ephemeral: true);
+        _logger.LogInformation("Show my page requested. UserId={UserId}, GuildId={GuildId}", Context.User.Id, Context.Guild.Id);
 
         try
         {
             var embed = await BuildMyPageEmbedAsync(guildUser);
+            await _audit.SendAsync(Context.Guild, "マイページ表示", "マイページを表示しました。", Color.Blue, Context.User);
             await FollowupAsync(embed: embed, ephemeral: true);
         }
         catch (Exception ex)
@@ -205,6 +202,8 @@ public sealed class SettingsPanelModule : InteractionModuleBase<SocketInteractio
             return;
         }
 
+        _logger.LogInformation("Show achievement resume requested. UserId={UserId}, GuildId={GuildId}", Context.User.Id, Context.Guild.Id);
+        await _audit.SendAsync(Context.Guild, "レイド履歴書表示", "レイド履歴書の表示をリクエストしました。", Color.Purple, Context.User);
         var components = AchievementResumeModule.BuildSavageFilterComponents(Context.User.Id);
         await RespondAsync(
             "表示したい零式カテゴリを選択してください。選択後に履歴書を生成します。",
@@ -222,6 +221,7 @@ public sealed class SettingsPanelModule : InteractionModuleBase<SocketInteractio
         }
 
         await DeferAsync(ephemeral: true);
+        _logger.LogInformation("Show self profile requested. UserId={UserId}, GuildId={GuildId}", Context.User.Id, Context.Guild.Id);
 
         try
         {
@@ -231,6 +231,7 @@ public sealed class SettingsPanelModule : InteractionModuleBase<SocketInteractio
                 "自分の情報",
                 Color.Blue,
                 includeLodestoneExtras: true);
+            await _audit.SendAsync(Context.Guild, "自己プロフィール表示", "自己プロフィールを表示しました。", Color.Blue, Context.User);
             await FollowupAsync(embed: embed, ephemeral: true);
         }
         catch (Exception ex)
@@ -238,6 +239,73 @@ public sealed class SettingsPanelModule : InteractionModuleBase<SocketInteractio
             _logger.LogWarning(ex, "Failed to show self profile from settings panel. UserId={UserId}", Context.User.Id);
             await FollowupAsync("自分の情報の表示に失敗しました。時間をおいて再試行してください。", ephemeral: true);
         }
+    }
+
+    [ComponentInteraction(SettingsPanel.ChangeSelfStoryProgressionCustomId, ignoreGroupNames: true)]
+    public async Task ShowSelfStoryProgressionSelectAsync()
+    {
+        if (Context.Guild is null)
+        {
+            await RespondAsync("この操作はサーバー内でのみ使えます。", ephemeral: true);
+            return;
+        }
+
+        var profile = await _db.GetDiscordUserProfileAsync(Context.User.Id);
+        var current = FormatStoryProgression(profile?.StoryProgression);
+
+        var components = ProfileUI.BuildStoryProgressionSelect(key => $"{SelfStorySelectCustomIdPrefix}{Context.User.Id}:{key}");
+
+        await RespondAsync(
+            $"あなたのストーリー進行度を選択してください。\n（現在: {current}）",
+            components: components,
+            ephemeral: true);
+    }
+
+    [ComponentInteraction(SelfStorySelectCustomIdPrefix + "*:*", ignoreGroupNames: true)]
+    public async Task HandleSelfStoryProgressionSelectAsync(string userIdRaw, string storyKey)
+    {
+        if (Context.Guild is null)
+        {
+            await RespondAsync("この操作はサーバー内でのみ使えます。", ephemeral: true);
+            return;
+        }
+
+        if (!ulong.TryParse(userIdRaw, out var targetUserId) || targetUserId != Context.User.Id)
+        {
+            await RespondAsync("ユーザー情報が不正です。", ephemeral: true);
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(storyKey))
+        {
+            await RespondAsync("選択が不正です。", ephemeral: true);
+            return;
+        }
+
+        var storyProgression = StoryProgressionOptions.ContainsKey(storyKey) ? storyKey : null;
+        var label = FormatStoryProgression(storyProgression);
+
+        try
+        {
+            await _db.UpdateUserStoryProgressionAsync(targetUserId, storyProgression);
+        }
+        catch
+        {
+            await RespondAsync("ストーリー進行度の更新に失敗しました。", ephemeral: true);
+            return;
+        }
+
+        if (Context.Interaction is SocketMessageComponent component)
+        {
+            await component.UpdateAsync(props =>
+            {
+                props.Content = $"ストーリー進行度を **{label}** に更新しました。";
+                props.Components = new ComponentBuilder().Build();
+                props.Embed = null;
+            });
+        }
+
+        await _audit.SendAsync(Context.Guild, "自己設定変更", $"ストーリー進行度を {label} に変更しました。", Color.Green, Context.User);
     }
 
     [RequireBotAdmin]
@@ -431,12 +499,14 @@ public sealed class SettingsPanelModule : InteractionModuleBase<SocketInteractio
                 message.Author.Id == Context.Client.CurrentUser.Id &&
                 SettingsPanel.LooksLikePanelMessage(message.Content));
 
+        var embed = SettingsPanel.BuildEmbed();
         var components = SettingsPanel.BuildComponents();
         if (existing is not null)
         {
             await existing.ModifyAsync(props =>
             {
                 props.Content = SettingsPanel.PanelMessage;
+                props.Embed = embed;
                 props.Components = components;
             });
             return existing;
@@ -446,6 +516,7 @@ public sealed class SettingsPanelModule : InteractionModuleBase<SocketInteractio
         {
             return await channel.SendMessageAsync(
                 SettingsPanel.PanelMessage,
+                embed: embed,
                 components: components,
                 flags: MessageFlags.SuppressNotification);
         }
@@ -460,10 +531,11 @@ public sealed class SettingsPanelModule : InteractionModuleBase<SocketInteractio
     {
         return await RefreshPanelsByScanAsync(
             guild,
-            match: message => SettingsPanel.LooksLikePanelMessage(message.Content),
+            match: message => SettingsPanel.LooksLikePanelMessage(message.Content) || message.Embeds.Any(e => e.Title?.Contains("設定パネル") == true),
             update: message => message.ModifyAsync(props =>
             {
                 props.Content = SettingsPanel.PanelMessage;
+                props.Embed = SettingsPanel.BuildEmbed();
                 props.Components = SettingsPanel.BuildComponents();
             }),
             panelName: "settings");
@@ -858,45 +930,70 @@ public sealed class SettingsPanelModule : InteractionModuleBase<SocketInteractio
     {
         var guildId = guildUser.Guild.Id;
         var userId = guildUser.Id;
-        var toUtcExclusive = DateTimeOffset.UtcNow;
-        var fromUtcInclusive = toUtcExclusive.AddDays(-7);
 
         var hostRecruitsTask = _db.ListActiveRecruitPostsByCreatorAsync(guildId, userId);
         var joinedRecruitsTask = _db.ListActiveRecruitPostsByParticipantAsync(guildId, userId, maxRows: 5);
         var activeLotteriesTask = _db.ListActiveLotteriesByEntryUserAsync(guildId, userId, maxRows: 5);
         var inquiryTask = _db.GetOpenInquiryTicketByRequesterAsync(guildId, userId);
-        var weeklyMessageCountTask = _db.CountMessagesByUserAsync(guildId, userId, fromUtcInclusive, toUtcExclusive, includeDeleted: false);
-        var weeklyVoiceSummaryTask = _db.SummarizeVoiceByUserAsync(guildId, userId, fromUtcInclusive, toUtcExclusive);
+        var profileTask = _db.GetDiscordUserProfileAsync(userId);
+        var mainCharTask = _db.GetMainCharacterAsync(userId);
         var settingsTask = _db.GetGuildSettingsAsync(guildId);
+        var vcNotifyTask = _db.GetVoiceNotificationEnabledAsync(userId);
+        var vcTextAutoDeleteTask = _db.GetVoiceTextAutoDeletePolicyAsync(userId);
 
         await Task.WhenAll(
             hostRecruitsTask,
             joinedRecruitsTask,
             activeLotteriesTask,
             inquiryTask,
-            weeklyMessageCountTask,
-            weeklyVoiceSummaryTask,
-            settingsTask);
+            profileTask,
+            mainCharTask,
+            settingsTask,
+            vcNotifyTask,
+            vcTextAutoDeleteTask);
 
         var hostRecruits = (await hostRecruitsTask).Take(5).ToList();
         var joinedRecruits = (await joinedRecruitsTask).ToList();
         var activeLotteries = (await activeLotteriesTask).ToList();
         var inquiry = await inquiryTask;
-        var weeklyMessageCount = await weeklyMessageCountTask;
-        var (weeklyVoiceSessionCount, weeklyVoiceDurationSeconds) = await weeklyVoiceSummaryTask;
+        var profile = await profileTask;
+        var mainChar = await mainCharTask;
         var settings = await settingsTask;
+        var vcNotifyEnabled = await vcNotifyTask;
+        var vcTextAutoDelete = await vcTextAutoDeleteTask;
 
-        var memberRole = ResolveGuildRole(guildUser.Guild, settings?.MemberRoleId ?? 0, _options.MemberRoleName);
-        var provisionalRole = ResolveGuildRole(guildUser.Guild, settings?.ProvisionalRoleId ?? 0, _options.ProvisionalRoleName);
-        var isMember = memberRole is not null && guildUser.Roles.Any(role => role.Id == memberRole.Id);
-        var isProvisional = provisionalRole is not null && guildUser.Roles.Any(role => role.Id == provisionalRole.Id);
-        var approvalRequired = settings?.RegistrationApprovalRequired ?? true;
-        var pendingRegistrationCount = !isMember && isProvisional && approvalRequired ? 1 : 0;
-        var registrationState = isMember
-            ? "登録済み"
-            : (isProvisional
-                ? (approvalRequired ? "申請中(確認待ち)" : "仮登録")
-                : "未登録");
+        var memberRole = settings is not null && settings.MemberRoleId != 0
+            ? guildUser.Guild.GetRole(ToUlong(settings.MemberRoleId))
+            : null;
+        var provisionalRole = settings is not null && settings.ProvisionalRoleId != 0
+            ? guildUser.Guild.GetRole(ToUlong(settings.ProvisionalRoleId))
+            : null;
+        var voiceNotifyRoleName = string.IsNullOrWhiteSpace(_options.VoiceNotificationRoleName)
+            ? "通話通知"
+            : _options.VoiceNotificationRoleName;
+        var voiceNotifyRole = guildUser.Guild.Roles.FirstOrDefault(role =>
+            string.Equals(role.Name, voiceNotifyRoleName, StringComparison.OrdinalIgnoreCase));
+
+        var memberState = "未登録";
+        if (memberRole is not null && guildUser.Roles.Any(role => role.Id == memberRole.Id))
+        {
+            memberState = "登録済み";
+        }
+        else if (provisionalRole is not null && guildUser.Roles.Any(role => role.Id == provisionalRole.Id))
+        {
+            memberState = "仮登録";
+        }
+
+        var hasVoiceNotifyRole = voiceNotifyRole is not null && guildUser.Roles.Any(role => role.Id == voiceNotifyRole.Id);
+        var vcTextAutoDeleteState = vcTextAutoDelete.Enabled
+            ? $"ON ({Math.Clamp(vcTextAutoDelete.RetentionHours <= 0 ? 6 : vcTextAutoDelete.RetentionHours, 1, 168)}時間)"
+            : "OFF";
+        var roleList = guildUser.Roles
+            .Where(role => role.Id != guildUser.Guild.EveryoneRole.Id)
+            .OrderByDescending(role => role.Position)
+            .Select(role => role.Mention)
+            .ToList();
+        var roleText = roleList.Count == 0 ? "なし" : Truncate(string.Join(", ", roleList), 1000);
 
         var embed = new EmbedBuilder()
             .WithTitle("マイページ")
@@ -904,16 +1001,20 @@ public sealed class SettingsPanelModule : InteractionModuleBase<SocketInteractio
             .WithCurrentTimestamp()
             .WithAuthor(guildUser.DisplayName, guildUser.GetAvatarUrl() ?? guildUser.GetDefaultAvatarUrl())
             .AddField(
-                "今週サマリー(7日)",
-                $"発言数: {weeklyMessageCount:N0}件\n" +
-                $"VC滞在: {FormatDurationForMyPage(weeklyVoiceDurationSeconds)} ({weeklyVoiceSessionCount:N0}回)\n" +
-                $"参加中募集: {joinedRecruits.Count}件\n" +
-                $"保留中申請: {pendingRegistrationCount}件",
+                "プロフィール",
+                $"キャラ名: {profile?.FfxivName ?? "未設定"}\n" +
+                $"ストーリー進行度: {FormatStoryProgression(profile?.StoryProgression)}\n" +
+                $"ロドスト連携: {(mainChar is not null ? "済み" : "未連携")}",
                 false)
             .AddField(
-                "サマリー",
-                $"登録状態: {registrationState}\n募集(主催中): {hostRecruits.Count}件\n募集(参加中): {joinedRecruits.Count}件\n抽選(応募中/結果待ち): {activeLotteries.Count}件\n問い合わせ(進行中): {(inquiry is null ? 0 : 1)}件",
+                "設定状態",
+                $"メンバー登録: {memberState}\n" +
+                $"通話通知ロール: {(hasVoiceNotifyRole ? "ON" : "OFF")}\n" +
+                $"自分のVC通知: {(vcNotifyEnabled ? "ON" : "OFF")}\n" +
+                $"VCテキスト自動削除: {vcTextAutoDeleteState}",
                 false)
+            .AddField("サーバー参加日", guildUser.JoinedAt.HasValue ? $"<t:{guildUser.JoinedAt.Value.ToUnixTimeSeconds()}:F>" : "不明", true)
+            .AddField("現在のロール", roleText, false)
             .AddField("募集(主催中)", BuildRecruitSummaryLines(guildId, hostRecruits), false)
             .AddField("募集(参加中)", BuildRecruitSummaryLines(guildId, joinedRecruits), false)
             .AddField("抽選(応募中/結果待ち)", BuildLotterySummaryLines(guildId, activeLotteries), false)
@@ -1006,42 +1107,28 @@ public sealed class SettingsPanelModule : InteractionModuleBase<SocketInteractio
             : $"`{status}` [{Truncate(subject, 120)}]({channelLink}) / 更新: {updated}";
     }
 
-    private static IRole? ResolveGuildRole(SocketGuild guild, long roleId, string? fallbackName)
+    private static string FormatStoryProgression(string? storyProgression)
     {
-        if (roleId != 0)
+        if (string.IsNullOrWhiteSpace(storyProgression))
         {
-            var byId = guild.GetRole(ToUlong(roleId));
-            if (byId is not null)
-            {
-                return byId;
-            }
+            return "未設定";
         }
 
-        if (string.IsNullOrWhiteSpace(fallbackName))
+        return storyProgression switch
         {
-            return null;
-        }
-
-        return guild.Roles.FirstOrDefault(role =>
-            string.Equals(role.Name, fallbackName, StringComparison.OrdinalIgnoreCase));
-    }
-
-    private static string FormatDurationForMyPage(long durationSeconds)
-    {
-        var safe = Math.Max(0L, durationSeconds);
-        var hours = safe / 3600;
-        var minutes = (safe % 3600) / 60;
-        if (hours > 0)
-        {
-            return $"{hours}時間{minutes:00}分";
-        }
-
-        return $"{minutes}分";
+            "arr_hw" => "新生〜蒼天",
+            "sb" => "紅蓮",
+            "shb" => "漆黒",
+            "ew" => "暁月",
+            "dt" => "黄金",
+            "completed" => "最新パッチ済み",
+            _ => storyProgression,
+        };
     }
 
     private static string BuildDiscordMessageLink(ulong guildId, ulong channelId, ulong messageId)
         => $"https://discord.com/channels/{guildId}/{channelId}/{messageId}";
 
-    private static Embed BuildAdminPanelStatusEmbed(bool approvalRequired, bool inactiveAutoKickEnabled)
-        => AdminControlPanel.BuildStatusEmbed(approvalRequired, inactiveAutoKickEnabled);
+    private static Embed BuildAdminPanelStatusEmbed(bool approvalRequired, bool inactiveAutoKickEnabled, bool sleepKickAdminConfirm = false)
+        => AdminControlPanel.BuildStatusEmbed(approvalRequired, inactiveAutoKickEnabled, sleepKickAdminConfirm);
 }

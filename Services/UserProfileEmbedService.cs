@@ -58,6 +58,10 @@ public sealed class UserProfileEmbedService
         {
             embed.AddField("一言", snapshot.BioInfo, false);
         }
+        if (!string.IsNullOrWhiteSpace(snapshot.StoryProgression))
+        {
+            embed.AddField("📖 ストーリー進行度", snapshot.StoryProgression, false);
+        }
         embed.AddField("ロール", snapshot.RoleInfo, false);
 
         configure?.Invoke(embed);
@@ -135,7 +139,8 @@ public sealed class UserProfileEmbedService
             BuildVoiceCharacterInfo(character, profile),
             character,
             BuildVoiceSnsInfo(profile),
-            BuildVoiceBioInfo(profile, _options.VoiceProfileMaxBioLength));
+            BuildVoiceBioInfo(profile, _options.VoiceProfileMaxBioLength),
+            FormatStoryProgression(profile?.StoryProgression));
     }
 
     private async Task<string> BuildLodestoneExtrasInfoAsync(LinkedCharacter? character)
@@ -408,5 +413,25 @@ public sealed class UserProfileEmbedService
         string CharacterInfo,
         LinkedCharacter? LinkedCharacter,
         string SnsInfo,
-        string BioInfo);
+        string BioInfo,
+        string? StoryProgression);
+
+    private static string FormatStoryProgression(string? storyProgression)
+    {
+        if (string.IsNullOrWhiteSpace(storyProgression))
+        {
+            return string.Empty;
+        }
+
+        return storyProgression.ToLowerInvariant() switch
+        {
+            "arr_hw" => "新生〜蒼天",
+            "sb" => "紅蓮",
+            "shb" => "漆黒",
+            "ew" => "暁月",
+            "dt" => "黄金",
+            "completed" => "最新パッチ済み",
+            _ => storyProgression
+        };
+    }
 }

@@ -356,7 +356,8 @@ ADD COLUMN IF NOT EXISTS runtime_recruit_canceled_retention_hours INTEGER NULL,
 ADD COLUMN IF NOT EXISTS runtime_message_log_retention_days INTEGER NULL,
 ADD COLUMN IF NOT EXISTS runtime_voice_session_retention_days INTEGER NULL,
 ADD COLUMN IF NOT EXISTS runtime_reaction_log_retention_days INTEGER NULL,
-ADD COLUMN IF NOT EXISTS runtime_tuning_updated_at TIMESTAMPTZ NULL;";
+ADD COLUMN IF NOT EXISTS runtime_tuning_updated_at TIMESTAMPTZ NULL,
+ADD COLUMN IF NOT EXISTS sleep_kick_admin_confirmation_required BOOLEAN NOT NULL DEFAULT FALSE;";
 
         await using var conn = CreateConnection();
         await conn.ExecuteAsync(sql);
@@ -1029,7 +1030,7 @@ WHERE discord_user_id = @UserId;";
         });
     }
 
-    public async Task UpdateUserRegistrationProfileAsync(ulong userId, string ffxivName, string ffxivWorld, string ffxivDataCenter, string? xHandle, string? blueskyHandle, string bio)
+    public async Task UpdateUserRegistrationProfileAsync(ulong userId, string ffxivName, string ffxivWorld, string ffxivDataCenter, string? xHandle, string? blueskyHandle, string bio, string? storyProgression = null)
     {
         const string sql = @"
 UPDATE discord_users
@@ -1039,6 +1040,7 @@ SET ffxiv_name = @FfxivName,
     x_handle = @XHandle,
     bluesky_handle = @BlueskyHandle,
     bio = @Bio,
+    story_progression = @StoryProgression,
     updated_at = NOW()
 WHERE discord_user_id = @UserId;";
 
@@ -1051,7 +1053,24 @@ WHERE discord_user_id = @UserId;";
             FfxivDataCenter = NullIfBlank(ffxivDataCenter),
             XHandle = NullIfBlank(xHandle),
             BlueskyHandle = NullIfBlank(blueskyHandle),
-            Bio = NullIfBlank(bio)
+            Bio = NullIfBlank(bio),
+            StoryProgression = NullIfBlank(storyProgression)
+        });
+    }
+
+    public async Task UpdateUserStoryProgressionAsync(ulong userId, string? storyProgression)
+    {
+        const string sql = @"
+UPDATE discord_users
+SET story_progression = @StoryProgression,
+    updated_at = NOW()
+WHERE discord_user_id = @UserId;";
+
+        await using var conn = CreateConnection();
+        await conn.ExecuteAsync(sql, new
+        {
+            UserId = ToDbId(userId),
+            StoryProgression = NullIfBlank(storyProgression)
         });
     }
 
@@ -1168,6 +1187,7 @@ SELECT discord_user_id AS DiscordUserId,
        x_handle AS XHandle,
        bluesky_handle AS BlueskyHandle,
        bio AS Bio,
+       story_progression AS StoryProgression,
        updated_at AS UpdatedAt
 FROM discord_users
 WHERE discord_user_id = @UserId
@@ -1194,6 +1214,7 @@ SELECT discord_user_id AS DiscordUserId,
        x_handle AS XHandle,
        bluesky_handle AS BlueskyHandle,
        bio AS Bio,
+       story_progression AS StoryProgression,
        updated_at AS UpdatedAt
 FROM discord_users
 WHERE discord_user_id = ANY(@UserIds);";
@@ -1216,6 +1237,7 @@ SELECT discord_user_id AS DiscordUserId,
        x_handle AS XHandle,
        bluesky_handle AS BlueskyHandle,
        bio AS Bio,
+       story_progression AS StoryProgression,
        updated_at AS UpdatedAt
 FROM discord_users
 WHERE COALESCE(TRIM(ffxiv_name), '') <> ''
@@ -1541,6 +1563,41 @@ RETURNING v.id AS Id,
         {
             GuildId = ToDbId(guildId),
             ChannelId = ToDbId(channelId),
+            UserId = ToDbId(userId),
+            LeftAt = leftAt
+        });
+    }
+
+    public async Task<VoiceSession?> EndVoiceSessionByUserAsync(ulong guildId, ulong userId, DateTimeOffset leftAt)
+    {
+        const string sql = @"
+WITH target AS (
+    SELECT id
+    FROM voice_sessions
+    WHERE guild_id = @GuildId
+      AND user_id = @UserId
+      AND left_at IS NULL
+    ORDER BY joined_at DESC
+    LIMIT 1
+)
+UPDATE voice_sessions v
+SET left_at = @LeftAt,
+    duration_seconds = GREATEST(0, EXTRACT(EPOCH FROM (@LeftAt - v.joined_at))::int)
+FROM target
+WHERE v.id = target.id
+RETURNING v.id AS Id,
+          v.guild_id AS GuildId,
+          v.channel_id AS ChannelId,
+          v.user_id AS UserId,
+          v.user_name AS UserName,
+          v.joined_at AS JoinedAt,
+          v.left_at AS LeftAt,
+          v.duration_seconds AS DurationSeconds;";
+
+        await using var conn = CreateConnection();
+        return await conn.QuerySingleOrDefaultAsync<VoiceSession>(sql, new
+        {
+            GuildId = ToDbId(guildId),
             UserId = ToDbId(userId),
             LeftAt = leftAt
         });
@@ -2719,14 +2776,13 @@ SELECT r.channel_id AS ChannelId,
        r.user_id AS UserId,
        COUNT(1)::INT AS ReactionCount
 FROM public.user_reaction_logs r
-JOIN public.message_logs m
+LEFT JOIN public.message_logs m
   ON m.guild_id = r.guild_id
  AND m.message_id = r.message_id
 WHERE r.guild_id = @GuildId
   AND r.reacted_at >= @FromUtcInclusive
   AND r.reacted_at < @ToUtcExclusive
-  AND m.author_id <> 0
-  AND m.author_id <> r.user_id
+  AND (m.author_id IS NULL OR (m.author_id <> 0 AND m.author_id <> r.user_id))
 GROUP BY r.channel_id, r.user_id;";
 
         await using var conn = CreateConnection();
@@ -2749,12 +2805,13 @@ SELECT r.channel_id AS ChannelId,
        m.author_id AS UserId,
        COUNT(1)::INT AS ReactionCount
 FROM public.user_reaction_logs r
-JOIN public.message_logs m
+LEFT JOIN public.message_logs m
   ON m.guild_id = r.guild_id
  AND m.message_id = r.message_id
 WHERE r.guild_id = @GuildId
   AND r.reacted_at >= @FromUtcInclusive
   AND r.reacted_at < @ToUtcExclusive
+  AND m.author_id IS NOT NULL
   AND m.author_id <> r.user_id
   AND m.author_id <> 0
 GROUP BY r.channel_id, m.author_id;";
@@ -2782,13 +2839,13 @@ WITH per_post AS (
            COUNT(1)::INT AS ReactionCount,
            MAX(r.reacted_at) AS LastReactedAt
     FROM public.user_reaction_logs r
-    JOIN public.message_logs m
+    LEFT JOIN public.message_logs m
       ON m.guild_id = r.guild_id
      AND m.message_id = r.message_id
     WHERE r.guild_id = @GuildId
       AND r.reacted_at >= @FromUtcInclusive
       AND r.reacted_at < @ToUtcExclusive
-      AND m.deleted_at IS NULL
+      AND (m.deleted_at IS NULL OR m.message_id IS NULL)
       AND m.author_id <> 0
       AND m.author_id <> r.user_id
     GROUP BY m.author_id, r.message_id
@@ -5609,6 +5666,7 @@ SELECT guild_id AS GuildId,
        runtime_voice_session_retention_days AS RuntimeVoiceSessionRetentionDays,
        runtime_reaction_log_retention_days AS RuntimeReactionLogRetentionDays,
        runtime_tuning_updated_at AS RuntimeTuningUpdatedAt,
+       sleep_kick_admin_confirmation_required AS SleepKickAdminConfirmationRequired,
        updated_at AS UpdatedAt
 FROM guild_settings
 WHERE guild_id = @GuildId
@@ -5685,6 +5743,99 @@ WHERE guild_id = @GuildId;";
         await using var conn = CreateConnection();
         var affected = await conn.ExecuteAsync(sql, new { GuildId = ToDbId(guildId), Enabled = enabled });
         return affected > 0;
+    }
+
+    public async Task<bool> UpdateGuildSleepKickAdminConfirmationRequiredAsync(ulong guildId, bool enabled)
+    {
+        const string sql = @"
+UPDATE guild_settings
+SET sleep_kick_admin_confirmation_required = @Enabled,
+    updated_at = NOW()
+WHERE guild_id = @GuildId;";
+
+        await using var conn = CreateConnection();
+        var affected = await conn.ExecuteAsync(sql, new { GuildId = ToDbId(guildId), Enabled = enabled });
+        return affected > 0;
+    }
+
+    public async Task EnsureSleepKickLogsTableAsync()
+    {
+        const string sql = @"
+CREATE TABLE IF NOT EXISTS sleep_kick_logs (
+    id bigint NOT NULL GENERATED ALWAYS AS IDENTITY,
+    guild_id bigint NOT NULL,
+    target_user_id bigint NOT NULL,
+    target_user_name text,
+    initiator_user_id bigint,
+    initiator_user_name text,
+    voice_channel_id bigint NOT NULL,
+    voice_channel_name text,
+    event_type text NOT NULL,
+    vote_yes_count integer NOT NULL DEFAULT 0,
+    vote_no_count integer NOT NULL DEFAULT 0,
+    required_votes integer NOT NULL DEFAULT 0,
+    voter_details jsonb,
+    result text,
+    created_at timestamp with time zone DEFAULT NOW() NOT NULL,
+    CONSTRAINT sleep_kick_logs_pkey PRIMARY KEY (id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sleep_kick_logs_guild_created ON sleep_kick_logs (guild_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sleep_kick_logs_target ON sleep_kick_logs (target_user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sleep_kick_logs_initiator ON sleep_kick_logs (initiator_user_id, created_at DESC);
+";
+
+        await using var conn = CreateConnection();
+        await conn.ExecuteAsync(sql);
+    }
+
+    public async Task<long> InsertSleepKickLogAsync(
+        ulong guildId,
+        ulong targetUserId,
+        string? targetUserName,
+        ulong? initiatorUserId,
+        string? initiatorUserName,
+        ulong voiceChannelId,
+        string? voiceChannelName,
+        string eventType,
+        int voteYesCount = 0,
+        int voteNoCount = 0,
+        int requiredVotes = 0,
+        string? voterDetails = null,
+        string? result = null)
+    {
+        const string sql = @"
+INSERT INTO sleep_kick_logs (
+    guild_id, target_user_id, target_user_name,
+    initiator_user_id, initiator_user_name,
+    voice_channel_id, voice_channel_name,
+    event_type, vote_yes_count, vote_no_count,
+    required_votes, voter_details, result)
+VALUES (
+    @GuildId, @TargetUserId, @TargetUserName,
+    @InitiatorUserId, @InitiatorUserName,
+    @VoiceChannelId, @VoiceChannelName,
+    @EventType, @VoteYesCount, @VoteNoCount,
+    @RequiredVotes, @VoterDetails::jsonb, @Result)
+RETURNING id;";
+
+        await using var conn = CreateConnection();
+        return await conn.QuerySingleAsync<long>(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            TargetUserId = ToDbId(targetUserId),
+            TargetUserName = targetUserName,
+            InitiatorUserId = initiatorUserId.HasValue ? ToDbId(initiatorUserId.Value) : (long?)null,
+            InitiatorUserName = initiatorUserName,
+            VoiceChannelId = ToDbId(voiceChannelId),
+            VoiceChannelName = voiceChannelName,
+            EventType = eventType,
+            VoteYesCount = voteYesCount,
+            VoteNoCount = voteNoCount,
+            RequiredVotes = requiredVotes,
+            VoterDetails = voterDetails,
+            Result = result
+        });
     }
 
     public async Task<int> UpsertGuildInactiveKickUserDataRetentionDaysAsync(ulong guildId, int retentionDays)
@@ -5818,6 +5969,7 @@ SELECT guild_id AS GuildId,
        runtime_voice_session_retention_days AS RuntimeVoiceSessionRetentionDays,
        runtime_reaction_log_retention_days AS RuntimeReactionLogRetentionDays,
        runtime_tuning_updated_at AS RuntimeTuningUpdatedAt,
+       sleep_kick_admin_confirmation_required AS SleepKickAdminConfirmationRequired,
        updated_at AS UpdatedAt
 FROM guild_settings
 WHERE runtime_tuning_updated_at IS NOT NULL
@@ -8390,7 +8542,234 @@ WHERE id = @Id;";
         );
         return true;
     }
+
+    public async Task EnsureBotCommandLogsTableAsync()
+    {
+        const string sql = @"
+CREATE TABLE IF NOT EXISTS bot_command_logs (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    guild_id BIGINT NOT NULL,
+    channel_id BIGINT NOT NULL,
+    user_id BIGINT NOT NULL,
+    user_name TEXT NOT NULL,
+    command_path TEXT NOT NULL,
+    parameters_json TEXT,
+    is_success BOOLEAN NOT NULL DEFAULT TRUE,
+    error_reason TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_bot_command_logs_guild_created ON bot_command_logs (guild_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_bot_command_logs_user_created ON bot_command_logs (user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_bot_command_logs_command ON bot_command_logs (command_path, created_at DESC);";
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync();
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        await cmd.ExecuteNonQueryAsync();
+    }
+
+    public async Task LogCommandAsync(
+        ulong guildId,
+        ulong channelId,
+        ulong userId,
+        string userName,
+        string commandPath,
+        string? parametersJson,
+        bool isSuccess,
+        string? errorReason)
+    {
+        await EnsureBotCommandLogsTableAsync();
+        const string sql = @"
+INSERT INTO bot_command_logs (guild_id, channel_id, user_id, user_name, command_path, parameters_json, is_success, error_reason, created_at)
+VALUES (@GuildId, @ChannelId, @UserId, @UserName, @CommandPath, @ParametersJson, @IsSuccess, @ErrorReason, NOW());";
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync();
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("GuildId", (long)guildId);
+        cmd.Parameters.AddWithValue("ChannelId", (long)channelId);
+        cmd.Parameters.AddWithValue("UserId", (long)userId);
+        cmd.Parameters.AddWithValue("UserName", userName);
+        cmd.Parameters.AddWithValue("CommandPath", commandPath);
+        cmd.Parameters.AddWithValue("ParametersJson", (object?)parametersJson ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("IsSuccess", isSuccess);
+        cmd.Parameters.AddWithValue("ErrorReason", (object?)errorReason ?? DBNull.Value);
+        await cmd.ExecuteNonQueryAsync();
+    }
+
+    public async Task<(IReadOnlyList<BotCommandLogItem> Items, int TotalCount)> ListCommandLogsAsync(
+        ulong? guildId, ulong? userId, string? commandPath, string? search, int limit, int offset)
+    {
+        var whereClauses = new List<string>();
+        if (guildId.HasValue) whereClauses.Add("guild_id = @GuildId");
+        if (userId.HasValue) whereClauses.Add("user_id = @UserId");
+        if (!string.IsNullOrWhiteSpace(commandPath)) whereClauses.Add("command_path = @CommandPath");
+        if (!string.IsNullOrWhiteSpace(search))
+            whereClauses.Add("(command_path ILIKE @Search OR user_name ILIKE @Search OR parameters_json ILIKE @Search)");
+
+        var where = whereClauses.Count > 0 ? $"WHERE {string.Join(" AND ", whereClauses)}" : "";
+
+        var countSql = $"SELECT COUNT(*) FROM bot_command_logs {where}";
+        var listSql = $@"
+SELECT id, guild_id, channel_id, user_id, user_name, command_path, parameters_json, is_success, error_reason, created_at
+FROM bot_command_logs {where}
+ORDER BY created_at DESC
+LIMIT @Limit OFFSET @Offset;";
+
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync();
+
+        await using var countCmd = new NpgsqlCommand(countSql, conn);
+        if (guildId.HasValue) countCmd.Parameters.AddWithValue("GuildId", (long)guildId.Value);
+        if (userId.HasValue) countCmd.Parameters.AddWithValue("UserId", (long)userId.Value);
+        if (!string.IsNullOrWhiteSpace(commandPath)) countCmd.Parameters.AddWithValue("CommandPath", commandPath);
+        if (!string.IsNullOrWhiteSpace(search)) countCmd.Parameters.AddWithValue("Search", $"%{search.Trim()}%");
+        var totalCount = Convert.ToInt32(await countCmd.ExecuteScalarAsync() ?? 0);
+
+        var items = new List<BotCommandLogItem>();
+        await using var listCmd = new NpgsqlCommand(listSql, conn);
+        listCmd.Parameters.AddWithValue("Limit", limit);
+        listCmd.Parameters.AddWithValue("Offset", offset);
+        if (guildId.HasValue) listCmd.Parameters.AddWithValue("GuildId", (long)guildId.Value);
+        if (userId.HasValue) listCmd.Parameters.AddWithValue("UserId", (long)userId.Value);
+        if (!string.IsNullOrWhiteSpace(commandPath)) listCmd.Parameters.AddWithValue("CommandPath", commandPath);
+        if (!string.IsNullOrWhiteSpace(search)) listCmd.Parameters.AddWithValue("Search", $"%{search.Trim()}%");
+        await using var reader = await listCmd.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            items.Add(new BotCommandLogItem(
+                reader.GetInt64(0),
+                reader.GetInt64(1).ToString(),
+                reader.GetInt64(2).ToString(),
+                reader.GetInt64(3).ToString(),
+                reader.GetString(4),
+                reader.GetString(5),
+                reader.IsDBNull(6) ? null : reader.GetString(6),
+                reader.GetBoolean(7),
+                reader.IsDBNull(8) ? null : reader.GetString(8),
+                reader.GetDateTime(9)
+            ));
+        }
+        return (items, totalCount);
+    }
+
+    public async Task EnsureBotAuditLogsTableAsync()
+    {
+        const string sql = @"
+CREATE TABLE IF NOT EXISTS bot_audit_logs (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    guild_id BIGINT NOT NULL,
+    actor_user_id BIGINT,
+    actor_name TEXT,
+    category TEXT NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT,
+    color_raw_value INTEGER,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_bot_audit_logs_guild_created ON bot_audit_logs (guild_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_bot_audit_logs_category ON bot_audit_logs (category, created_at DESC);";
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync();
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        await cmd.ExecuteNonQueryAsync();
+    }
+
+    public async Task<long> LogAuditAsync(
+        ulong guildId,
+        string category,
+        string title,
+        string? description,
+        int colorRawValue,
+        ulong? actorUserId = null,
+        string? actorName = null)
+    {
+        await EnsureBotAuditLogsTableAsync();
+        const string sql = @"
+INSERT INTO bot_audit_logs (guild_id, actor_user_id, actor_name, category, title, description, color_raw_value, created_at)
+VALUES (@GuildId, @ActorUserId, @ActorName, @Category, @Title, @Description, @ColorRawValue, NOW())
+RETURNING id;";
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync();
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("GuildId", (long)guildId);
+        cmd.Parameters.AddWithValue("ActorUserId", (object?)(actorUserId.HasValue ? (long)actorUserId.Value : null) ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("ActorName", (object?)actorName ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("Category", category);
+        cmd.Parameters.AddWithValue("Title", title);
+        cmd.Parameters.AddWithValue("Description", (object?)description ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("ColorRawValue", colorRawValue);
+        return (long)(await cmd.ExecuteScalarAsync() ?? 0);
+    }
+
+    public async Task<(IReadOnlyList<BotAuditLogItem> Items, int TotalCount)> ListAuditLogsAsync(
+        ulong? guildId, string? category, int limit, int offset)
+    {
+        var whereClauses = new List<string>();
+        if (guildId.HasValue) whereClauses.Add("guild_id = @GuildId");
+        if (!string.IsNullOrWhiteSpace(category)) whereClauses.Add("category = @Category");
+
+        var where = whereClauses.Count > 0 ? $"WHERE {string.Join(" AND ", whereClauses)}" : "";
+
+        var countSql = $"SELECT COUNT(*) FROM bot_audit_logs {where}";
+        var listSql = $@"
+SELECT id, guild_id, actor_user_id, actor_name, category, title, description, color_raw_value, created_at
+FROM bot_audit_logs {where}
+ORDER BY created_at DESC
+LIMIT @Limit OFFSET @Offset;";
+
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync();
+
+        await using var countCmd = new NpgsqlCommand(countSql, conn);
+        if (guildId.HasValue) countCmd.Parameters.AddWithValue("GuildId", (long)guildId.Value);
+        if (!string.IsNullOrWhiteSpace(category)) countCmd.Parameters.AddWithValue("Category", category);
+        var totalCount = Convert.ToInt32(await countCmd.ExecuteScalarAsync() ?? 0);
+
+        var items = new List<BotAuditLogItem>();
+        await using var listCmd = new NpgsqlCommand(listSql, conn);
+        listCmd.Parameters.AddWithValue("Limit", limit);
+        listCmd.Parameters.AddWithValue("Offset", offset);
+        if (guildId.HasValue) listCmd.Parameters.AddWithValue("GuildId", (long)guildId.Value);
+        if (!string.IsNullOrWhiteSpace(category)) listCmd.Parameters.AddWithValue("Category", category);
+        await using var reader = await listCmd.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            items.Add(new BotAuditLogItem(
+                reader.GetInt64(0),
+                reader.GetInt64(1).ToString(),
+                reader.IsDBNull(2) ? null : reader.GetInt64(2).ToString(),
+                reader.IsDBNull(3) ? null : reader.GetString(3),
+                reader.GetString(4),
+                reader.GetString(5),
+                reader.IsDBNull(6) ? null : reader.GetString(6),
+                reader.IsDBNull(7) ? 0 : reader.GetInt32(7),
+                reader.GetDateTime(8)));
+        }
+        return (items, totalCount);
+    }
 }
+
+public sealed record BotCommandLogItem(
+    long Id,
+    string GuildId,
+    string ChannelId,
+    string UserId,
+    string UserName,
+    string CommandPath,
+    string? ParametersJson,
+    bool IsSuccess,
+    string? ErrorReason,
+    DateTimeOffset CreatedAt);
+
+public sealed record BotAuditLogItem(
+    long Id,
+    string GuildId,
+    string? ActorUserId,
+    string? ActorName,
+    string Category,
+    string Title,
+    string Description,
+    int ColorRawValue,
+    DateTimeOffset CreatedAt);
 
 public sealed class RecruitPostLockInfo
 {
@@ -8401,3 +8780,20 @@ public sealed class RecruitPostLockInfo
 }
 
 public sealed record RecruitPositionUpdateResult(bool Success, IReadOnlyList<string> BlockedPositions);
+
+public sealed record SleepKickVoteLog(
+    long Id,
+    long GuildId,
+    long TargetUserId,
+    string? TargetUserName,
+    long? InitiatorUserId,
+    string? InitiatorUserName,
+    long VoiceChannelId,
+    string? VoiceChannelName,
+    string EventType,
+    int VoteYesCount,
+    int VoteNoCount,
+    int RequiredVotes,
+    string? VoterDetails,
+    string? Result,
+    DateTimeOffset CreatedAt);

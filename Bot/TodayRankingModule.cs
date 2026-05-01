@@ -47,7 +47,7 @@ public sealed class TodayRankingModule : InteractionModuleBase<SocketInteraction
         var nowJst = nowUtc.ToOffset(JapanTimeOffset);
         var fromUtc = new DateTimeOffset(nowJst.Year, nowJst.Month, nowJst.Day, 0, 0, 0, JapanTimeOffset).ToUniversalTime();
         var topCount = Math.Clamp(top, 1, 10);
-        var embed = await _voiceStats.BuildActivityRankingEmbedAsync(Context.Guild, fromUtc, nowUtc, topCount, "今日のアクティビティランキング");
+        var embed = await _voiceStats.BuildActivityRankingEmbedAsync(Context.Guild, fromUtc, nowUtc, topCount, ActivityRankingPanel.DailyMessageHeader);
 
         var panel = await _db.GetGuildDailyActivityPanelAsync(Context.Guild.Id);
         ulong? existingMessageId = null;

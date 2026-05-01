@@ -65,6 +65,38 @@ public sealed class GuildAuditLogService
         {
             _logger.LogWarning(ex, "Failed to send guild audit log. GuildId={GuildId}, Title={Title}", guild.Id, title);
         }
+
+        try
+        {
+            await _db.LogAuditAsync(
+                guild.Id,
+                InferCategory(title),
+                title,
+                description,
+                (int)color.RawValue,
+                actor?.Id,
+                actor?.GlobalName ?? actor?.Username);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to persist audit log to DB. GuildId={GuildId}, Title={Title}", guild.Id, title);
+        }
+    }
+
+    private static string InferCategory(string title)
+    {
+        var t = title.ToLowerInvariant();
+        if (t.Contains("コマンド")) return "command";
+        if (t.Contains("権限拒否")) return "permission";
+        if (t.Contains("失敗")) return "error";
+        if (t.Contains("勧誘")) return "recruit";
+        if (t.Contains("抽選")) return "lottery";
+        if (t.Contains("問い合わせ")) return "inquiry";
+        if (t.Contains("ロール")) return "role";
+        if (t.Contains("登録")) return "registration";
+        if (t.Contains("削除")) return "delete";
+        if (t.Contains("編集")) return "edit";
+        return "general";
     }
 
     private async Task<IMessageChannel?> ResolveLogChannelAsync(SocketGuild guild)

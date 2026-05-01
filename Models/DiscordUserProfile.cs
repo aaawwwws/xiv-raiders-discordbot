@@ -11,5 +11,6 @@ public sealed class DiscordUserProfile
     public string? XHandle { get; init; }
     public string? BlueskyHandle { get; init; }
     public string? Bio { get; init; }
+    public string? StoryProgression { get; init; }
     public DateTimeOffset UpdatedAt { get; init; }
 }

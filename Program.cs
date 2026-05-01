@@ -57,6 +57,7 @@ builder.Services.AddSingleton<VoiceChannelTextService>();
 builder.Services.AddSingleton<UserProfileEmbedService>();
 builder.Services.AddSingleton<AchievementResumeService>();
 builder.Services.AddSingleton<GuildAuditLogService>();
+
 builder.Services.AddSingleton<FfLogsReportWatcherService>();
 builder.Services.AddSingleton<RuntimeDiagnosticsService>();
 builder.Services.AddSingleton<RuntimeTuningService>();
@@ -64,6 +65,7 @@ builder.Services.AddSingleton<RecruitUndoService>();
 builder.Services.AddSingleton<StatsEmbedService>();
 builder.Services.AddSingleton<VoiceStatsService>();
 builder.Services.AddSingleton<VoiceSessionReconciliationService>();
+builder.Services.AddSingleton<SleepKickService>();
 builder.Services.AddSingleton<RecruitmentListService>();
 builder.Services.AddSingleton<RecruitJoinContextTracker>();
 builder.Services.AddSingleton<RecruitCommentEditContextTracker>();
@@ -82,14 +84,16 @@ builder.Services.AddSingleton(new DiscordSocketClient(new DiscordSocketConfig {
         | GatewayIntents.MessageContent
         | GatewayIntents.GuildVoiceStates,
     LogLevel = LogSeverity.Info,
-    MessageCacheSize = discordOptions.MessageCacheSize
+    MessageCacheSize = discordOptions.MessageCacheSize,
+    EnableVoiceDaveEncryption = true
 }));
 
 builder.Services.AddSingleton(sp => new InteractionService(
     sp.GetRequiredService<DiscordSocketClient>(),
     new InteractionServiceConfig {
         LogLevel = LogSeverity.Info,
-        UseCompiledLambda = true
+        UseCompiledLambda = true,
+        DefaultRunMode = Discord.Interactions.RunMode.Async
     }));
 
 builder.Services.AddHostedService<DiscordBotService>();

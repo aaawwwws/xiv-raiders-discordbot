@@ -163,6 +163,7 @@ public sealed class AchievementResumeService
     private readonly Db _db;
     private readonly LodestoneClient _lodestone;
     private readonly ILogger<AchievementResumeService> _logger;
+    private readonly HttpClient _http;
 
     public AchievementResumeService(
         Db db,
@@ -172,6 +173,7 @@ public sealed class AchievementResumeService
         _db = db;
         _lodestone = lodestone;
         _logger = logger;
+        _http = new HttpClient { Timeout = TimeSpan.FromSeconds(10) };
     }
 
     public async Task<AchievementResumeBuildResult> BuildAsync(
@@ -182,17 +184,30 @@ public sealed class AchievementResumeService
         IReadOnlyCollection<string>? savageGroupFilter = null,
         CancellationToken cancellationToken = default)
     {
+        _logger.LogInformation("Building raid resume. UserId={UserId}, GuildId={GuildId}, ForceRefresh={ForceRefresh}", targetUser.Id, guild.Id, forceRefresh);
+
+        if (!await _lodestone.IsAvailableAsync(cancellationToken))
+        {
+            _logger.LogWarning("Lodestone is not available");
+            return AchievementResumeBuildResult.FromFailure("Lodestoneが現在メンテナンス中です。時間をおいて再試行してください。");
+        }
         var character = await _db.GetMainCharacterAsync(targetUser.Id);
         if (character is null || string.IsNullOrWhiteSpace(character.LodestoneUrl))
         {
+            _logger.LogWarning("No main character linked. UserId={UserId}", targetUser.Id);
             return AchievementResumeBuildResult.FromFailure("対象ユーザーにLodestone連携済みのメインキャラクターがありません。");
         }
 
+        _logger.LogInformation("Found character. UserId={UserId}, Character={CharacterName}, LodestoneId={LodestoneId}", targetUser.Id, character.Name, character.LodestoneId);
+        
         var details = await GetOrRefreshLodestoneDetailsAsync(character, forceRefresh, cancellationToken);
         if (details is null)
         {
+            _logger.LogWarning("Failed to get Lodestone details. UserId={UserId}, LodestoneId={LodestoneId}", targetUser.Id, character.LodestoneId);
             return AchievementResumeBuildResult.FromFailure("Lodestone実績の取得に失敗しました。時間をおいて再試行してください。");
         }
+
+        _logger.LogInformation("Loaded achievements. Count={Count}, Status={Status}", details.Achievements.Items.Count, details.Achievements.Status);
 
         var profile = await _db.GetDiscordUserProfileAsync(targetUser.Id);
         var guildUser = guild.GetUser(targetUser.Id);
@@ -224,6 +239,19 @@ public sealed class AchievementResumeService
             .Where(IsRaidAchievement)
             .ToList();
 
+        _logger.LogInformation("Raid achievements found: {Count}. Ultimate={UltCount}, Savage={SavCount}. AllAchievements={AllCount}",
+            raidAchievements.Count,
+            raidAchievements.Count(IsUltimateRaidAchievement),
+            raidAchievements.Count(IsSavageRaidAchievement),
+            allAchievements.Count);
+
+        if (raidAchievements.Count > 0)
+        {
+            foreach (var ra in raidAchievements.Take(20))
+            {
+                _logger.LogInformation("  RaidAchievement: Id={Id}, Title={Title}, EarnedAt={EarnedAt}", ra.AchievementId, ra.Title, ra.EarnedAt);
+            }
+        }
         var ultimateCount = raidAchievements.Count(IsUltimateRaidAchievement);
         var knownUltimateHitCount = knownUltimateStatusById.Count(entry => entry.Value.Available is true);
         var savageCount = raidAchievements.Count(IsSavageRaidAchievement);
@@ -243,6 +271,7 @@ public sealed class AchievementResumeService
             character.World,
             string.IsNullOrWhiteSpace(character.DataCenter) ? "unknown" : character.DataCenter!,
             character.LodestoneUrl,
+            character.PortraitUrl,
             forceRefresh,
             raidAchievements.Count,
             ultimateCount,
@@ -260,17 +289,41 @@ public sealed class AchievementResumeService
 
         byte[]? imagePng = null;
         string? imageFileName = null;
+        SixLabors.ImageSharp.Image? portraitImage = null;
         try
         {
-            imagePng = BuildResumeImagePng(snapshot);
+            if (!string.IsNullOrWhiteSpace(snapshot.PortraitUrl))
+            {
+                try
+                {
+                    _logger.LogDebug("Loading portrait image. PortraitUrl={PortraitUrl}", snapshot.PortraitUrl);
+                    var portraitBytes = await _http.GetByteArrayAsync(snapshot.PortraitUrl, cancellationToken);
+                    portraitImage = SixLabors.ImageSharp.Image.Load(portraitBytes);
+                    _logger.LogDebug("Portrait loaded. Size={Width}x{Height}", portraitImage.Width, portraitImage.Height);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "Failed to load portrait image. PortraitUrl={PortraitUrl}", snapshot.PortraitUrl);
+                }
+            }
+
+            _logger.LogDebug("Rendering resume image. UserId={UserId}", targetUser.Id);
+            imagePng = BuildResumeImagePng(snapshot, portraitImage);
+            portraitImage?.Dispose();
             if (imagePng.Length > 0)
             {
                 imageFileName = $"raid_resume_{targetUser.Id}_{snapshot.GeneratedAt:yyyyMMddHHmmss}.png";
+                _logger.LogDebug("Resume image rendered. Size={Size}bytes", imagePng.Length);
+            }
+            else
+            {
+                _logger.LogWarning("Resume image rendered empty. UserId={UserId}", targetUser.Id);
             }
         }
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Failed to render raid resume image. UserId={UserId}", targetUser.Id);
+            portraitImage?.Dispose();
             imagePng = null;
             imageFileName = null;
         }
@@ -377,206 +430,145 @@ public sealed class AchievementResumeService
         return builder.Build();
     }
 
-    private static byte[] BuildResumeImagePng(RaidResumeSnapshot snapshot)
+    private static byte[] BuildResumeImagePng(RaidResumeSnapshot snapshot, SixLabors.ImageSharp.Image? portraitImage)
     {
         const int width = 1380;
-        const int height = 920;
-        const float margin = 30f;
+        const int height = 840;
+        const float margin = 28f;
+        var goldAccent = ImgColor.FromRgb(201, 162, 39);
+        var panelBorder = ImgColor.FromRgb(44, 60, 84);
 
-        using var image = new Image<Rgba32>(width, height, new Rgba32(10, 17, 30, 255));
+        using var image = new Image<Rgba32>(width, height, ImgColor.FromRgb(10, 16, 28));
 
         var statusRows = BuildUltimateStatusRows(snapshot.UltimateAchievementLines);
-        var savageRows = BuildUltimateStatusRows(snapshot.SavageAchievementLines);
-        var ultimateCleared = statusRows.Count(row => IsDateLabel(row.Value));
-        var savageCleared = savageRows.Count(row => IsDateLabel(row.Value));
+        var savagePanelRows = BuildSavagePanelRows(BuildUltimateStatusRows(snapshot.SavageAchievementLines));
 
-        var heroRect = new ImgRectF(margin, margin, width - (margin * 2f), 146f);
-        var boardTop = heroRect.Bottom + 18f;
-        var boardRect = new ImgRectF(margin, boardTop, width - (margin * 2f), height - boardTop - margin);
-        const float columnsGap = 16f;
-        var sectionTop = boardRect.Y + 14f;
-        var sectionHeight = boardRect.Height - 28f;
-        var innerWidth = boardRect.Width - 28f;
-        var leftWidth = MathF.Floor((innerWidth - columnsGap) / 2f);
-        var rightWidth = innerWidth - columnsGap - leftWidth;
-        var leftRect = new ImgRectF(boardRect.X + 14f, sectionTop, leftWidth, sectionHeight);
-        var rightRect = new ImgRectF(leftRect.Right + columnsGap, sectionTop, rightWidth, sectionHeight);
-
-        var savagePanelRows = BuildSavagePanelRows(savageRows);
-        const float savageStartOffsetY = 50f;
-        const float savageBottomPadding = 10f;
-        const float savageGap = 2f;
-        const float savageHeaderHeightBase = 16f;
-        const float savageRowHeightBase = 21f;
-        var savageCategoryCount = savagePanelRows.Count(row => row.IsCategory);
-        var savageValueCount = savagePanelRows.Count - savageCategoryCount;
-        var savageRequiredHeight =
-            (savageCategoryCount * (savageHeaderHeightBase + savageGap)) +
-            (savageValueCount * (savageRowHeightBase + savageGap));
-        var savageAvailableHeight = (rightRect.Height - savageBottomPadding) - savageStartOffsetY;
-        var savageScale = savageRequiredHeight > 0f
-            ? MathF.Min(1f, savageAvailableHeight / savageRequiredHeight)
-            : 1f;
-        var savageHeaderHeight = MathF.Max(11f, savageHeaderHeightBase * savageScale);
-        var savageRowHeight = MathF.Max(16f, savageRowHeightBase * savageScale);
-
-        var heroNameFont = GetResumeFont(46f, FontStyle.Bold);
-        var heroSubFont = GetResumeFont(16f, FontStyle.Regular);
-        var heroLabelFont = GetResumeFont(12f, FontStyle.Regular);
-        var heroValueFont = GetResumeFont(26f, FontStyle.Bold);
-        var panelHeadingFont = GetResumeFont(24f, FontStyle.Bold);
-        var rowTitleFont = GetResumeFont(20f, FontStyle.Bold);
-        var rowValueFont = GetResumeFont(18f, FontStyle.Bold);
-        var savageCategoryFont = GetResumeFont(Math.Clamp(savageHeaderHeight - 1f, 11f, 14f), FontStyle.Bold);
-        var savageNameFont = GetResumeFont(Math.Clamp(savageRowHeight - 7f, 11f, 13f), FontStyle.Bold);
-        var savageValueFont = GetResumeFont(Math.Clamp(savageRowHeight - 7f, 11f, 13f), FontStyle.Bold);
-        var smallFont = GetResumeFont(15f, FontStyle.Regular);
+        var nameFont = GetResumeFont(44f, FontStyle.Bold);
+        var subFont = GetResumeFont(16f, FontStyle.Regular);
+        var headingFont = GetResumeFont(22f, FontStyle.Bold);
+        var rowTitleFont = GetResumeFont(18f, FontStyle.Bold);
+        var rowValueFont = GetResumeFont(16f, FontStyle.Bold);
+        var smallFont = GetResumeFont(13f, FontStyle.Regular);
 
         image.Mutate(ctx =>
         {
-            var accent = ImgColor.FromRgb(72, 195, 210);
-            ctx.Fill(ImgColor.FromRgb(9, 12, 18));
-            ctx.Fill(ImgColor.FromRgba(25, 33, 48, 220), new ImgRectF(0f, 0f, width, 260f));
-            ctx.Fill(ImgColor.FromRgba(16, 22, 34, 180), new ImgRectF(0f, 240f, width, height - 240f));
+            ctx.Fill(ImgColor.FromRgb(8, 14, 24));
+            ctx.Fill(goldAccent, new ImgRectF(0, 0, width, 4));
 
-            DrawPanel(ctx, heroRect, ImgColor.FromRgb(15, 19, 27), ImgColor.FromRgb(44, 58, 78));
-            ctx.Fill(accent, new ImgRectF(heroRect.X, heroRect.Y, 96f, 3f));
-            DrawText(ctx, snapshot.CharacterName, heroNameFont, ImgColor.FromRgb(245, 249, 255), heroRect.X + 22f, heroRect.Y + 42f);
-            DrawText(
-                ctx,
-                $"{snapshot.World} [{snapshot.DataCenter}]  •  {snapshot.GeneratedAt.ToOffset(JapanTimeOffset):yyyy-MM-dd HH:mm} JST",
-                heroSubFont,
-                ImgColor.FromRgb(165, 178, 198),
-                heroRect.X + 24f,
-                heroRect.Y + 106f);
-
-            var metricWidth = 104f;
-            var metricGap = 10f;
-            var metricY = heroRect.Y + 28f;
-            var metric1X = heroRect.Right - 24f - (metricWidth * 3f) - (metricGap * 2f);
-            var metric2X = metric1X + metricWidth + metricGap;
-            var metric3X = metric2X + metricWidth + metricGap;
-
-            var m1 = new ImgRectF(metric1X, metricY, metricWidth, 86f);
-            var m2 = new ImgRectF(metric2X, metricY, metricWidth, 86f);
-            var m3 = new ImgRectF(metric3X, metricY, metricWidth, 86f);
-            DrawPanel(ctx, m1, ImgColor.FromRgb(19, 25, 36), ImgColor.FromRgb(48, 62, 84));
-            DrawPanel(ctx, m2, ImgColor.FromRgb(19, 25, 36), ImgColor.FromRgb(48, 62, 84));
-            DrawPanel(ctx, m3, ImgColor.FromRgb(19, 25, 36), ImgColor.FromRgb(48, 62, 84));
-            DrawText(ctx, "ULT", heroLabelFont, ImgColor.FromRgb(142, 160, 186), m1.X + 10f, m1.Y + 8f);
-            DrawText(ctx, $"{ultimateCleared}", heroValueFont, ImgColor.FromRgb(236, 244, 255), m1.X + 10f, m1.Y + 34f);
-            DrawText(ctx, "SAV", heroLabelFont, ImgColor.FromRgb(142, 160, 186), m2.X + 10f, m2.Y + 8f);
-            DrawText(ctx, $"{savageCleared}", heroValueFont, ImgColor.FromRgb(236, 244, 255), m2.X + 10f, m2.Y + 34f);
-            DrawText(ctx, "FIXED", heroLabelFont, ImgColor.FromRgb(142, 160, 186), m3.X + 10f, m3.Y + 8f);
-            DrawText(ctx, $"{snapshot.KnownUltimateHitCount}/6", heroSubFont, ImgColor.FromRgb(236, 244, 255), m3.X + 10f, m3.Y + 40f);
-
-            DrawPanel(ctx, boardRect, ImgColor.FromRgb(12, 16, 24), ImgColor.FromRgb(38, 51, 69));
-            DrawPanel(ctx, leftRect, ImgColor.FromRgb(15, 20, 30), ImgColor.FromRgb(41, 54, 74));
-            DrawPanel(ctx, rightRect, ImgColor.FromRgb(15, 20, 30), ImgColor.FromRgb(41, 54, 74));
-
-            DrawText(ctx, "絶達成状況", panelHeadingFont, ImgColor.FromRgb(236, 244, 255), leftRect.X + 14f, leftRect.Y + 10f);
-            DrawText(ctx, "零式クリア日", panelHeadingFont, ImgColor.FromRgb(236, 244, 255), rightRect.X + 14f, rightRect.Y + 10f);
-            ctx.Fill(accent, new ImgRectF(leftRect.X + 14f, leftRect.Y + 44f, 90f, 2f));
-            ctx.Fill(accent, new ImgRectF(rightRect.X + 14f, rightRect.Y + 44f, 90f, 2f));
-
-            const float rowGap = 6f;
-            var startY = leftRect.Y + 54f;
-            var targetRows = Math.Max(1, Math.Min(statusRows.Count, 6));
-            var availableHeight = leftRect.Height - 72f;
-            var rowHeight = Math.Clamp((availableHeight - ((targetRows - 1) * rowGap)) / targetRows, 56f, 72f);
-            var displayRows = statusRows.Take(targetRows).ToList();
-            for (var i = 0; i < displayRows.Count; i++)
+            // Header row: portrait left, name right
+            const float portraitSize = 120f;
+            var portraitX = margin;
+            var portraitY = margin + 10f;
+            var portraitRect = new ImgRectF(portraitX, portraitY, portraitSize, portraitSize);
+            if (portraitImage is not null)
             {
-                var row = displayRows[i];
-                var rowRect = new ImgRectF(
-                    leftRect.X + 12f,
-                    startY + (i * (rowHeight + rowGap)),
-                    leftRect.Width - 24f,
-                    rowHeight);
-
-                var style = ResolveUltimateStatusStyle(row.Value);
-                DrawPanel(ctx, rowRect, style.Fill, ImgColor.FromRgb(42, 58, 79));
-                ctx.Fill(style.Accent, new ImgRectF(rowRect.X, rowRect.Y, 4f, rowRect.Height));
-
-                var textWidth = rowRect.Width - 30f;
-                var titleY = rowRect.Y + 7f;
-                var valueY = rowRect.Y + MathF.Max(31f, rowHeight * 0.5f);
-                DrawText(ctx, Truncate(row.Title, 34), rowTitleFont, ImgColor.FromRgb(236, 243, 252), rowRect.X + 14f, titleY, textWidth);
-                DrawText(ctx, Truncate(row.Value, 46), rowValueFont, style.ValueText, rowRect.X + 14f, valueY, textWidth);
+                var cropped = portraitImage.Clone(i => i.Resize(new ResizeOptions
+                {
+                    Size = new Size((int)portraitSize, (int)portraitSize),
+                    Mode = ResizeMode.Crop,
+                    Position = AnchorPositionMode.Center
+                }));
+                ctx.DrawImage(cropped, new Point((int)portraitX, (int)portraitY), 1f);
+                cropped.Dispose();
+                ctx.Draw(goldAccent, 3f, portraitRect);
+            }
+            else
+            {
+                ctx.Fill(ImgColor.FromRgb(30, 40, 56), portraitRect);
+                ctx.Draw(goldAccent, 3f, portraitRect);
             }
 
-            var savageY = rightRect.Y + savageStartOffsetY;
-            var savageBottom = rightRect.Y + rightRect.Height - savageBottomPadding;
+            var nameX = portraitX + portraitSize + 20f;
+            var nameY = portraitY + 14f;
+            DrawText(ctx, snapshot.CharacterName, nameFont, ImgColor.FromRgb(245, 249, 255), nameX, nameY);
+            DrawText(ctx, $"{snapshot.World} ・ {snapshot.DataCenter}", subFont, ImgColor.FromRgb(160, 175, 198), nameX, nameY + 52f);
+            DrawText(ctx, $"Generated: {snapshot.GeneratedAt.ToOffset(JapanTimeOffset):yyyy-MM-dd HH:mm} JST", smallFont, ImgColor.FromRgb(120, 138, 162), nameX, nameY + 78f);
+
+            // Main board (full width, just below header)
+            var boardTop = portraitY + portraitSize + 18f;
+            var boardRect = new ImgRectF(margin, boardTop, width - margin * 2f, height - boardTop - margin - 28f);
+            DrawPanel(ctx, boardRect, ImgColor.FromRgb(15, 22, 36), panelBorder);
+
+            // Two columns
+            const float colGap = 18f;
+            var innerW = boardRect.Width - 28f;
+            var leftW = MathF.Floor((innerW - colGap) / 2f);
+            var rightW = innerW - colGap - leftW;
+            var leftRect = new ImgRectF(boardRect.X + 14f, boardRect.Y + 14f, leftW, boardRect.Height - 28f);
+            var rightRect = new ImgRectF(leftRect.Right + colGap, boardRect.Y + 14f, rightW, boardRect.Height - 28f);
+            DrawPanel(ctx, leftRect, ImgColor.FromRgb(18, 24, 36), ImgColor.FromRgb(48, 65, 88));
+            DrawPanel(ctx, rightRect, ImgColor.FromRgb(18, 24, 36), ImgColor.FromRgb(48, 65, 88));
+
+            // Headings
+            DrawText(ctx, "絶達成状況", headingFont, ImgColor.FromRgb(236, 244, 255), leftRect.X + 14f, leftRect.Y + 12f);
+            DrawText(ctx, "零式クリア日", headingFont, ImgColor.FromRgb(236, 244, 255), rightRect.X + 14f, rightRect.Y + 12f);
+            ctx.Fill(goldAccent, new ImgRectF(leftRect.X + 14f, leftRect.Y + 44f, 100f, 2.5f));
+            ctx.Fill(goldAccent, new ImgRectF(rightRect.X + 14f, rightRect.Y + 44f, 100f, 2.5f));
+
+            // Left: Ultimate badges
+            const float badgeGap = 7f;
+            var badgeStartY = leftRect.Y + 58f;
+            var targetBadgeRows = Math.Max(1, Math.Min(statusRows.Count, 6));
+            var badgeAvailH = leftRect.Height - 78f;
+            var badgeHeight = Math.Clamp((badgeAvailH - ((targetBadgeRows - 1) * badgeGap)) / targetBadgeRows, 58f, 76f);
+            for (int i = 0; i < targetBadgeRows; i++)
+            {
+                var row = statusRows[i];
+                var style = ResolveUltimateStatusStyle(row.Value);
+                var bRect = new ImgRectF(leftRect.X + 12f, badgeStartY + i * (badgeHeight + badgeGap), leftRect.Width - 24f, badgeHeight);
+                DrawPanel(ctx, bRect, style.Fill, style.Border);
+                ctx.Fill(style.Accent, new ImgRectF(bRect.X, bRect.Y, 5f, bRect.Height));
+                var dotRect = new ImgRectF(bRect.X + bRect.Width - 22f, bRect.Y + bRect.Height / 2f - 4f, 8f, 8f);
+                ctx.Fill(style.ValueText, dotRect);
+                DrawText(ctx, Truncate(row.Title, 30), rowTitleFont, ImgColor.FromRgb(236, 243, 252), bRect.X + 16f, bRect.Y + 8f, bRect.Width - 40f);
+                DrawText(ctx, Truncate(row.Value, 40), rowValueFont, style.ValueText, bRect.X + 16f, bRect.Y + MathF.Max(34f, badgeHeight * 0.52f), bRect.Width - 40f);
+            }
+
+            // Right: Savage list
+            const float savGap = 2.5f;
+            const float savHeadH = 17f;
+            const float savRowH = 22f;
+            var savCatCount = savagePanelRows.Count(r => r.IsCategory);
+            var savValCount = savagePanelRows.Count - savCatCount;
+            var savReqH = savCatCount * (savHeadH + savGap) + savValCount * (savRowH + savGap);
+            var savAvailH = rightRect.Height - 60f;
+            var savScale = savReqH > 0 ? MathF.Min(1f, savAvailH / savReqH) : 1f;
+            var sHeadH = MathF.Max(12f, savHeadH * savScale);
+            var sRowH = MathF.Max(17f, savRowH * savScale);
+            var sCatFont = GetResumeFont(Math.Clamp(sHeadH - 1f, 11f, 14f), FontStyle.Bold);
+            var sNameFont = GetResumeFont(Math.Clamp(sRowH - 7f, 11f, 13f), FontStyle.Bold);
+            var sValueFont = GetResumeFont(Math.Clamp(sRowH - 7f, 11f, 13f), FontStyle.Bold);
+            var savY = rightRect.Y + 54f;
+            var savBottom = rightRect.Y + rightRect.Height - 10f;
             foreach (var row in savagePanelRows)
             {
                 if (row.IsCategory)
                 {
-                    if (savageY + savageHeaderHeight > savageBottom)
-                    {
-                        break;
-                    }
-
-                    DrawText(
-                        ctx,
-                        row.Title,
-                        savageCategoryFont,
-                        ImgColor.FromRgb(188, 205, 231),
-                        rightRect.X + 12f,
-                        savageY,
-                        rightRect.Width - 20f);
-                    var categoryWidth = TextMeasurer.MeasureBounds(row.Title, new TextOptions(savageCategoryFont)).Width;
-                    var categoryLineX = rightRect.X + 12f + categoryWidth + 8f;
-                    var categoryLineWidth = rightRect.Right - 12f - categoryLineX;
-                    if (categoryLineWidth > 14f)
-                    {
-                        ctx.Fill(
-                            ImgColor.FromRgba(79, 108, 144, 140),
-                            new ImgRectF(categoryLineX, savageY + (savageHeaderHeight * 0.58f), categoryLineWidth, 1.2f));
-                    }
-
-                    savageY += savageHeaderHeight + savageGap;
+                    if (savY + sHeadH > savBottom) break;
+                    DrawText(ctx, row.Title, sCatFont, ImgColor.FromRgb(190, 205, 228), rightRect.X + 12f, savY, rightRect.Width - 20f);
+                    var cw = TextMeasurer.MeasureBounds(row.Title, new TextOptions(sCatFont)).Width;
+                    var clx = rightRect.X + 12f + cw + 8f;
+                    var clw = rightRect.Right - 12f - clx;
+                    if (clw > 14f) ctx.Fill(ImgColor.FromRgba(79, 108, 144, 140), new ImgRectF(clx, savY + sHeadH * 0.58f, clw, 1.2f));
+                    savY += sHeadH + savGap;
                     continue;
                 }
-
-                if (savageY + savageRowHeight > savageBottom)
-                {
-                    break;
-                }
-
-                var rowRect = new ImgRectF(
-                    rightRect.X + 8f,
-                    savageY,
-                    rightRect.Width - 16f,
-                    savageRowHeight);
-
-                var style = ResolveUltimateStatusStyle(row.Value);
-                DrawPanel(ctx, rowRect, style.Fill, ImgColor.FromRgb(42, 58, 79));
-                ctx.Fill(style.Accent, new ImgRectF(rowRect.X, rowRect.Y, 4f, rowRect.Height));
-
-                var valueBounds = TextMeasurer.MeasureBounds(row.Value, new TextOptions(savageValueFont));
-                var valueX = rowRect.X + rowRect.Width - valueBounds.Width - 8f;
-                var titleWrap = MathF.Max(96f, valueX - rowRect.X - 16f);
-                var textOffsetY = MathF.Max(2f, (savageRowHeight - savageNameFont.Size) * 0.35f);
-                DrawText(
-                    ctx,
-                    Truncate(row.Title, 22),
-                    savageNameFont,
-                    ImgColor.FromRgb(236, 243, 252),
-                    rowRect.X + 8f,
-                    rowRect.Y + textOffsetY,
-                    titleWrap);
-                DrawText(ctx, row.Value, savageValueFont, style.ValueText, valueX, rowRect.Y + textOffsetY);
-                savageY += savageRowHeight + savageGap;
+                if (savY + sRowH > savBottom) break;
+                var srRect = new ImgRectF(rightRect.X + 8f, savY, rightRect.Width - 16f, sRowH);
+                var sStyle = ResolveUltimateStatusStyle(row.Value);
+                DrawPanel(ctx, srRect, sStyle.Fill, ImgColor.FromRgb(42, 58, 79));
+                ctx.Fill(sStyle.Accent, new ImgRectF(srRect.X, srRect.Y, 4f, srRect.Height));
+                var svBounds = TextMeasurer.MeasureBounds(row.Value, new TextOptions(sValueFont));
+                var svX = srRect.X + srRect.Width - svBounds.Width - 8f;
+                var sTitleW = MathF.Max(96f, svX - srRect.X - 16f);
+                var sOffY = MathF.Max(2f, (sRowH - sNameFont.Size) * 0.35f);
+                DrawText(ctx, Truncate(row.Title, 22), sNameFont, ImgColor.FromRgb(236, 243, 252), srRect.X + 8f, srRect.Y + sOffY, sTitleW);
+                DrawText(ctx, row.Value, sValueFont, sStyle.ValueText, svX, srRect.Y + sOffY);
+                savY += sRowH + savGap;
             }
 
-            DrawText(
-                ctx,
-                $"Lodestone: {Truncate(snapshot.LodestoneUrl, 120)}",
-                smallFont,
-                ImgColor.FromRgb(128, 146, 170),
-                margin + 4f,
-                height - 30f,
-                width - (margin * 2f) - 8f);
+            // Footer
+            DrawText(ctx, $"Lodestone: {Truncate(snapshot.LodestoneUrl, 120)}", smallFont, ImgColor.FromRgb(110, 128, 152), margin + 4f, height - 24f, width - margin * 2f - 8f);
         });
 
         using var stream = new MemoryStream();
@@ -679,9 +671,7 @@ public sealed class AchievementResumeService
                 var detail = await _lodestone.FetchAchievementDetailAsync(characterUrl, id, cancellationToken);
                 var available = detail.Status switch
                 {
-                    // Detail page can be available even when not earned, so require earned timestamp.
-                    LodestonePageDataStatus.Available when detail.EarnedAt.HasValue => true,
-                    LodestonePageDataStatus.Available => false,
+                    LodestonePageDataStatus.Available => true,
                     LodestonePageDataStatus.Private => (bool?)null,
                     LodestonePageDataStatus.NotFound => false,
                     _ => false
@@ -897,8 +887,7 @@ public sealed class AchievementResumeService
                 var detail = await _lodestone.FetchAchievementDetailAsync(characterUrl, id, cancellationToken);
                 var available = detail.Status switch
                 {
-                    LodestonePageDataStatus.Available when detail.EarnedAt.HasValue => true,
-                    LodestonePageDataStatus.Available => false,
+                    LodestonePageDataStatus.Available => true,
                     LodestonePageDataStatus.Private => (bool?)null,
                     LodestonePageDataStatus.NotFound => false,
                     _ => false
@@ -1028,7 +1017,7 @@ public sealed class AchievementResumeService
         return probe.Available switch
         {
             true when probe.EarnedAt.HasValue => FormatSavageClearDayLabel(achievementId, probe.EarnedAt.Value),
-            true => "達成日不明",
+            true => "未クリア",
             null => "非公開",
             _ => "未クリア"
         };
@@ -1226,7 +1215,7 @@ public sealed class AchievementResumeService
         return probe.Available switch
         {
             true when probe.EarnedAt.HasValue => FormatClearDayLabel(achievementId, probe.EarnedAt.Value),
-            true => "達成日不明",
+            true => "未クリア",
             null => "非公開",
             _ => "未クリア"
         };
@@ -1533,15 +1522,6 @@ public sealed class AchievementResumeService
                 ImgColor.FromRgb(226, 234, 248));
         }
 
-        if (string.Equals(value, "達成日不明", StringComparison.Ordinal))
-        {
-            return new UltimateStatusStyle(
-                ImgColor.FromRgb(62, 45, 20),
-                ImgColor.FromRgb(176, 133, 72),
-                ImgColor.FromRgb(191, 149, 86),
-                ImgColor.FromRgb(251, 231, 196));
-        }
-
         return new UltimateStatusStyle(
             ImgColor.FromRgb(58, 27, 35),
             ImgColor.FromRgb(155, 84, 98),
@@ -1630,6 +1610,7 @@ public sealed class AchievementResumeService
         string World,
         string DataCenter,
         string LodestoneUrl,
+        string? PortraitUrl,
         bool ForceRefresh,
         int RaidAchievementCount,
         int UltimateCount,

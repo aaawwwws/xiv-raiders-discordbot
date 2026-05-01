@@ -13,10 +13,12 @@ public sealed class AchievementResumeModule : InteractionModuleBase<SocketIntera
     private static readonly HashSet<string> SavageExpansionGroupSet = new(SavageExpansionGroups, StringComparer.Ordinal);
 
     private readonly AchievementResumeService _resume;
+    private readonly GuildAuditLogService _audit;
 
-    public AchievementResumeModule(AchievementResumeService resume)
+    public AchievementResumeModule(AchievementResumeService resume, GuildAuditLogService audit)
     {
         _resume = resume;
+        _audit = audit;
     }
 
     [ComponentInteraction(SavageFilterCustomIdPrefix + ":*", ignoreGroupNames: true)]
@@ -99,14 +101,16 @@ public sealed class AchievementResumeModule : InteractionModuleBase<SocketIntera
         var result = await _resume.BuildAsync(
             Context.Guild,
             target,
-            forceRefresh: false,
+            forceRefresh: true,
             savageGroupFilter: selectedGroups.ToArray());
         if (!result.Success || result.Embed is null)
         {
+            await _audit.SendAsync(Context.Guild, "レイド履歴書生成失敗", $"零式フィルタ `{string.Join(", ", selectedGroups)}` での履歴書生成に失敗しました。", Color.Red, Context.User);
             await FollowupAsync(result.ErrorMessage ?? "履歴書の生成に失敗しました。", ephemeral: true);
             return;
         }
 
+        await _audit.SendAsync(Context.Guild, "レイド履歴書生成", $"零式フィルタ `{string.Join(", ", selectedGroups)}` での履歴書を生成しました。", Color.Purple, Context.User);
         var components = BuildSavageFilterComponents(targetUserId, selectedGroups);
         if (result.ImagePng is { Length: > 0 } && !string.IsNullOrWhiteSpace(result.ImageFileName))
         {
