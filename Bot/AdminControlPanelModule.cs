@@ -383,10 +383,12 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
         var settings = await _db.GetGuildSettingsAsync(Context.Guild.Id);
         var approvalRequired = settings?.RegistrationApprovalRequired ?? true;
         var inactiveAutoKickEnabled = settings?.InactiveAutoKickEnabled ?? _options.InactiveAutoKickEnabled;
+        var sleepKickEnabled = settings?.SleepKickEnabled ?? _options.SleepKickEnabled;
+        var sleepKickAutoDetect = settings?.SleepKickAutoDetectEnabled ?? true;
         var sleepKickAdminConfirm = settings?.SleepKickAdminConfirmationRequired ?? _options.SleepKickRequiresAdminConfirmation;
         await RespondAsync(
             "設定/保守メニュー",
-            components: AdminControlPanel.BuildSettingsCategoryComponents(approvalRequired, inactiveAutoKickEnabled, sleepKickAdminConfirm),
+            components: AdminControlPanel.BuildSettingsCategoryComponents(approvalRequired, inactiveAutoKickEnabled, sleepKickEnabled, sleepKickAutoDetect, sleepKickAdminConfirm),
             ephemeral: true);
     }
 
@@ -3778,13 +3780,16 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
         var refreshedSettings = await _db.GetGuildSettingsAsync(Context.Guild.Id);
         var approvalRequired = refreshedSettings?.RegistrationApprovalRequired ?? true;
         var inactiveAutoKickEnabled = refreshedSettings?.InactiveAutoKickEnabled ?? _options.InactiveAutoKickEnabled;
+        var sleepKickEnabled = refreshedSettings?.SleepKickEnabled ?? _options.SleepKickEnabled;
+        var sleepKickAutoDetect = refreshedSettings?.SleepKickAutoDetectEnabled ?? true;
+        var sleepKickAdminConfirm = refreshedSettings?.SleepKickAdminConfirmationRequired ?? _options.SleepKickRequiresAdminConfirmation;
         if (Context.Interaction is SocketMessageComponent component &&
             component.Message is IUserMessage message &&
             LooksLikeAdminControlPanelMessage(message))
         {
-            await ApplyAdminControlPanelStateAsync(message, approvalRequired, inactiveAutoKickEnabled);
+            await ApplyAdminControlPanelStateAsync(message, approvalRequired, inactiveAutoKickEnabled, sleepKickEnabled, sleepKickAutoDetect, sleepKickAdminConfirm);
         }
-        await RefreshStoredAdminControlPanelStateAsync(approvalRequired, inactiveAutoKickEnabled);
+        await RefreshStoredAdminControlPanelStateAsync(approvalRequired, inactiveAutoKickEnabled, sleepKickEnabled, sleepKickAutoDetect, sleepKickAdminConfirm);
 
         await FollowupAsync(
             approvalRequired
@@ -3832,13 +3837,16 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
         var refreshedSettings = await _db.GetGuildSettingsAsync(Context.Guild.Id);
         var approvalRequired = refreshedSettings?.RegistrationApprovalRequired ?? true;
         var inactiveAutoKickEnabled = refreshedSettings?.InactiveAutoKickEnabled ?? _options.InactiveAutoKickEnabled;
+        var sleepKickEnabled = refreshedSettings?.SleepKickEnabled ?? _options.SleepKickEnabled;
+        var sleepKickAutoDetect = refreshedSettings?.SleepKickAutoDetectEnabled ?? true;
+        var sleepKickAdminConfirm = refreshedSettings?.SleepKickAdminConfirmationRequired ?? _options.SleepKickRequiresAdminConfirmation;
         if (Context.Interaction is SocketMessageComponent component &&
             component.Message is IUserMessage message &&
             LooksLikeAdminControlPanelMessage(message))
         {
-            await ApplyAdminControlPanelStateAsync(message, approvalRequired, inactiveAutoKickEnabled);
+            await ApplyAdminControlPanelStateAsync(message, approvalRequired, inactiveAutoKickEnabled, sleepKickEnabled, sleepKickAutoDetect, sleepKickAdminConfirm);
         }
-        await RefreshStoredAdminControlPanelStateAsync(approvalRequired, inactiveAutoKickEnabled);
+        await RefreshStoredAdminControlPanelStateAsync(approvalRequired, inactiveAutoKickEnabled, sleepKickEnabled, sleepKickAutoDetect, sleepKickAdminConfirm);
 
         await FollowupAsync(
             inactiveAutoKickEnabled
@@ -3850,6 +3858,120 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
             Context.Guild,
             "設定変更: 30日非アクティブ自動キック",
             $"旧値: {(previousValue ? "ON" : "OFF")}\n新値: {(inactiveAutoKickEnabled ? "ON" : "OFF")}",
+            Color.Teal,
+            Context.User);
+    }
+
+    [RequireBotAdmin]
+    [ComponentInteraction(AdminControlPanel.ToggleSleepKickEnabledCustomId, ignoreGroupNames: true)]
+    public async Task ToggleSleepKickEnabledAsync()
+    {
+        if (Context.Guild is null)
+        {
+            await RespondAsync("この操作はサーバー内でのみ使えます。", ephemeral: true);
+            return;
+        }
+
+        await DeferAsync(ephemeral: true);
+
+        var settings = await _db.GetGuildSettingsAsync(Context.Guild.Id);
+        if (settings is null)
+        {
+            await FollowupAsync("サーバー設定が未初期化です。Botを再起動してから再試行してください。", ephemeral: true);
+            return;
+        }
+
+        var previousValue = settings.SleepKickEnabled;
+        var updated = await _db.UpdateGuildSleepKickEnabledAsync(
+            Context.Guild.Id,
+            !settings.SleepKickEnabled);
+        if (!updated)
+        {
+            await FollowupAsync("設定更新に失敗しました。時間を置いて再試行してください。", ephemeral: true);
+            return;
+        }
+
+        var refreshedSettings = await _db.GetGuildSettingsAsync(Context.Guild.Id);
+        var approvalRequired = refreshedSettings?.RegistrationApprovalRequired ?? true;
+        var inactiveAutoKickEnabled = refreshedSettings?.InactiveAutoKickEnabled ?? _options.InactiveAutoKickEnabled;
+        var sleepKickEnabled = refreshedSettings?.SleepKickEnabled ?? _options.SleepKickEnabled;
+        var sleepKickAutoDetect = refreshedSettings?.SleepKickAutoDetectEnabled ?? true;
+        var sleepKickAdminConfirm = refreshedSettings?.SleepKickAdminConfirmationRequired ?? _options.SleepKickRequiresAdminConfirmation;
+        if (Context.Interaction is SocketMessageComponent component &&
+            component.Message is IUserMessage message &&
+            LooksLikeAdminControlPanelMessage(message))
+        {
+            await ApplyAdminControlPanelStateAsync(message, approvalRequired, inactiveAutoKickEnabled, sleepKickEnabled, sleepKickAutoDetect, sleepKickAdminConfirm);
+        }
+        await RefreshStoredAdminControlPanelStateAsync(approvalRequired, inactiveAutoKickEnabled, sleepKickEnabled, sleepKickAutoDetect, sleepKickAdminConfirm);
+
+        await FollowupAsync(
+            sleepKickEnabled
+                ? "寝落ち投票機能を「ON」に変更しました。"
+                : "寝落ち投票機能を「OFF」に変更しました。",
+            ephemeral: true);
+
+        await _audit.SendAsync(
+            Context.Guild,
+            "設定変更: 寝落ち投票機能",
+            $"旧値: {(previousValue ? "ON" : "OFF")}\n新値: {(sleepKickEnabled ? "ON" : "OFF")}",
+            Color.Teal,
+            Context.User);
+    }
+
+    [RequireBotAdmin]
+    [ComponentInteraction(AdminControlPanel.ToggleSleepKickAutoDetectCustomId, ignoreGroupNames: true)]
+    public async Task ToggleSleepKickAutoDetectAsync()
+    {
+        if (Context.Guild is null)
+        {
+            await RespondAsync("この操作はサーバー内でのみ使えます。", ephemeral: true);
+            return;
+        }
+
+        await DeferAsync(ephemeral: true);
+
+        var settings = await _db.GetGuildSettingsAsync(Context.Guild.Id);
+        if (settings is null)
+        {
+            await FollowupAsync("サーバー設定が未初期化です。Botを再起動してから再試行してください。", ephemeral: true);
+            return;
+        }
+
+        var previousValue = settings.SleepKickAutoDetectEnabled;
+        var updated = await _db.UpdateGuildSleepKickAutoDetectEnabledAsync(
+            Context.Guild.Id,
+            !settings.SleepKickAutoDetectEnabled);
+        if (!updated)
+        {
+            await FollowupAsync("設定更新に失敗しました。時間を置いて再試行してください。", ephemeral: true);
+            return;
+        }
+
+        var refreshedSettings = await _db.GetGuildSettingsAsync(Context.Guild.Id);
+        var approvalRequired = refreshedSettings?.RegistrationApprovalRequired ?? true;
+        var inactiveAutoKickEnabled = refreshedSettings?.InactiveAutoKickEnabled ?? _options.InactiveAutoKickEnabled;
+        var sleepKickEnabled = refreshedSettings?.SleepKickEnabled ?? _options.SleepKickEnabled;
+        var sleepKickAutoDetect = refreshedSettings?.SleepKickAutoDetectEnabled ?? true;
+        var sleepKickAdminConfirm = refreshedSettings?.SleepKickAdminConfirmationRequired ?? _options.SleepKickRequiresAdminConfirmation;
+        if (Context.Interaction is SocketMessageComponent component &&
+            component.Message is IUserMessage message &&
+            LooksLikeAdminControlPanelMessage(message))
+        {
+            await ApplyAdminControlPanelStateAsync(message, approvalRequired, inactiveAutoKickEnabled, sleepKickEnabled, sleepKickAutoDetect, sleepKickAdminConfirm);
+        }
+        await RefreshStoredAdminControlPanelStateAsync(approvalRequired, inactiveAutoKickEnabled, sleepKickEnabled, sleepKickAutoDetect, sleepKickAdminConfirm);
+
+        await FollowupAsync(
+            sleepKickAutoDetect
+                ? "寝落ち自動検出を「ON」に変更しました。"
+                : "寝落ち自動検出を「OFF」に変更しました。",
+            ephemeral: true);
+
+        await _audit.SendAsync(
+            Context.Guild,
+            "設定変更: 寝落ち自動検出",
+            $"旧値: {(previousValue ? "ON" : "OFF")}\n新値: {(sleepKickAutoDetect ? "ON" : "OFF")}",
             Color.Teal,
             Context.User);
     }
@@ -6447,26 +6569,29 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
             : await _db.GetGuildSettingsAsync(Context.Guild.Id);
         var approvalRequired = settings?.RegistrationApprovalRequired ?? true;
         var inactiveAutoKickEnabled = settings?.InactiveAutoKickEnabled ?? _options.InactiveAutoKickEnabled;
+        var sleepKickEnabled = settings?.SleepKickEnabled ?? _options.SleepKickEnabled;
+        var sleepKickAutoDetect = settings?.SleepKickAutoDetectEnabled ?? true;
+        var sleepKickAdminConfirm = settings?.SleepKickAdminConfirmationRequired ?? _options.SleepKickRequiresAdminConfirmation;
         if (existing is not null)
         {
             await existing.ModifyAsync(props =>
             {
                 props.Content = null;
-                props.Embed = BuildAdminStatusEmbed(approvalRequired, inactiveAutoKickEnabled);
+                props.Embed = BuildAdminStatusEmbed(approvalRequired, inactiveAutoKickEnabled, sleepKickEnabled, sleepKickAutoDetect, sleepKickAdminConfirm);
                 props.Components = AdminControlPanel.BuildComponents(approvalRequired, inactiveAutoKickEnabled);
             });
             return existing;
         }
 
         return await channel.SendMessageAsync(
-            embed: BuildAdminStatusEmbed(approvalRequired, inactiveAutoKickEnabled),
+            embed: BuildAdminStatusEmbed(approvalRequired, inactiveAutoKickEnabled, sleepKickEnabled, sleepKickAutoDetect, sleepKickAdminConfirm),
             components: AdminControlPanel.BuildComponents(approvalRequired, inactiveAutoKickEnabled),
             flags: MessageFlags.SuppressNotification);
     }
 
-    private static Task ApplyAdminControlPanelStateAsync(IUserMessage message, bool approvalRequired, bool inactiveAutoKickEnabled)
+    private static Task ApplyAdminControlPanelStateAsync(IUserMessage message, bool approvalRequired, bool inactiveAutoKickEnabled, bool sleepKickEnabled = false, bool sleepKickAutoDetect = false, bool sleepKickAdminConfirm = false)
     {
-        var embed = BuildAdminStatusEmbed(approvalRequired, inactiveAutoKickEnabled);
+        var embed = BuildAdminStatusEmbed(approvalRequired, inactiveAutoKickEnabled, sleepKickEnabled, sleepKickAutoDetect, sleepKickAdminConfirm);
         var components = AdminControlPanel.BuildComponents(approvalRequired, inactiveAutoKickEnabled);
         return message.ModifyAsync(props =>
         {
@@ -6476,7 +6601,7 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
         });
     }
 
-    private async Task RefreshStoredAdminControlPanelStateAsync(bool approvalRequired, bool inactiveAutoKickEnabled)
+    private async Task RefreshStoredAdminControlPanelStateAsync(bool approvalRequired, bool inactiveAutoKickEnabled, bool sleepKickEnabled = false, bool sleepKickAutoDetect = false, bool sleepKickAdminConfirm = false)
     {
         if (Context.Guild is null)
         {
@@ -6503,7 +6628,7 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
                 return;
             }
 
-            await ApplyAdminControlPanelStateAsync(message, approvalRequired, inactiveAutoKickEnabled);
+            await ApplyAdminControlPanelStateAsync(message, approvalRequired, inactiveAutoKickEnabled, sleepKickEnabled, sleepKickAutoDetect, sleepKickAdminConfirm);
         }
         catch
         {
@@ -6523,8 +6648,8 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
         return false;
     }
 
-    private static Embed BuildAdminStatusEmbed(bool approvalRequired, bool inactiveAutoKickEnabled, bool sleepKickAdminConfirm = false)
-        => AdminControlPanel.BuildStatusEmbed(approvalRequired, inactiveAutoKickEnabled, sleepKickAdminConfirm);
+    private static Embed BuildAdminStatusEmbed(bool approvalRequired, bool inactiveAutoKickEnabled, bool sleepKickEnabled = false, bool sleepKickAutoDetect = false, bool sleepKickAdminConfirm = false)
+        => AdminControlPanel.BuildStatusEmbed(approvalRequired, inactiveAutoKickEnabled, sleepKickEnabled, sleepKickAutoDetect, sleepKickAdminConfirm, includeReactionLabelInAutoKickNote: true);
 
     private int GetMemberManageLookbackDays(ulong guildId, ulong actorUserId)
     {

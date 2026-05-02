@@ -5858,7 +5858,9 @@ SELECT guild_id AS GuildId,
        registration_approval_required AS RegistrationApprovalRequired,
        inactive_auto_kick_enabled AS InactiveAutoKickEnabled,
        inactive_auto_kick_user_data_retention_days AS InactiveAutoKickUserDataRetentionDays,
-       log_channel_id AS LogChannelId,
+        sleep_kick_enabled AS SleepKickEnabled,
+        sleep_kick_auto_detect_enabled AS SleepKickAutoDetectEnabled,
+        log_channel_id AS LogChannelId,
        control_channel_id AS ControlChannelId,
        runtime_cleanup_interval_minutes AS RuntimeCleanupIntervalMinutes,
        runtime_recruit_closed_retention_hours AS RuntimeRecruitClosedRetentionHours,
@@ -5890,8 +5892,8 @@ LIMIT 1;";
         ulong controlChannelId)
     {
         const string sql = @"
-INSERT INTO guild_settings (guild_id, admin_role_id, member_role_id, provisional_role_id, registration_channel_id, registration_review_channel_id, registration_approval_required, inactive_auto_kick_enabled, log_channel_id, control_channel_id)
-VALUES (@GuildId, @AdminRoleId, @MemberRoleId, @ProvisionalRoleId, @RegistrationChannelId, @RegistrationReviewChannelId, @RegistrationApprovalRequired, @InactiveAutoKickEnabled, @LogChannelId, @ControlChannelId)
+INSERT INTO guild_settings (guild_id, admin_role_id, member_role_id, provisional_role_id, registration_channel_id, registration_review_channel_id, registration_approval_required, inactive_auto_kick_enabled, sleep_kick_enabled, sleep_kick_auto_detect_enabled, log_channel_id, control_channel_id)
+VALUES (@GuildId, @AdminRoleId, @MemberRoleId, @ProvisionalRoleId, @RegistrationChannelId, @RegistrationReviewChannelId, @RegistrationApprovalRequired, @InactiveAutoKickEnabled, true, true, @LogChannelId, @ControlChannelId)
 ON CONFLICT (guild_id) DO UPDATE
 SET admin_role_id = EXCLUDED.admin_role_id,
     member_role_id = EXCLUDED.member_role_id,
@@ -5951,6 +5953,32 @@ WHERE guild_id = @GuildId;";
         const string sql = @"
 UPDATE guild_settings
 SET sleep_kick_admin_confirmation_required = @Enabled,
+    updated_at = NOW()
+WHERE guild_id = @GuildId;";
+
+        await using var conn = CreateConnection();
+        var affected = await conn.ExecuteAsync(sql, new { GuildId = ToDbId(guildId), Enabled = enabled });
+        return affected > 0;
+    }
+
+    public async Task<bool> UpdateGuildSleepKickEnabledAsync(ulong guildId, bool enabled)
+    {
+        const string sql = @"
+UPDATE guild_settings
+SET sleep_kick_enabled = @Enabled,
+    updated_at = NOW()
+WHERE guild_id = @GuildId;";
+
+        await using var conn = CreateConnection();
+        var affected = await conn.ExecuteAsync(sql, new { GuildId = ToDbId(guildId), Enabled = enabled });
+        return affected > 0;
+    }
+
+    public async Task<bool> UpdateGuildSleepKickAutoDetectEnabledAsync(ulong guildId, bool enabled)
+    {
+        const string sql = @"
+UPDATE guild_settings
+SET sleep_kick_auto_detect_enabled = @Enabled,
     updated_at = NOW()
 WHERE guild_id = @GuildId;";
 

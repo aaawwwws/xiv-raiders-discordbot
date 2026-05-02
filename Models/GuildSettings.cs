@@ -10,6 +10,8 @@ public sealed class GuildSettings
     public long RegistrationReviewChannelId { get; init; }
     public bool RegistrationApprovalRequired { get; init; }
     public bool InactiveAutoKickEnabled { get; init; }
+    public bool SleepKickEnabled { get; init; }
+    public bool SleepKickAutoDetectEnabled { get; init; }
     public bool SleepKickAdminConfirmationRequired { get; init; }
     public int? InactiveAutoKickUserDataRetentionDays { get; init; }
     public long LogChannelId { get; init; }

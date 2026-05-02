@@ -150,7 +150,9 @@ public sealed class SleepKickService
 
     public async Task<bool> StartVoteAsync(SocketGuild guild, ITextChannel? fallbackChannel, SocketGuildUser targetUser, ulong initiatorUserId, bool skipCooldown = false)
     {
-        if (!_options.SleepKickEnabled)
+        var settings = await _db.GetGuildSettingsAsync(guild.Id);
+        var sleepKickEnabled = settings?.SleepKickEnabled ?? _options.SleepKickEnabled;
+        if (!sleepKickEnabled)
             return false;
 
         if (targetUser.VoiceChannel is null)
@@ -176,7 +178,9 @@ public sealed class SleepKickService
 
     public async Task DetectAndNotifyAsync(SocketGuild guild, ITextChannel? fallbackChannel = null)
     {
-        if (!_options.SleepKickEnabled)
+        var settings = await _db.GetGuildSettingsAsync(guild.Id);
+        var sleepKickEnabled = settings?.SleepKickEnabled ?? _options.SleepKickEnabled;
+        if (!sleepKickEnabled)
             return;
 
         var threshold = TimeSpan.FromMinutes(_options.SleepKickDetectMinutes);

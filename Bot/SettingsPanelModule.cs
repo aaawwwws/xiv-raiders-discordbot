@@ -1129,6 +1129,6 @@ public sealed class SettingsPanelModule : InteractionModuleBase<SocketInteractio
     private static string BuildDiscordMessageLink(ulong guildId, ulong channelId, ulong messageId)
         => $"https://discord.com/channels/{guildId}/{channelId}/{messageId}";
 
-    private static Embed BuildAdminPanelStatusEmbed(bool approvalRequired, bool inactiveAutoKickEnabled, bool sleepKickAdminConfirm = false)
-        => AdminControlPanel.BuildStatusEmbed(approvalRequired, inactiveAutoKickEnabled, sleepKickAdminConfirm);
+    private static Embed BuildAdminPanelStatusEmbed(bool approvalRequired, bool inactiveAutoKickEnabled, bool sleepKickEnabled = false, bool sleepKickAutoDetect = false, bool sleepKickAdminConfirm = false)
+        => AdminControlPanel.BuildStatusEmbed(approvalRequired, inactiveAutoKickEnabled, sleepKickEnabled, sleepKickAutoDetect, sleepKickAdminConfirm);
 }

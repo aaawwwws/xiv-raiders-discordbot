@@ -388,6 +388,8 @@ CREATE TABLE ""public"".""guild_settings"" (
     ""registration_approval_required"" boolean DEFAULT true NOT NULL,
     ""inactive_auto_kick_enabled"" boolean DEFAULT true NOT NULL,
     ""inactive_auto_kick_user_data_retention_days"" integer DEFAULT 7 NOT NULL,
+    ""sleep_kick_enabled"" boolean DEFAULT true NOT NULL,
+    ""sleep_kick_auto_detect_enabled"" boolean DEFAULT true NOT NULL,
     ""sleep_kick_admin_confirmation_required"" boolean DEFAULT false NOT NULL,
     ""log_channel_id"" bigint NOT NULL,
     ""control_channel_id"" bigint NOT NULL,

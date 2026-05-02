@@ -808,6 +808,12 @@ public sealed class DiscordBotService : IHostedService
             {
                 foreach (var guild in _client.Guilds)
                 {
+                    var settings = await _db.GetGuildSettingsAsync(guild.Id);
+                    var sleepKickEnabled = settings?.SleepKickEnabled ?? _options.SleepKickEnabled;
+                    var sleepKickAutoDetect = settings?.SleepKickAutoDetectEnabled ?? true;
+                    if (!sleepKickEnabled || !sleepKickAutoDetect)
+                        continue;
+
                     var logChannel = await ResolveLogChannelAsync(guild);
                     await _sleepKick.DetectAndNotifyAsync(guild, logChannel as ITextChannel);
                 }
@@ -4245,8 +4251,8 @@ public sealed class DiscordBotService : IHostedService
             _ => ButtonStyle.Secondary
         };
 
-    private static Embed BuildAdminPanelStatusEmbed(bool approvalRequired, bool inactiveAutoKickEnabled, bool sleepKickAdminConfirm = false)
-        => AdminControlPanel.BuildStatusEmbed(approvalRequired, inactiveAutoKickEnabled, sleepKickAdminConfirm, includeReactionLabelInAutoKickNote: true);
+    private static Embed BuildAdminPanelStatusEmbed(bool approvalRequired, bool inactiveAutoKickEnabled, bool sleepKickEnabled = false, bool sleepKickAutoDetect = false, bool sleepKickAdminConfirm = false)
+        => AdminControlPanel.BuildStatusEmbed(approvalRequired, inactiveAutoKickEnabled, sleepKickEnabled, sleepKickAutoDetect, sleepKickAdminConfirm, includeReactionLabelInAutoKickNote: true);
 
     private async Task EnsureVisibilityAsync(
         SocketGuild guild,
