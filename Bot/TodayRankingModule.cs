@@ -87,11 +87,24 @@ public sealed class TodayRankingModule : InteractionModuleBase<SocketInteraction
         var lastMessageId = existing is null ? 0UL : ToUlong(existing.MessageId);
         await _db.UpsertGuildWeeklyActivityPanelAsync(Context.Guild.Id, channel.Id, lastMessageId);
 
+        // 先週のランキング上位者にロール付与
+        try
+        {
+            var roleRangeDays = Math.Clamp(_options.VoiceWeeklyRankingRangeDays, 1, 30);
+            var nowUtc = DateTimeOffset.UtcNow;
+            var fromUtc = nowUtc.AddDays(-roleRangeDays);
+            await _voiceStats.AssignWeeklyRankingRolesAsync(Context.Guild, fromUtc, nowUtc);
+        }
+        catch
+        {
+            // ロール付与の失敗は設定メッセージをブロックしない
+        }
+
         var day = ToJstDayName(Math.Clamp(_options.VoiceWeeklyRankingPostDayOfWeekJst, 0, 6));
         var hour = Math.Clamp(_options.VoiceWeeklyRankingPostHourJst, 0, 23);
         var rangeDays = Math.Clamp(_options.VoiceWeeklyRankingRangeDays, 1, 30);
         await FollowupAsync(
-            $"週間ランキングの送信先を設定しました。\n対象: <#{channel.Id}>\n投稿タイミング: 毎週{day} {hour:00}:00 (JST)\n集計期間: 直前{rangeDays}日（確定分のみ）",
+            $"週間ランキングの送信先を設定しました。\n対象: <#{channel.Id}>\n投稿タイミング: 毎週{day} {hour:00}:00 (JST)\n集計期間: 直前{rangeDays}日（確定分のみ）\n\n🥇🥈🥉 先週のランキング上位3名にロールを付与しました！",
             ephemeral: true);
     }
 

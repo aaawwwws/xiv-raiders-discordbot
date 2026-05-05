@@ -886,7 +886,8 @@ public sealed class SleepKickService
         var initialButtons = new Btn[]
         {
             new("✅ はい", 3, BuildYesCustomId(voiceChannel.Guild.Id, targetUser.Id, 0)),
-            new("❌ いいえ", 2, BuildNoCustomId(voiceChannel.Guild.Id, targetUser.Id, 0))
+            new("❌ いいえ", 2, BuildNoCustomId(voiceChannel.Guild.Id, targetUser.Id, 0)),
+            new("⛔ 起きてるよ！", 4, BuildCancelCustomId(voiceChannel.Guild.Id, targetUser.Id, 0))
         };
 
         var targetChannelId = voiceChannel.Id;
@@ -899,14 +900,15 @@ public sealed class SleepKickService
         if (voiceTextChannel != null)
         {
             var cb = new ComponentBuilder()
-                .WithButton("✅ はい", BuildYesCustomId(voiceChannel.Guild.Id, targetUser.Id, 0), ButtonStyle.Success)
-                .WithButton("❌ いいえ", BuildNoCustomId(voiceChannel.Guild.Id, targetUser.Id, 0), ButtonStyle.Secondary);
+                    .WithButton("✅ はい", BuildYesCustomId(voiceChannel.Guild.Id, targetUser.Id, 0), ButtonStyle.Success)
+                    .WithButton("❌ いいえ", BuildNoCustomId(voiceChannel.Guild.Id, targetUser.Id, 0), ButtonStyle.Secondary)
+                    .WithButton("⛔ 起きてるよ！(本人のみ)", BuildCancelCustomId(voiceChannel.Guild.Id, targetUser.Id, 0), ButtonStyle.Danger);
 
-            try
-            {
-                var message = await voiceTextChannel.SendMessageAsync(
-                    text: MentionUtils.MentionUser(targetUser.Id), embed: embed, components: cb.Build());
-                messageId = message.Id;
+                try
+                {
+                    var message = await voiceTextChannel.SendMessageAsync(
+                        text: MentionUtils.MentionUser(targetUser.Id), embed: embed, components: cb.Build());
+                    messageId = message.Id;
                 usedImessageChannel = true;
             }
             catch (Exception ex)
@@ -932,7 +934,8 @@ public sealed class SleepKickService
 
                 var cb = new ComponentBuilder()
                     .WithButton("✅ はい", BuildYesCustomId(voiceChannel.Guild.Id, targetUser.Id, 0), ButtonStyle.Success)
-                    .WithButton("❌ いいえ", BuildNoCustomId(voiceChannel.Guild.Id, targetUser.Id, 0), ButtonStyle.Secondary);
+                    .WithButton("❌ いいえ", BuildNoCustomId(voiceChannel.Guild.Id, targetUser.Id, 0), ButtonStyle.Secondary)
+                    .WithButton("⛔ 起きてるよ！(本人のみ)", BuildCancelCustomId(voiceChannel.Guild.Id, targetUser.Id, 0), ButtonStyle.Danger);
 
                 var message = await fallbackChannel.SendMessageAsync(
                     text: MentionUtils.MentionUser(targetUser.Id), embed: embed, components: cb.Build());

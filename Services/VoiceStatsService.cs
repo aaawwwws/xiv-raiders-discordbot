@@ -583,4 +583,127 @@ public sealed class VoiceStatsService {
 
         return false;
     }
+
+    public async Task AssignWeeklyRankingRolesAsync(SocketGuild guild, DateTimeOffset fromUtc, DateTimeOffset toUtc)
+    {
+        try
+        {
+            // 上位10位まで取得（除外対象がいる場合の繰り上げ用）
+            var voiceRows = await ExecuteRankingDbQueryWithRetryAsync(
+                guild.Id,
+                nameof(Db.ListVoiceDurationSummaryAsync),
+                () => _db.ListVoiceDurationSummaryAsync(guild.Id, fromUtc, toUtc, 10));
+
+            // 除外対象ロールを持つ人をフィルタリング
+            var excludedRoles = new[] { "管理者", "オフィサー", "運営" };
+            var filteredTop = voiceRows
+                .Where(row => {
+                    var user = guild.GetUser(unchecked((ulong)row.UserId));
+                    if (user == null) return false;
+                    // 除外ロールを持っていないかチェック
+                    return !user.Roles.Any(r => excludedRoles.Contains(r.Name));
+                })
+                .Take(3)
+                .Select(row => unchecked((ulong)row.UserId))
+                .ToList();
+
+            var top3 = filteredTop;
+
+            var roleConfigs = new[]
+            {
+                new { Rank = 1, Name = "🥇1位", Colors = new RoleColors(new Color(0xFF, 0xD7, 0x00), new Color(0xFF, 0x95, 0x00), null) },
+                new { Rank = 2, Name = "🥈2位", Colors = new RoleColors(new Color(0xE0, 0xE0, 0xE0), new Color(0x80, 0x80, 0x80), null) },
+                new { Rank = 3, Name = "🥉3位", Colors = new RoleColors(new Color(0xCD, 0x7F, 0x32), new Color(0x8B, 0x45, 0x13), null) }
+            };
+
+            foreach (var config in roleConfigs)
+            {
+                var userId = top3.ElementAtOrDefault(config.Rank - 1);
+
+                // 既存のロールを探す
+                var role = (IRole?)guild.Roles.FirstOrDefault(r => r.Name == config.Name);
+                
+                if (role is null)
+                {
+                    try
+                    {
+                        role = await guild.CreateRoleAsync(config.Name, isMentionable: false);
+                        await role.ModifyAsync(r => r.Colors = config.Colors);
+                        
+                        // ロールをメンバーロールより上位に配置（@everyoneの1つ上）
+                        var everyoneRole = guild.EveryoneRole;
+                        if (everyoneRole != null)
+                        {
+                            try
+                            {
+                                await role.ModifyAsync(r => r.Position = everyoneRole.Position + 1);
+                            }
+                            catch (Exception posEx)
+                            {
+                                _logger.LogWarning(posEx, "Failed to move role position. GuildId={GuildId}, Role={RoleName}", guild.Id, config.Name);
+                            }
+                        }
+                        
+                        _logger.LogInformation("Created ranking role with gradient. GuildId={GuildId}, Role={RoleName}", guild.Id, config.Name);
+                        // ロール作成後、Discord側で反映されるまで少し待機
+                        await Task.Delay(500);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Failed to create ranking role. GuildId={GuildId}, Role={RoleName}", guild.Id, config.Name);
+                        continue;
+                    }
+                }
+
+                // 既存のこのロールを持つメンバーから解除（上位者が変わった場合）
+                foreach (var member in guild.Users.Where(u => u.Roles.Any(r => r.Id == role.Id)))
+                {
+                    if (member.Id != userId)
+                    {
+                        try
+                        {
+                            await member.RemoveRoleAsync(role);
+                            _logger.LogInformation("Removed ranking role. GuildId={GuildId}, Role={RoleName}, UserId={UserId}", guild.Id, config.Name, member.Id);
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogWarning(ex, "Failed to remove ranking role. GuildId={GuildId}, Role={RoleName}, UserId={UserId}", guild.Id, config.Name, member.Id);
+                        }
+                    }
+                }
+
+                // 新しい上位者に付与（対象がいる場合のみ）
+                if (userId != 0)
+                {
+                    var targetUser = guild.GetUser(userId);
+                    if (targetUser is not null && !targetUser.Roles.Any(r => r.Id == role.Id))
+                    {
+                        // 最大3回リトライ
+                        for (var attempt = 0; attempt < 3; attempt++)
+                        {
+                            try
+                            {
+                                await targetUser.AddRoleAsync(role);
+                                _logger.LogInformation("Assigned ranking role. GuildId={GuildId}, Role={RoleName}, UserId={UserId}", guild.Id, config.Name, userId);
+                                break;
+                            }
+                            catch (Exception ex) when (attempt < 2)
+                            {
+                                _logger.LogWarning(ex, "Failed to assign ranking role (attempt {Attempt}/3). Retrying... GuildId={GuildId}, Role={RoleName}, UserId={UserId}", attempt + 1, guild.Id, config.Name, userId);
+                                await Task.Delay(1000);
+                            }
+                            catch (Exception ex)
+                            {
+                                _logger.LogWarning(ex, "Failed to assign ranking role after 3 attempts. GuildId={GuildId}, Role={RoleName}, UserId={UserId}", guild.Id, config.Name, userId);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to assign weekly ranking roles. GuildId={GuildId}", guild.Id);
+        }
+    }
 }

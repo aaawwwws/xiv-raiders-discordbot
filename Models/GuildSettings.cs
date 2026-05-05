@@ -13,6 +13,7 @@ public sealed class GuildSettings
     public bool SleepKickEnabled { get; init; }
     public bool SleepKickAutoDetectEnabled { get; init; }
     public bool SleepKickAdminConfirmationRequired { get; init; }
+    public string? LodestoneUserAgent { get; init; }
     public int? InactiveAutoKickUserDataRetentionDays { get; init; }
     public long LogChannelId { get; init; }
     public long ControlChannelId { get; init; }

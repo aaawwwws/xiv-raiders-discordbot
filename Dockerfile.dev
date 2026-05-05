@@ -1,0 +1,15 @@
+FROM mcr.microsoft.com/dotnet/sdk:10.0
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends libopus-dev libsodium-dev fonts-noto-cjk unzip wget && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN wget https://github.com/discord/libdave/releases/download/v1.1.1%2Fcpp/libdave-Linux-X64-boringssl.zip -O /tmp/libdave.zip && \
+    unzip -o /tmp/libdave.zip -d /tmp/libdave && \
+    cp /tmp/libdave/lib/libdave.so /usr/local/lib/ && \
+    ldconfig && \
+    rm -rf /tmp/libdave.zip /tmp/libdave
+
+WORKDIR /src
+COPY RaidDcBot.csproj ./
+RUN dotnet restore RaidDcBot.csproj

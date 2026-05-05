@@ -305,6 +305,11 @@ public sealed class SettingsPanelModule : InteractionModuleBase<SocketInteractio
             });
         }
 
+        if (Context.User is SocketGuildUser guildUser)
+        {
+            await GrantStoryProgressionRoleAsync(guildUser, storyProgression);
+        }
+
         await _audit.SendAsync(Context.Guild, "自己設定変更", $"ストーリー進行度を {label} に変更しました。", Color.Green, Context.User);
     }
 
@@ -1131,4 +1136,54 @@ public sealed class SettingsPanelModule : InteractionModuleBase<SocketInteractio
 
     private static Embed BuildAdminPanelStatusEmbed(bool approvalRequired, bool inactiveAutoKickEnabled, bool sleepKickEnabled = false, bool sleepKickAutoDetect = false, bool sleepKickAdminConfirm = false)
         => AdminControlPanel.BuildStatusEmbed(approvalRequired, inactiveAutoKickEnabled, sleepKickEnabled, sleepKickAutoDetect, sleepKickAdminConfirm);
+
+    private async Task GrantStoryProgressionRoleAsync(SocketGuildUser guildUser, string? storyProgression)
+    {
+        if (Context.Guild is null)
+        {
+            return;
+        }
+
+        var allStoryRoleNames = StoryProgressionOptions.Values.ToList();
+
+        if (string.IsNullOrWhiteSpace(storyProgression) || !StoryProgressionOptions.TryGetValue(storyProgression, out var targetRoleName))
+        {
+            var removeRoles = guildUser.Roles
+                .Where(role => allStoryRoleNames.Any(name => string.Equals(name, role.Name, StringComparison.OrdinalIgnoreCase)))
+                .ToList();
+
+            if (removeRoles.Count > 0)
+            {
+                await guildUser.RemoveRolesAsync(removeRoles);
+            }
+            return;
+        }
+
+        IRole? existingRole = Context.Guild.Roles.FirstOrDefault(role =>
+            string.Equals(role.Name, targetRoleName, StringComparison.OrdinalIgnoreCase));
+
+        if (existingRole is null)
+        {
+            existingRole = await Context.Guild.CreateRoleAsync(targetRoleName, GuildPermissions.None, color: new Color(99, 110, 114), isHoisted: false, isMentionable: false);
+        }
+
+        if (existingRole is null)
+        {
+            return;
+        }
+
+        var removeOtherRoles = guildUser.Roles
+            .Where(role => allStoryRoleNames.Any(name => string.Equals(name, role.Name, StringComparison.OrdinalIgnoreCase)) && role.Id != existingRole.Id)
+            .ToList();
+
+        if (removeOtherRoles.Count > 0)
+        {
+            await guildUser.RemoveRolesAsync(removeOtherRoles);
+        }
+
+        if (!guildUser.Roles.Any(role => role.Id == existingRole.Id))
+        {
+            await guildUser.AddRoleAsync(existingRole);
+        }
+    }
 }

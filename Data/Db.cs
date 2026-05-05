@@ -1450,6 +1450,20 @@ WHERE COALESCE(TRIM(ffxiv_name), '') <> ''
         return rows.ToList();
     }
 
+    public async Task<IReadOnlyList<StoryProgressionCount>> GetStoryProgressionCountsAsync(ulong guildId)
+    {
+        const string sql = @"
+SELECT COALESCE(NULLIF(TRIM(story_progression), ''), '未設定') AS StoryProgression,
+       COUNT(*) AS Count
+FROM discord_users
+GROUP BY COALESCE(NULLIF(TRIM(story_progression), ''), '未設定')
+ORDER BY COUNT(*) DESC;";
+
+        await using var conn = CreateConnection();
+        var rows = await conn.QueryAsync<StoryProgressionCount>(sql);
+        return rows.ToList();
+    }
+
     public async Task InvalidateActiveTokensAsync(ulong userId)
     {
         const string sql = @"
@@ -2449,6 +2463,71 @@ ORDER BY Hour ASC;";
 
         await using var conn = CreateConnection();
         var rows = await conn.QueryAsync<VoiceHourlyActivity>(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            FromUtcInclusive = fromUtcInclusive,
+            ToUtcExclusive = toUtcExclusive
+        });
+        return rows.ToList();
+    }
+
+    public async Task<IReadOnlyList<VoiceHourlyAverage>> ListVoiceHourlyAverageAsync(
+        ulong guildId,
+        DateTimeOffset fromUtcInclusive,
+        DateTimeOffset toUtcExclusive)
+    {
+        if (toUtcExclusive <= fromUtcInclusive)
+        {
+            return Array.Empty<VoiceHourlyAverage>();
+        }
+
+        const string sql = @"
+WITH bounded AS (
+    SELECT id,
+           user_id,
+           GREATEST(joined_at, @FromUtcInclusive) AS start_utc,
+           LEAST(COALESCE(left_at, @ToUtcExclusive), @ToUtcExclusive) AS end_utc
+    FROM voice_sessions
+    WHERE guild_id = @GuildId
+      AND COALESCE(left_at, @ToUtcExclusive) > @FromUtcInclusive
+      AND joined_at < @ToUtcExclusive
+),
+expanded AS (
+    SELECT b.id,
+           b.user_id,
+           gs.bucket_start,
+           (b.start_utc AT TIME ZONE 'Asia/Tokyo') AS start_jst,
+           (b.end_utc AT TIME ZONE 'Asia/Tokyo') AS end_jst,
+           DATE(b.start_utc AT TIME ZONE 'Asia/Tokyo') AS activity_date
+    FROM bounded b
+    CROSS JOIN LATERAL generate_series(
+        date_trunc('hour', b.start_utc AT TIME ZONE 'Asia/Tokyo'),
+        date_trunc('hour', (b.end_utc AT TIME ZONE 'Asia/Tokyo') - INTERVAL '1 second'),
+        INTERVAL '1 hour'
+    ) AS gs(bucket_start)
+),
+hourly_daily AS (
+    SELECT EXTRACT(HOUR FROM bucket_start)::INT AS Hour,
+           activity_date,
+           COUNT(DISTINCT user_id)::INT AS UsersInHour
+    FROM expanded
+    GROUP BY Hour, activity_date
+),
+hourly_avg AS (
+    SELECT Hour,
+           AVG(UsersInHour)::DOUBLE PRECISION AS AverageUsers,
+           COUNT(DISTINCT activity_date)::INT AS TotalDays
+    FROM hourly_daily
+    GROUP BY Hour
+)
+SELECT Hour,
+       COALESCE(AverageUsers, 0) AS AverageUsers,
+       TotalDays
+FROM hourly_avg
+ORDER BY Hour ASC;";
+
+        await using var conn = CreateConnection();
+        var rows = await conn.QueryAsync<VoiceHourlyAverage>(sql, new
         {
             GuildId = ToDbId(guildId),
             FromUtcInclusive = fromUtcInclusive,
@@ -5868,9 +5947,10 @@ SELECT guild_id AS GuildId,
        runtime_message_log_retention_days AS RuntimeMessageLogRetentionDays,
        runtime_voice_session_retention_days AS RuntimeVoiceSessionRetentionDays,
        runtime_reaction_log_retention_days AS RuntimeReactionLogRetentionDays,
-       runtime_tuning_updated_at AS RuntimeTuningUpdatedAt,
-       sleep_kick_admin_confirmation_required AS SleepKickAdminConfirmationRequired,
-       updated_at AS UpdatedAt
+        runtime_tuning_updated_at AS RuntimeTuningUpdatedAt,
+        sleep_kick_admin_confirmation_required AS SleepKickAdminConfirmationRequired,
+        lodestone_user_agent AS LodestoneUserAgent,
+        updated_at AS UpdatedAt
 FROM guild_settings
 WHERE guild_id = @GuildId
 LIMIT 1;";
@@ -5985,6 +6065,121 @@ WHERE guild_id = @GuildId;";
         await using var conn = CreateConnection();
         var affected = await conn.ExecuteAsync(sql, new { GuildId = ToDbId(guildId), Enabled = enabled });
         return affected > 0;
+    }
+
+    public async Task<bool> UpdateLodestoneUserAgentAsync(ulong guildId, string? userAgent)
+    {
+        const string sql = @"
+UPDATE guild_settings
+SET lodestone_user_agent = @UserAgent,
+    updated_at = NOW()
+WHERE guild_id = @GuildId;";
+
+        await using var conn = CreateConnection();
+        var affected = await conn.ExecuteAsync(sql, new { GuildId = ToDbId(guildId), UserAgent = string.IsNullOrWhiteSpace(userAgent) ? null : userAgent.Trim() });
+        return affected > 0;
+    }
+
+    public async Task<ServerStatsSnapshot> GetServerStatsAsync(ulong guildId)
+    {
+        var today = DateTimeOffset.UtcNow.Date;
+        var weekAgo = today.AddDays(-7);
+
+        const string registeredCountSql = "SELECT COUNT(*) FROM discord_users WHERE ffxiv_name IS NOT NULL AND TRIM(ffxiv_name) <> '';";
+        const string todayJoinedCountSql = "SELECT COUNT(*) FROM voice_sessions WHERE guild_id = @GuildId AND joined_at >= @Today;";
+        const string todayMessageCountSql = "SELECT COUNT(*) FROM message_logs WHERE guild_id = @GuildId AND created_at >= @Today;";
+        const string weekMessageCountSql = "SELECT COUNT(*) FROM message_logs WHERE guild_id = @GuildId AND created_at >= @WeekAgo;";
+        const string weekVcCountSql = "SELECT COUNT(*) FROM voice_sessions WHERE guild_id = @GuildId AND joined_at >= @WeekAgo;";
+        const string openRecruitCountSql = "SELECT COUNT(*) FROM recruit_posts WHERE guild_id = @GuildId AND status IN (0, 1);";
+        const string openInquiryCountSql = "SELECT COUNT(*) FROM inquiry_tickets WHERE guild_id = @GuildId AND status <> 'CLOSED';";
+        const string openLotteryCountSql = "SELECT COUNT(*) FROM lotteries WHERE guild_id = @GuildId AND status IN ('OPEN', 'DRAWING');";
+        const string todayRecruitCountSql = "SELECT COUNT(*) FROM recruit_posts WHERE guild_id = @GuildId AND created_at >= @Today;";
+        const string todayKickCountSql = "SELECT COUNT(*) FROM sleep_kick_logs WHERE guild_id = @GuildId AND created_at >= @Today AND event_type = 'disconnected';";
+
+        await using var conn = CreateConnection();
+        var p = new { GuildId = ToDbId(guildId), Today = today, WeekAgo = weekAgo };
+
+        var registeredCount = await conn.ExecuteScalarAsync<int>(registeredCountSql);
+        var todayJoinedCount = await conn.ExecuteScalarAsync<int>(todayJoinedCountSql, p);
+        var todayMessageCount = await conn.ExecuteScalarAsync<int>(todayMessageCountSql, p);
+        var weekMessageCount = await conn.ExecuteScalarAsync<int>(weekMessageCountSql, p);
+        var weekVcCount = await conn.ExecuteScalarAsync<int>(weekVcCountSql, p);
+        var openRecruitCount = await conn.ExecuteScalarAsync<int>(openRecruitCountSql, p);
+        var openInquiryCount = await conn.ExecuteScalarAsync<int>(openInquiryCountSql, p);
+        var openLotteryCount = await conn.ExecuteScalarAsync<int>(openLotteryCountSql, p);
+        var todayRecruitCount = await conn.ExecuteScalarAsync<int>(todayRecruitCountSql, p);
+        var todayKickCount = await conn.ExecuteScalarAsync<int>(todayKickCountSql, p);
+
+        return new ServerStatsSnapshot
+        {
+            RegisteredMemberCount = registeredCount,
+            TodayJoinedCount = todayJoinedCount,
+            TodayMessageCount = todayMessageCount,
+            WeekMessageCount = weekMessageCount,
+            WeekVcCount = weekVcCount,
+            OpenRecruitCount = openRecruitCount,
+            OpenInquiryCount = openInquiryCount,
+            OpenLotteryCount = openLotteryCount,
+            TodayRecruitCount = todayRecruitCount,
+            TodayKickCount = todayKickCount
+        };
+    }
+
+    public async Task<IReadOnlyList<(DateTimeOffset Hour, int MessageCount, int VcCount)>> GetHourlyActivityAsync(ulong guildId, DateTimeOffset since)
+    {
+        const string sql = @"
+WITH hours AS (
+    SELECT generate_series AS hour
+    FROM generate_series(@Since, @Until, interval '1 hour')
+),
+msg AS (
+    SELECT date_trunc('hour', created_at) AS hour, COUNT(*) AS cnt
+    FROM message_logs
+    WHERE guild_id = @GuildId AND created_at >= @Since
+    GROUP BY 1
+),
+vc AS (
+    SELECT date_trunc('hour', joined_at) AS hour, COUNT(*) AS cnt
+    FROM voice_sessions
+    WHERE guild_id = @GuildId AND joined_at >= @Since
+    GROUP BY 1
+)
+SELECT h.hour AS Hour,
+       COALESCE(m.cnt, 0) AS MessageCount,
+       COALESCE(v.cnt, 0) AS VcCount
+FROM hours h
+LEFT JOIN msg m ON m.hour = h.hour
+LEFT JOIN vc v ON v.hour = h.hour
+ORDER BY h.hour;";
+
+        await using var conn = CreateConnection();
+        var rows = await conn.QueryAsync(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            Since = since,
+            Until = DateTimeOffset.UtcNow
+        });
+        return rows.Select(r => {
+            DateTimeOffset hour = r.Hour is null ? DateTimeOffset.MinValue : new DateTimeOffset(Convert.ToDateTime(r.Hour), TimeSpan.Zero);
+            int messageCount = Convert.ToInt32(r.MessageCount);
+            int vcCount = Convert.ToInt32(r.VcCount);
+            return (hour, messageCount, vcCount);
+        }).ToList();
+    }
+
+    public async Task<IReadOnlyList<(string RoleName, int Count)>> GetRoleDistributionAsync(ulong guildId, IReadOnlyList<string> roleNames)
+    {
+        if (roleNames.Count == 0) return Array.Empty<(string, int)>();
+
+        const string sql = @"
+SELECT r.role_name AS RoleName, COUNT(*) AS Count
+FROM guild_member_content_roles r
+WHERE r.guild_id = @GuildId AND r.is_active = true
+GROUP BY r.role_name;";
+
+        await using var conn = CreateConnection();
+        var rows = await conn.QueryAsync(sql, new { GuildId = ToDbId(guildId) });
+        return rows.Select(r => ((string)r.RoleName, (int)r.Count)).ToList();
     }
 
     public async Task EnsureSleepKickLogsTableAsync()
@@ -6553,6 +6748,57 @@ SET channel_id = EXCLUDED.channel_id,
             ChannelId = ToDbId(channelId),
             DataCenterMessageId = ToDbId(dataCenterMessageId),
             WorldMessageId = ToDbId(worldMessageId)
+        });
+    }
+
+    public async Task EnsureGuildStoryStatsPanelTableAsync()
+    {
+        const string sql = @"
+CREATE TABLE IF NOT EXISTS guild_story_stats_panels (
+    id integer NOT NULL GENERATED ALWAYS AS IDENTITY,
+    guild_id bigint NOT NULL,
+    channel_id bigint NOT NULL,
+    message_id bigint NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT guild_story_stats_panels_pkey PRIMARY KEY (id),
+    CONSTRAINT guild_story_stats_panels_guild_id_key UNIQUE (guild_id)
+);";
+
+        await using var conn = CreateConnection();
+        await conn.ExecuteAsync(sql);
+    }
+
+    public async Task<GuildStoryStatsPanel?> GetGuildStoryStatsPanelAsync(ulong guildId)
+    {
+        const string sql = @"
+SELECT guild_id AS GuildId,
+       channel_id AS ChannelId,
+       message_id AS MessageId,
+       updated_at AS UpdatedAt
+FROM guild_story_stats_panels
+WHERE guild_id = @GuildId
+LIMIT 1;";
+
+        await using var conn = CreateConnection();
+        return await conn.QuerySingleOrDefaultAsync<GuildStoryStatsPanel>(sql, new { GuildId = ToDbId(guildId) });
+    }
+
+    public async Task UpsertGuildStoryStatsPanelAsync(ulong guildId, ulong channelId, ulong messageId)
+    {
+        const string sql = @"
+INSERT INTO guild_story_stats_panels (guild_id, channel_id, message_id)
+VALUES (@GuildId, @ChannelId, @MessageId)
+ON CONFLICT (guild_id) DO UPDATE
+SET channel_id = EXCLUDED.channel_id,
+    message_id = EXCLUDED.message_id,
+    updated_at = NOW();";
+
+        await using var conn = CreateConnection();
+        await conn.ExecuteAsync(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            ChannelId = ToDbId(channelId),
+            MessageId = ToDbId(messageId)
         });
     }
 
@@ -9026,3 +9272,17 @@ public sealed record SleepKickVoteLog(
     string? VoterDetails,
     string? Result,
     DateTimeOffset CreatedAt);
+
+public sealed record ServerStatsSnapshot
+{
+    public int RegisteredMemberCount { get; init; }
+    public int TodayJoinedCount { get; init; }
+    public int TodayMessageCount { get; init; }
+    public int WeekMessageCount { get; init; }
+    public int WeekVcCount { get; init; }
+    public int OpenRecruitCount { get; init; }
+    public int OpenInquiryCount { get; init; }
+    public int OpenLotteryCount { get; init; }
+    public int TodayRecruitCount { get; init; }
+    public int TodayKickCount { get; init; }
+}

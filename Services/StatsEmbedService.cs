@@ -138,6 +138,68 @@ public sealed class StatsEmbedService
         return await RefreshPopulationEmbedsGuardedAsync(guild, channel, persistPanel: true, panel, applyAutoDebounce: true);
     }
 
+    public async Task RefreshStoryStatsIfConfiguredAsync(SocketGuild guild)
+    {
+        try
+        {
+            var panel = await _db.GetGuildStoryStatsPanelAsync(guild.Id);
+            if (panel is null || panel.ChannelId == 0 || panel.MessageId == 0)
+            {
+                return;
+            }
+
+            var channelId = ToUlong(panel.ChannelId);
+            var channel = guild.GetTextChannel(channelId)
+                ?? guild.GetChannel(channelId) as IMessageChannel;
+            if (channel is null)
+            {
+                return;
+            }
+
+            var messageId = ToUlong(panel.MessageId);
+            IUserMessage? message = null;
+            try
+            {
+                message = await channel.GetMessageAsync(messageId) as IUserMessage;
+            }
+            catch { }
+
+            if (message is null)
+            {
+                return;
+            }
+
+            var embed = await BuildStoryProgressionEmbedAsync(guild.Id);
+            var chartPng = await BuildStoryProgressionChartAsync(guild.Id);
+
+            if (chartPng is null || chartPng.Length == 0)
+            {
+                await message.ModifyAsync(props =>
+                {
+                    props.Content = null;
+                    props.Embed = embed;
+                });
+            }
+            else
+            {
+                var stream = new MemoryStream(chartPng);
+                await message.ModifyAsync(props =>
+                {
+                    props.Content = null;
+                    props.Embed = embed;
+                    props.Attachments = new Optional<IEnumerable<FileAttachment>>(new[]
+                    {
+                        new FileAttachment(stream, "story_progression_chart.png")
+                    });
+                });
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to refresh story stats. GuildId={GuildId}", guild.Id);
+        }
+    }
+
     private async Task<StatsRefreshResult> RefreshPopulationEmbedsGuardedAsync(
         SocketGuild guild,
         IMessageChannel channel,
@@ -716,8 +778,8 @@ public sealed class StatsEmbedService
 
                     if (canPlaceInside)
                     {
-                        DrawTextCenteredSmoothShadow(image, name, nameFont, new Rgba32(255, 255, 255, 255), centerX, centerY - (totalHeight / 2f) + (nameSize.Height / 2f), shadowAlpha: 82);
-                        DrawTextCenteredSmoothShadow(image, percentText, percentFont, new Rgba32(255, 255, 255, 255), centerX, centerY + (totalHeight / 2f) - (percentSize.Height / 2f), shadowAlpha: 82);
+                        DrawTextCenteredSmoothShadow(image, name, nameFont, new Rgba32(255, 255, 255, 255), centerX, centerY - (totalHeight / 2f) + (nameSize.Height / 2f), shadowAlpha: 180);
+                        DrawTextCenteredSmoothShadow(image, percentText, percentFont, new Rgba32(255, 255, 255, 255), centerX, centerY + (totalHeight / 2f) - (percentSize.Height / 2f), shadowAlpha: 180);
                         rendered = true;
                         break;
                     }
@@ -752,7 +814,7 @@ public sealed class StatsEmbedService
                     var arcLength = span * 2.0 * Math.PI * percentOnlyRadius;
                     if (percentSize.Width <= (arcLength * 0.96))
                     {
-                        DrawTextCenteredSmoothShadow(image, percentText, percentOnlyFont, new Rgba32(255, 255, 255, 255), percentOnlyX, percentOnlyY, shadowAlpha: 78);
+                        DrawTextCenteredSmoothShadow(image, percentText, percentOnlyFont, new Rgba32(255, 255, 255, 255), percentOnlyX, percentOnlyY, shadowAlpha: 180);
                         rendered = true;
                         break;
                     }
@@ -771,6 +833,167 @@ public sealed class StatsEmbedService
         {
             // Text rendering depends on host font availability and native font discovery.
             // Keep the chart attachment even when that layer fails and fall back to bitmap text.
+            DrawPieChartTextFallback(image, chartTitle, segments, total, pieCenterX, pieCenterY, pieRadius);
+        }
+
+        using var ms = new MemoryStream();
+        image.Save(ms, new PngEncoder());
+        return ms.ToArray();
+    }
+
+    private static byte[]? BuildPieChartPngWithColors(
+        string chartTitle,
+        IReadOnlyList<DistributionRow> slices,
+        int total,
+        IReadOnlyList<StoryProgressionCount> originalCounts,
+        IReadOnlyList<DistributionRow> displayRows)
+    {
+        if (total <= 0 || slices.Count == 0)
+        {
+            return null;
+        }
+
+        var colorMap = new Dictionary<string, Rgba32>(StringComparer.OrdinalIgnoreCase);
+        foreach (var c in originalCounts)
+        {
+            colorMap[FormatStoryProgressionLabel(c.StoryProgression)] = GetStoryProgressionColor(c.StoryProgression);
+        }
+
+        var palette = displayRows.Select(r => colorMap.TryGetValue(r.Name, out var col) ? col : Hex("#95a5a6")).ToArray();
+
+        const int width = 1920;
+        const int height = 1200;
+        const int pieCenterX = width / 2;
+        const int pieCenterY = height / 2 + 40;
+        const int pieRadius = 400;
+
+        using var image = new Image<Rgba32>(width, height, new Rgba32(234, 234, 234, 255));
+        DrawVerticalGradient(image, new Rgba32(238, 238, 238, 255), new Rgba32(231, 231, 231, 255));
+
+        var segments = BuildSegments(slices, total, palette);
+        var radiusSquared = pieRadius * pieRadius;
+
+        for (var y = pieCenterY - pieRadius; y <= pieCenterY + pieRadius; y++)
+        {
+            if (y < 0 || y >= height) continue;
+            for (var x = pieCenterX - pieRadius; x <= pieCenterX + pieRadius; x++)
+            {
+                if (x < 0 || x >= width) continue;
+                var dx = x - pieCenterX;
+                var dy = y - pieCenterY;
+                var distanceSquared = dx * dx + dy * dy;
+                if (distanceSquared > radiusSquared) continue;
+
+                var angle = Math.Atan2(dy, dx) - (-Math.PI / 2.0);
+                if (angle < 0) angle += Math.PI * 2.0;
+
+                var ratio = angle / (Math.PI * 2.0);
+                var seg = segments.FirstOrDefault(segment => ratio <= segment.EndRatio);
+                if (seg is null) continue;
+
+                var distance = Math.Sqrt(distanceSquared);
+                image[x, y] = ApplySegmentShading(seg.Color, dx, dy, distance, 0, pieRadius, strength: 0.02);
+            }
+        }
+
+        foreach (var seg in segments)
+        {
+            var angle = RatioToAngle(seg.StartRatio);
+            var cos = Math.Cos(angle);
+            var sin = Math.Sin(angle);
+            var edgeX = pieCenterX + (int)Math.Round(cos * pieRadius);
+            var edgeY = pieCenterY + (int)Math.Round(sin * pieRadius);
+            DrawLineThick(image, pieCenterX, pieCenterY, edgeX, edgeY, new Rgba32(246, 246, 246, 255), 4);
+        }
+
+        DrawCircleOutline(image, pieCenterX, pieCenterY, pieRadius, new Rgba32(245, 245, 245, 255));
+        DrawCircleOutline(image, pieCenterX, pieCenterY, pieRadius - 1, new Rgba32(245, 245, 245, 255));
+
+        try
+        {
+            var titleFont = GetChartFont(80, FontStyle.Bold);
+            DrawTextSmooth(image, chartTitle, titleFont, new Rgba32(35, 35, 35, 255), 80, 90);
+
+            foreach (var seg in segments)
+            {
+                var span = seg.EndRatio - seg.StartRatio;
+                if (span < 0.02) continue;
+
+                var percent = ToPercent(seg.Row.Count, total);
+                var (nameFontSize, percentFontSize) = span switch
+                {
+                    >= 0.20 => (64f, 68f),
+                    >= 0.13 => (54f, 58f),
+                    >= 0.09 => (44f, 48f),
+                    _ => (36f, 40f)
+                };
+
+                var nameFont = GetChartFont(nameFontSize, FontStyle.Bold);
+                var percentFont = GetChartFont(percentFontSize, FontStyle.Bold);
+                var angle = RatioToAngle(seg.MidRatio);
+                var radius = pieRadius * 0.58;
+                var centerX = pieCenterX + (float)(Math.Cos(angle) * radius);
+                var centerY = pieCenterY + (float)(Math.Sin(angle) * radius);
+
+                var name = TruncateLegendText(seg.Row.Name, span >= 0.12 ? 12 : 8);
+                var percentText = $"{percent:0.#}%";
+
+                var rendered = false;
+                var fitRadius = radius;
+                for (var attempt = 0; attempt < 8; attempt++)
+                {
+                    var nameSize = MeasureTextSmooth(name, nameFont);
+                    var percentSize = MeasureTextSmooth(percentText, percentFont);
+                    var totalHeight = nameSize.Height + 8 + percentSize.Height;
+                    var arcLength = span * 2.0 * Math.PI * fitRadius;
+                    var maxWidth = Math.Max(nameSize.Width, percentSize.Width);
+                    var canPlaceInside = span >= 0.05 && maxWidth <= (arcLength * 0.92) && totalHeight <= (pieRadius * 0.58);
+
+                    if (canPlaceInside)
+                    {
+                        DrawTextCenteredSmoothShadow(image, name, nameFont, new Rgba32(255, 255, 255, 255), centerX, centerY - (totalHeight / 2f) + (nameSize.Height / 2f), shadowAlpha: 180);
+                        DrawTextCenteredSmoothShadow(image, percentText, percentFont, new Rgba32(255, 255, 255, 255), centerX, centerY + (totalHeight / 2f) - (percentSize.Height / 2f), shadowAlpha: 180);
+                        rendered = true;
+                        break;
+                    }
+
+                    var nextNameSize = nameFont.Size - 2f;
+                    var nextPercentSize = percentFont.Size - 2f;
+                    if (nextNameSize < 20f || nextPercentSize < 22f) break;
+
+                    nameFont = GetChartFont(nextNameSize, FontStyle.Bold);
+                    percentFont = GetChartFont(nextPercentSize, FontStyle.Bold);
+                    fitRadius = Math.Min(pieRadius * 0.82, fitRadius + 12);
+                    centerX = pieCenterX + (float)(Math.Cos(angle) * fitRadius);
+                    centerY = pieCenterY + (float)(Math.Sin(angle) * fitRadius);
+                }
+
+                if (rendered) continue;
+
+                var percentOnlyRadius = Math.Min(pieRadius * 0.86, fitRadius + 10);
+                var percentOnlyX = pieCenterX + (float)(Math.Cos(angle) * percentOnlyRadius);
+                var percentOnlyY = pieCenterY + (float)(Math.Sin(angle) * percentOnlyRadius);
+                var percentOnlyFont = GetChartFont(Math.Max(24f, percentFont.Size), FontStyle.Bold);
+
+                for (var attempt = 0; attempt < 6; attempt++)
+                {
+                    var percentSize = MeasureTextSmooth(percentText, percentOnlyFont);
+                    var arcLength = span * 2.0 * Math.PI * percentOnlyRadius;
+                    if (percentSize.Width <= (arcLength * 0.96))
+                    {
+                        DrawTextCenteredSmoothShadow(image, percentText, percentOnlyFont, new Rgba32(255, 255, 255, 255), percentOnlyX, percentOnlyY, shadowAlpha: 180);
+                        rendered = true;
+                        break;
+                    }
+
+                    var next = percentOnlyFont.Size - 2f;
+                    if (next < 16f) break;
+                    percentOnlyFont = GetChartFont(next, FontStyle.Bold);
+                }
+            }
+        }
+        catch (Exception)
+        {
             DrawPieChartTextFallback(image, chartTitle, segments, total, pieCenterX, pieCenterY, pieRadius);
         }
 
@@ -1070,8 +1293,16 @@ public sealed class StatsEmbedService
 
     private static void DrawTextCenteredSmoothShadow(Image<Rgba32> image, string text, Font font, Rgba32 color, float centerX, float centerY, byte shadowAlpha = 76)
     {
-        var shadowColor = new Rgba32(24, 24, 24, shadowAlpha);
-        DrawTextCenteredSmooth(image, text, font, shadowColor, centerX + 2f, centerY + 2f);
+        var shadowColor = new Rgba32(0, 0, 0, shadowAlpha);
+        var offsets = new[] { 3f, -3f, 0f };
+        foreach (var dx in offsets)
+        {
+            foreach (var dy in offsets)
+            {
+                if (dx == 0 && dy == 0) continue;
+                DrawTextCenteredSmooth(image, text, font, shadowColor, centerX + dx, centerY + dy);
+            }
+        }
         DrawTextCenteredSmooth(image, text, font, color, centerX, centerY);
     }
 
@@ -1497,6 +1728,101 @@ public sealed class StatsEmbedService
         Discord.Color Color,
         string ChartFileName,
         int PaletteIndex);
+
+    private static string FormatStoryProgressionLabel(string storyProgression)
+    {
+        return storyProgression.ToLowerInvariant() switch
+        {
+            "arr_hw" => "新生〜蒼天",
+            "sb" => "紅蓮",
+            "shb" => "漆黒",
+            "ew" => "暁月",
+            "dt" => "黄金",
+            "completed" => "最新パッチ済み",
+            "未設定" => "未設定",
+            _ => storyProgression
+        };
+    }
+
+    private static readonly IReadOnlyDictionary<string, Rgba32> StoryProgressionColors = new Dictionary<string, Rgba32>(StringComparer.OrdinalIgnoreCase)
+    {
+        ["arr_hw"] = Hex("#5865f2"),
+        ["sb"] = Hex("#ed4245"),
+        ["shb"] = Hex("#9b59b6"),
+        ["ew"] = Hex("#57f287"),
+        ["dt"] = Hex("#fee75c"),
+        ["completed"] = Hex("#eb459e"),
+        ["未設定"] = Hex("#7d8d8e"),
+    };
+
+    private static Rgba32 GetStoryProgressionColor(string storyProgression)
+    {
+        return StoryProgressionColors.TryGetValue(storyProgression, out var color) ? color : Hex("#95a5a6");
+    }
+
+    public async Task<byte[]?> BuildStoryProgressionChartAsync(ulong guildId)
+    {
+        var counts = await _db.GetStoryProgressionCountsAsync(guildId);
+        var filtered = counts.Where(c => !string.Equals(c.StoryProgression, "未設定", StringComparison.OrdinalIgnoreCase)
+            && !string.IsNullOrWhiteSpace(c.StoryProgression)).ToList();
+        if (filtered.Count == 0)
+        {
+            return null;
+        }
+
+        var totalCount = filtered.Sum(c => c.Count);
+        var rows = filtered
+            .Select(c => new DistributionRow(FormatStoryProgressionLabel(c.StoryProgression), c.Count))
+            .OrderByDescending(row => row.Count)
+            .ThenBy(row => row.Name, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        var slices = BuildChartSlices(rows, ChartMaxSlices);
+
+        try
+        {
+            return BuildPieChartPngWithColors("ストーリー進行度分布", slices, totalCount, counts, slices);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to build story progression chart. GuildId={GuildId}", guildId);
+            return null;
+        }
+    }
+
+    public async Task<Embed> BuildStoryProgressionEmbedAsync(ulong guildId)
+    {
+        var counts = await _db.GetStoryProgressionCountsAsync(guildId);
+        var filtered = counts.Where(c => !string.Equals(c.StoryProgression, "未設定", StringComparison.OrdinalIgnoreCase)
+            && !string.IsNullOrWhiteSpace(c.StoryProgression)).ToList();
+        if (filtered.Count == 0)
+        {
+            return new EmbedBuilder()
+                .WithTitle("📖 ストーリー進行度統計")
+                .WithDescription("データがありません。")
+                .WithColor(new Discord.Color(128, 128, 128))
+                .WithCurrentTimestamp()
+                .Build();
+        }
+
+        var totalCount = filtered.Sum(c => c.Count);
+        var rows = filtered
+            .Select(c => new DistributionRow(FormatStoryProgressionLabel(c.StoryProgression), c.Count))
+            .OrderByDescending(row => row.Count)
+            .ThenBy(row => row.Name, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        var chartPng = await BuildStoryProgressionChartAsync(guildId);
+        var chartFileName = chartPng is { Length: > 0 } ? "story_progression_chart.png" : null;
+
+        return BuildDistributionEmbed(
+            "📖 ストーリー進行度統計",
+            totalCount,
+            rows,
+            20,
+            new Discord.Color(99, 110, 114),
+            chartFileName);
+    }
 }
 
 public sealed record StatsRefreshResult(bool Updated, bool UsedFallback, int RegisteredCount, string Source);

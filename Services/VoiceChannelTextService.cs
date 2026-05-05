@@ -343,7 +343,7 @@ public sealed class VoiceChannelTextService
                 .ToList();
             var mentionText = allMentions.Count > 0
                 ? string.Join(" ", allMentions)
-                : "@here";
+                : "";
 
             var guildUser = channel.Guild.GetUser(user.Id);
             var displayName = guildUser?.DisplayName ?? guildUser?.GlobalName ?? user.GlobalName ?? user.Username;

@@ -30,6 +30,7 @@ public static class AdminControlPanel
     public const string ToggleSleepKickEnabledCustomId = "admin_toggle_sleep_kick_enabled";
     public const string ToggleSleepKickAutoDetectCustomId = "admin_toggle_sleep_kick_auto_detect";
     public const string ToggleSleepKickAdminConfirmCustomId = "admin_toggle_sleep_kick_admin_confirm";
+    public const string LodestoneUserAgentEditCustomId = "admin_lodestone_user_agent_edit";
     public const string ResyncPanelsCustomId = "settings_panels_resync";
     public const string OpenContentRoleCategoryCustomId = "admin_category_content_role";
     public const string ContentRoleListCustomId = "admin_content_role_list";
@@ -37,6 +38,8 @@ public static class AdminControlPanel
     public const string ContentRoleRemoveSelectCustomId = "admin_content_role_remove_select";
     public const string ContentRoleResyncCustomId = "admin_content_role_resync";
     public const string ContentRoleBackCustomId = "admin_content_role_back";
+    public const string StoryProgressionStatsCustomId = "admin_story_progression_stats";
+    public const string ServerStatsCustomId = "admin_server_stats";
 
     public static MessageComponent BuildComponents(bool registrationApprovalRequired, bool inactiveAutoKickEnabled)
     {
@@ -60,6 +63,8 @@ public static class AdminControlPanel
             .WithButton("VC整合性修復", VoiceSessionIntegrityCustomId, ButtonStyle.Secondary, row: 1)
             .WithButton("新規定着コホート/時間帯", OpsKpiCohortHourlyCustomId, ButtonStyle.Primary, row: 1)
             .WithButton("モデレーション時系列", ModerationTimelineCustomId, ButtonStyle.Secondary, row: 1)
+            .WithButton("ストーリー進行度統計", StoryProgressionStatsCustomId, ButtonStyle.Primary, row: 2)
+            .WithButton("📊 サーバー統計", ServerStatsCustomId, ButtonStyle.Success, row: 2)
             .Build();
     }
 
@@ -91,8 +96,9 @@ public static class AdminControlPanel
             .WithButton(sleepKickEnabledLabel, ToggleSleepKickEnabledCustomId, sleepKickEnabledStyle, row: 0)
             .WithButton(sleepKickAutoDetectLabel, ToggleSleepKickAutoDetectCustomId, sleepKickAutoDetectStyle, row: 1)
             .WithButton(sleepKickToggleLabel, ToggleSleepKickAdminConfirmCustomId, sleepKickToggleStyle, row: 1)
-            .WithButton("運用設定編集", RuntimeTuningCustomId, ButtonStyle.Secondary, row: 2)
-            .WithButton("パネル再同期", ResyncPanelsCustomId, ButtonStyle.Secondary, row: 2)
+            .WithButton("⚙️ 運用設定編集", RuntimeTuningCustomId, ButtonStyle.Secondary, row: 2)
+            .WithButton("🔧 User-Agent変更", LodestoneUserAgentEditCustomId, ButtonStyle.Secondary, row: 2)
+            .WithButton("パネル再同期", ResyncPanelsCustomId, ButtonStyle.Secondary, row: 3)
             .Build();
     }
 

@@ -64,6 +64,7 @@ builder.Services.AddSingleton<RuntimeTuningService>();
 builder.Services.AddSingleton<RecruitUndoService>();
 builder.Services.AddSingleton<StatsEmbedService>();
 builder.Services.AddSingleton<VoiceStatsService>();
+builder.Services.AddSingleton<VcHourlyChartService>();
 builder.Services.AddSingleton<VoiceSessionReconciliationService>();
 builder.Services.AddSingleton<SleepKickService>();
 builder.Services.AddSingleton<RecruitmentListService>();

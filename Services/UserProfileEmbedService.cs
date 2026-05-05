@@ -434,4 +434,54 @@ public sealed class UserProfileEmbedService
             _ => storyProgression
         };
     }
+
+    public async Task<Embed> BuildStoryProgressionEmbedAsync(ulong guildId)
+    {
+        var counts = await _db.GetStoryProgressionCountsAsync(guildId);
+        if (counts.Count == 0)
+        {
+            return new EmbedBuilder()
+                .WithTitle("📖 ストーリー進行度統計")
+                .WithDescription("データがありません。")
+                .WithColor(new Color(128, 128, 128))
+                .WithCurrentTimestamp()
+                .Build();
+        }
+
+        var totalCount = counts.Sum(c => c.Count);
+        var rows = counts
+            .Select(c => new { Name = FormatStoryProgressionLabel(c.StoryProgression), c.Count })
+            .OrderByDescending(row => row.Count)
+            .ThenBy(row => row.Name, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        var description = string.Join("\n", rows.Select(row =>
+        {
+            var percent = totalCount > 0 ? (double)row.Count / totalCount * 100 : 0;
+            return $"**{row.Name}**: {row.Count}人 ({percent:F1}%)";
+        }));
+
+        return new EmbedBuilder()
+            .WithTitle("📖 ストーリー進行度統計")
+            .WithDescription(description)
+            .WithColor(new Color(99, 110, 114))
+            .WithFooter($"合計: {totalCount}人")
+            .WithCurrentTimestamp()
+            .Build();
+    }
+
+    private static string FormatStoryProgressionLabel(string storyProgression)
+    {
+        return storyProgression.ToLowerInvariant() switch
+        {
+            "arr_hw" => "新生〜蒼天",
+            "sb" => "紅蓮",
+            "shb" => "漆黒",
+            "ew" => "暁月",
+            "dt" => "黄金",
+            "completed" => "最新パッチ済み",
+            "未設定" => "未設定",
+            _ => storyProgression
+        };
+    }
 }

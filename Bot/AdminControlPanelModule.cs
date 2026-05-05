@@ -21,6 +21,16 @@ namespace RaidDcBot.Bot;
 [Group("adminpanel", "ADMINコントロールパネル")]
 public sealed class AdminControlPanelModule : InteractionModuleBase<SocketInteractionContext>
 {
+    private static readonly IReadOnlyDictionary<string, string> StoryProgressionOptions = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+    {
+        ["arr_hw"] = "新生〜蒼天",
+        ["sb"] = "紅蓮",
+        ["shb"] = "漆黒",
+        ["ew"] = "暁月",
+        ["dt"] = "黄金",
+        ["completed"] = "最新パッチ済み"
+    };
+
     private readonly Db _db;
     private readonly DiscordOptions _options;
     private readonly LotteryCreateDraftContextTracker _lotteryCreateDraftTracker;
@@ -30,6 +40,7 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
     private readonly VoiceSessionReconciliationService _voiceSessionReconciliation;
     private readonly RecruitmentListService _recruitListService;
     private readonly UserProfileEmbedService _profileEmbeds;
+    private readonly HttpClient _lodestoneHttpClient;
     private readonly ILogger<AdminControlPanelModule> _logger;
     private readonly ConcurrentDictionary<string, MemberManageDangerActionContext> _memberDangerContexts = new();
     private readonly ConcurrentDictionary<ulong, MemberManageBulkSelectionContext> _memberBulkSelections = new();
@@ -161,6 +172,7 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
         VoiceSessionReconciliationService voiceSessionReconciliation,
         RecruitmentListService recruitListService,
         UserProfileEmbedService profileEmbeds,
+        HttpClient lodestoneHttpClient,
         ILogger<AdminControlPanelModule> logger)
     {
         _db = db;
@@ -173,6 +185,7 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
         _recruitListService = recruitListService;
         _logger = logger;
         _profileEmbeds = profileEmbeds;
+        _lodestoneHttpClient = lodestoneHttpClient;
     }
 
     [RequireBotAdmin]
@@ -287,6 +300,52 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
 
         await DeferAsync(ephemeral: true);
         await ShowRecruitKpiAsync(Math.Clamp(days, RecruitKpiMinDays, RecruitKpiMaxDays));
+    }
+
+    [RequireBotAdmin]
+    [SlashCommand("story_stats", "ストーリー進行度の統計をグラフで表示します")]
+    public async Task ShowStoryProgressionStatsByCommandAsync()
+    {
+        if (Context.Guild is null)
+        {
+            await RespondAsync("このコマンドはサーバー内でのみ使えます。", ephemeral: true);
+            return;
+        }
+
+        await DeferAsync(ephemeral: true);
+
+        try
+        {
+            var storyCounts = await _db.GetStoryProgressionCountsAsync(Context.Guild.Id);
+            var storyProgression = storyCounts
+                .Select(c => (FormatStoryProgressionLabel(c.StoryProgression), c.Count))
+                .OrderByDescending(x => x.Count)
+                .ToList();
+            var guildName = Context.Guild.Name;
+
+            using var stream = ServerStatsService.GenerateStoryProgressionImage(guildName, storyProgression);
+            await FollowupWithFileAsync(stream, "story_progression.png", ephemeral: true);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to generate story progression stats image. GuildId={GuildId}", Context.Guild.Id);
+            await FollowupAsync("統計画像の生成に失敗しました。", ephemeral: true);
+        }
+    }
+
+    private static string FormatStoryProgressionLabel(string storyProgression)
+    {
+        return storyProgression.ToLowerInvariant() switch
+        {
+            "arr_hw" => "新生〜蒼天",
+            "sb" => "紅蓮",
+            "shb" => "漆黒",
+            "ew" => "暁月",
+            "dt" => "黄金",
+            "completed" => "最新パッチ済み",
+            "未設定" => "未設定",
+            _ => storyProgression
+        };
     }
 
     [RequireBotAdmin]
@@ -650,6 +709,53 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
 
         await DeferAsync(ephemeral: true);
         await ShowVoiceHourlyStatsAsync(VoiceHourlyStatsDefaultDays);
+    }
+
+    [RequireBotAdmin]
+    [ComponentInteraction(AdminControlPanel.StoryProgressionStatsCustomId, ignoreGroupNames: true)]
+    public async Task ShowStoryProgressionStatsByButtonAsync()
+    {
+        if (Context.Guild is null)
+        {
+            await RespondAsync("この操作はサーバー内でのみ使えます。", ephemeral: true);
+            return;
+        }
+
+        await DeferAsync(ephemeral: true);
+
+        var embed = await _profileEmbeds.BuildStoryProgressionEmbedAsync(Context.Guild.Id);
+        await FollowupAsync(embed: embed, ephemeral: true);
+    }
+
+    [RequireBotAdmin]
+    [ComponentInteraction(AdminControlPanel.ServerStatsCustomId, ignoreGroupNames: true)]
+    public async Task ShowServerStatsByButtonAsync()
+    {
+        if (Context.Guild is null)
+        {
+            await RespondAsync("この操作はサーバー内でのみ使えます。", ephemeral: true);
+            return;
+        }
+
+        await DeferAsync(ephemeral: true);
+
+        try
+        {
+            var stats = await _db.GetServerStatsAsync(Context.Guild.Id);
+            var hourlyActivity = await _db.GetHourlyActivityAsync(Context.Guild.Id, DateTimeOffset.UtcNow.AddHours(-24));
+            var storyCounts = await _db.GetStoryProgressionCountsAsync(Context.Guild.Id);
+            var storyProgression = storyCounts.Select(c => (c.StoryProgression, c.Count)).ToList();
+            var totalMembers = Context.Guild.MemberCount;
+            var guildName = Context.Guild.Name;
+
+            using var stream = ServerStatsService.GenerateStatsImage(guildName, totalMembers, stats, hourlyActivity, storyProgression);
+            await FollowupWithFileAsync(stream, "server_stats.png", ephemeral: true);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to generate server stats image. GuildId={GuildId}", Context.Guild.Id);
+            await FollowupAsync("統計画像の生成に失敗しました。", ephemeral: true);
+        }
     }
 
     [RequireBotAdmin]
@@ -1285,6 +1391,8 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
 
         await RespondAsync($"{target.Mention} のストーリー進行度を **{label}** に更新しました。", ephemeral: true);
         await _audit.SendAsync(Context.Guild, "ストーリー進行度変更", $"対象: {target.Mention}\n進行度: {label}", Color.Blue, Context.User);
+
+        await GrantStoryProgressionRoleAsync(target, inputStory);
     }
 
     [RequireBotAdmin]
@@ -3972,6 +4080,118 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
             Context.Guild,
             "設定変更: 寝落ち自動検出",
             $"旧値: {(previousValue ? "ON" : "OFF")}\n新値: {(sleepKickAutoDetect ? "ON" : "OFF")}",
+            Color.Teal,
+            Context.User);
+    }
+
+    [RequireBotAdmin]
+    [ComponentInteraction(AdminControlPanel.ToggleSleepKickAdminConfirmCustomId, ignoreGroupNames: true)]
+    public async Task ToggleSleepKickAdminConfirmAsync()
+    {
+        if (Context.Guild is null)
+        {
+            await RespondAsync("この操作はサーバー内でのみ使えます。", ephemeral: true);
+            return;
+        }
+
+        await DeferAsync(ephemeral: true);
+
+        var settings = await _db.GetGuildSettingsAsync(Context.Guild.Id);
+        if (settings is null)
+        {
+            await FollowupAsync("サーバー設定が未初期化です。Botを再起動してから再試行してください。", ephemeral: true);
+            return;
+        }
+
+        var previousValue = settings.SleepKickAdminConfirmationRequired;
+        var updated = await _db.UpdateGuildSleepKickAdminConfirmationRequiredAsync(
+            Context.Guild.Id,
+            !settings.SleepKickAdminConfirmationRequired);
+        if (!updated)
+        {
+            await FollowupAsync("設定更新に失敗しました。時間を置いて再試行してください。", ephemeral: true);
+            return;
+        }
+
+        var refreshedSettings = await _db.GetGuildSettingsAsync(Context.Guild.Id);
+        var approvalRequired = refreshedSettings?.RegistrationApprovalRequired ?? true;
+        var inactiveAutoKickEnabled = refreshedSettings?.InactiveAutoKickEnabled ?? _options.InactiveAutoKickEnabled;
+        var sleepKickEnabled = refreshedSettings?.SleepKickEnabled ?? _options.SleepKickEnabled;
+        var sleepKickAutoDetect = refreshedSettings?.SleepKickAutoDetectEnabled ?? true;
+        var sleepKickAdminConfirm = refreshedSettings?.SleepKickAdminConfirmationRequired ?? _options.SleepKickRequiresAdminConfirmation;
+        if (Context.Interaction is SocketMessageComponent component &&
+            component.Message is IUserMessage message &&
+            LooksLikeAdminControlPanelMessage(message))
+        {
+            await ApplyAdminControlPanelStateAsync(message, approvalRequired, inactiveAutoKickEnabled, sleepKickEnabled, sleepKickAutoDetect, sleepKickAdminConfirm);
+        }
+        await RefreshStoredAdminControlPanelStateAsync(approvalRequired, inactiveAutoKickEnabled, sleepKickEnabled, sleepKickAutoDetect, sleepKickAdminConfirm);
+
+        await FollowupAsync(
+            sleepKickAdminConfirm
+                ? "寝落ち管理者確認を「ON」に変更しました。"
+                : "寝落ち管理者確認を「OFF」に変更しました。",
+            ephemeral: true);
+
+        await _audit.SendAsync(
+            Context.Guild,
+            "設定変更: 寝落ち管理者確認",
+            $"旧値: {(previousValue ? "ON" : "OFF")}\n新値: {(sleepKickAdminConfirm ? "ON" : "OFF")}",
+            Color.Teal,
+            Context.User);
+    }
+
+    [RequireBotAdmin]
+    [ComponentInteraction(AdminControlPanel.LodestoneUserAgentEditCustomId, ignoreGroupNames: true)]
+    public async Task ShowLodestoneUserAgentEditModalAsync()
+    {
+        if (Context.Guild is null)
+        {
+            await RespondAsync("この操作はサーバー内でのみ使えます。", ephemeral: true);
+            return;
+        }
+
+        var settings = await _db.GetGuildSettingsAsync(Context.Guild.Id);
+        var currentUserAgent = settings?.LodestoneUserAgent ?? LodestoneOptions.DefaultUserAgent;
+
+        var modal = new ModalBuilder()
+            .WithTitle("Lodestone User-Agent 設定")
+            .WithCustomId("admin_lodestone_user_agent_modal")
+            .AddTextInput("User-Agent", "user_agent", TextInputStyle.Paragraph, value: currentUserAgent, required: false, maxLength: 512)
+            .Build();
+
+        await RespondWithModalAsync(modal);
+    }
+
+    [ModalInteraction("admin_lodestone_user_agent_modal", ignoreGroupNames: true)]
+    public async Task HandleLodestoneUserAgentModalAsync(LodestoneUserAgentModal modal)
+    {
+        if (Context.Guild is null)
+        {
+            await RespondAsync("この操作はサーバー内でのみ使えます。", ephemeral: true);
+            return;
+        }
+
+        await DeferAsync(ephemeral: true);
+
+        var newUserAgent = string.IsNullOrWhiteSpace(modal.UserAgent) ? null : modal.UserAgent.Trim();
+        var updated = await _db.UpdateLodestoneUserAgentAsync(Context.Guild.Id, newUserAgent);
+        if (!updated)
+        {
+            await FollowupAsync("設定更新に失敗しました。", ephemeral: true);
+            return;
+        }
+
+        var effectiveUserAgent = string.IsNullOrWhiteSpace(newUserAgent) ? LodestoneOptions.DefaultUserAgent : newUserAgent;
+        _lodestoneHttpClient.DefaultRequestHeaders.UserAgent.Clear();
+        _lodestoneHttpClient.DefaultRequestHeaders.UserAgent.ParseAdd(effectiveUserAgent);
+
+        await FollowupAsync($"User-Agentを更新しました。\n```\n{effectiveUserAgent}\n```", ephemeral: true);
+
+        await _audit.SendAsync(
+            Context.Guild,
+            "設定変更: Lodestone User-Agent",
+            $"User-Agent: {effectiveUserAgent}",
             Color.Teal,
             Context.User);
     }
@@ -9770,6 +9990,56 @@ private static long ToDbId(ulong value) => unchecked((long)value);
 
         return updated;
     }
+
+    private async Task GrantStoryProgressionRoleAsync(SocketGuildUser guildUser, string? storyProgression)
+    {
+        if (Context.Guild is null)
+        {
+            return;
+        }
+
+        var allStoryRoleNames = StoryProgressionOptions.Values.ToList();
+
+        if (string.IsNullOrWhiteSpace(storyProgression) || !StoryProgressionOptions.TryGetValue(storyProgression, out var targetRoleName))
+        {
+            var removeRoles = guildUser.Roles
+                .Where(role => allStoryRoleNames.Any(name => string.Equals(name, role.Name, StringComparison.OrdinalIgnoreCase)))
+                .ToList();
+
+            if (removeRoles.Count > 0)
+            {
+                await guildUser.RemoveRolesAsync(removeRoles);
+            }
+            return;
+        }
+
+        IRole? existingRole = Context.Guild.Roles.FirstOrDefault(role =>
+            string.Equals(role.Name, targetRoleName, StringComparison.OrdinalIgnoreCase));
+
+        if (existingRole is null)
+        {
+            existingRole = await Context.Guild.CreateRoleAsync(targetRoleName, GuildPermissions.None, color: new Color(99, 110, 114), isHoisted: false, isMentionable: false);
+        }
+
+        if (existingRole is null)
+        {
+            return;
+        }
+
+        var removeOtherRoles = guildUser.Roles
+            .Where(role => allStoryRoleNames.Any(name => string.Equals(name, role.Name, StringComparison.OrdinalIgnoreCase)) && role.Id != existingRole.Id)
+            .ToList();
+
+        if (removeOtherRoles.Count > 0)
+        {
+            await guildUser.RemoveRolesAsync(removeOtherRoles);
+        }
+
+        if (!guildUser.Roles.Any(role => role.Id == existingRole.Id))
+        {
+            await guildUser.AddRoleAsync(existingRole);
+        }
+    }
 }
 
 public sealed class LotteryCreateModal : IModal
@@ -9915,6 +10185,15 @@ public sealed class MemberManageNoteModal : IModal
     [InputLabel("メモ（管理者のみ閲覧）")]
     [ModalTextInput("admin_member_manage_note_value", TextInputStyle.Paragraph, maxLength: 300)]
     public string Note { get; set; } = string.Empty;
+}
+
+public sealed class LodestoneUserAgentModal : IModal
+{
+    public string Title => "Lodestone User-Agent 設定";
+
+    [InputLabel("User-Agent（空欄でデフォルトに戻す）")]
+    [ModalTextInput("user_agent", TextInputStyle.Paragraph, maxLength: 512)]
+    public string UserAgent { get; set; } = string.Empty;
 }
 
 

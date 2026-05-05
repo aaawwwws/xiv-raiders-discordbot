@@ -9,6 +9,7 @@ using Discord;
 using Discord.Interactions;
 using Discord.Rest;
 using Discord.WebSocket;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -141,6 +142,7 @@ public sealed class DiscordBotService : IHostedService
         await _db.EnsureGuildAdminControlPanelTableAsync();
         await _db.EnsureGuildMemberContentRolesTableAsync();
         await _db.EnsureGuildStatsPanelTableAsync();
+        await _db.EnsureGuildStoryStatsPanelTableAsync();
         await _db.EnsureGuildDailyActivityPanelTableAsync();
         await _db.EnsureGuildWeeklyActivityPanelTableAsync();
         await _db.EnsureActivityRankingAwardsTableAsync();
@@ -430,19 +432,34 @@ public sealed class DiscordBotService : IHostedService
 
                 try
                 {
-                    if (_options.GuildId != 0)
+                    // 常にグローバルコマンドとして登録（開発・本番共通）
+                    await _interactions.RegisterCommandsGloballyAsync(true);
+                    _logger.LogInformation("Commands registered globally.");
+
+                    // 既存のギルドコマンドをクリーンアップ
+                    foreach (var guild in _client.Guilds)
                     {
-                        await _interactions.RegisterCommandsToGuildAsync(_options.GuildId, true);
+                        try
+                        {
+                            var commands = await guild.GetApplicationCommandsAsync();
+                            foreach (var cmd in commands)
+                            {
+                                await cmd.DeleteAsync();
+                            }
+                            if (commands.Count > 0)
+                            {
+                                _logger.LogInformation("Deleted {Count} guild commands for GuildId={GuildId}", commands.Count, guild.Id);
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogWarning(ex, "Failed to delete guild commands for GuildId={GuildId}", guild.Id);
+                        }
                     }
-                    else
-                    {
-                        await _interactions.RegisterCommandsGloballyAsync(true);
-                    }
-                    _logger.LogInformation("Commands registered successfully.");
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "Failed to register commands. Bot will continue without command registration. GuildId={GuildId}", _options.GuildId);
+                    _logger.LogError(ex, "Failed to register commands.");
                 }
 
                 _logger.LogInformation("Bot ready.");
@@ -1089,6 +1106,7 @@ public sealed class DiscordBotService : IHostedService
             {
                 statsRefreshCount++;
             }
+            await _stats.RefreshStoryStatsIfConfiguredAsync(guild);
         }
 
         return $"Panel refresh completed. StatsPanelsUpdated={statsRefreshCount}.";
@@ -2326,6 +2344,7 @@ public sealed class DiscordBotService : IHostedService
 
         await RefreshExistingPanelsAsync(guild, registrationChannel, controlChannel);
         _ = _stats.RefreshIfConfiguredAsync(guild);
+        _ = _stats.RefreshStoryStatsIfConfiguredAsync(guild);
     }
 
     private async Task RefreshExistingPanelsAsync(SocketGuild guild, IMessageChannel? registrationChannel, IMessageChannel controlChannel)
@@ -2803,6 +2822,12 @@ public sealed class DiscordBotService : IHostedService
                 var message = await channel.SendMessageAsync(embed: embed, flags: MessageFlags.SuppressNotification);
                 await _db.UpsertGuildWeeklyActivityPanelAsync(guild.Id, channel.Id, message.Id);
                 _weeklyVoiceRankingPosted[guild.Id] = weekKey;
+
+                // 週間ランキング上位3名にロール付与
+                await _voiceStats.AssignWeeklyRankingRolesAsync(
+                    guild,
+                    periodStartJst.ToUniversalTime(),
+                    periodEndJst.ToUniversalTime());
             }
             catch (Exception ex)
             {
@@ -4357,6 +4382,7 @@ public sealed class DiscordBotService : IHostedService
 
         await SendLogEmbedAsync(user.Guild, embed);
         _ = _stats.RefreshIfConfiguredAsync(user.Guild);
+        _ = _stats.RefreshStoryStatsIfConfiguredAsync(user.Guild);
     }
 
     private async Task OnUserLeftAsync(SocketGuild guild, SocketUser user)
@@ -4370,6 +4396,7 @@ public sealed class DiscordBotService : IHostedService
 
         await TryDeleteUserDataOnLeaveAsync(guild.Id, user.Id);
         _ = _stats.RefreshIfConfiguredAsync(guild);
+        _ = _stats.RefreshStoryStatsIfConfiguredAsync(guild);
     }
 
     private async Task OnUserBannedAsync(SocketUser user, SocketGuild guild)
