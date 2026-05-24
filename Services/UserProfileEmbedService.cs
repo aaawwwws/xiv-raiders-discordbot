@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using Discord;
 using Discord.WebSocket;
 using Microsoft.Extensions.Logging;
@@ -43,26 +43,35 @@ public sealed class UserProfileEmbedService
             .WithTitle(title)
             .WithColor(color)
             .WithCurrentTimestamp()
-            .WithAuthor(snapshot.AuthorName, snapshot.AvatarUrl)
-            .WithThumbnailUrl(snapshot.ThumbnailUrl);
+            .WithAuthor(snapshot.AuthorName, snapshot.AvatarUrl);
 
-        embed.AddField("基本情報", snapshot.BasicInfo, false);
-        embed.AddField("キャラクター", snapshot.CharacterInfo, true);
+        if (!string.IsNullOrWhiteSpace(snapshot.PortraitUrl))
+        {
+            embed.WithImageUrl(snapshot.PortraitUrl);
+            embed.WithThumbnailUrl(snapshot.AvatarUrl);
+        }
+        else
+        {
+            embed.WithThumbnailUrl(snapshot.AvatarUrl);
+        }
+
+        embed.AddField("👤 基本情報", snapshot.BasicInfo, false);
+        embed.AddField("🎮 キャラクター", snapshot.CharacterInfo, true);
         if (includeLodestoneExtras)
         {
             var lodestoneExtras = await BuildLodestoneExtrasInfoAsync(snapshot.LinkedCharacter);
-            embed.AddField("Lodestone追加情報", lodestoneExtras, false);
+            embed.AddField("📊 Lodestone", lodestoneExtras, false);
         }
-        embed.AddField("SNS", snapshot.SnsInfo, true);
+        embed.AddField("🔗 SNS", snapshot.SnsInfo, true);
         if (includeBio)
         {
-            embed.AddField("一言", snapshot.BioInfo, false);
+            embed.AddField("📝 一言", snapshot.BioInfo, false);
         }
         if (!string.IsNullOrWhiteSpace(snapshot.StoryProgression))
         {
             embed.AddField("📖 ストーリー進行度", snapshot.StoryProgression, false);
         }
-        embed.AddField("ロール", snapshot.RoleInfo, false);
+        embed.AddField("🏷️ ロール", snapshot.RoleInfo, false);
 
         configure?.Invoke(embed);
 
@@ -84,8 +93,17 @@ public sealed class UserProfileEmbedService
             .WithTitle(title)
             .WithColor(color)
             .WithCurrentTimestamp()
-            .WithAuthor(snapshot.AuthorName, snapshot.AvatarUrl)
-            .WithThumbnailUrl(snapshot.ThumbnailUrl);
+            .WithAuthor(snapshot.AuthorName, snapshot.AvatarUrl);
+
+        if (!string.IsNullOrWhiteSpace(snapshot.PortraitUrl))
+        {
+            embed.WithImageUrl(snapshot.PortraitUrl);
+            embed.WithThumbnailUrl(snapshot.AvatarUrl);
+        }
+        else
+        {
+            embed.WithThumbnailUrl(snapshot.AvatarUrl);
+        }
 
         var positionText = string.IsNullOrWhiteSpace(position) ? "不明" : position;
         var jobText = string.IsNullOrWhiteSpace(job) ? "不明" : job;
@@ -128,12 +146,10 @@ public sealed class UserProfileEmbedService
             portrait = await EnsureCharacterPortraitAsync(character) ?? portrait;
         }
 
-        var thumbnail = !string.IsNullOrWhiteSpace(portrait) ? portrait : avatar;
-
         return new ProfileSnapshot(
             authorName,
             avatar,
-            thumbnail,
+            portrait,
             BuildVoiceBasicInfo(user),
             BuildVoiceRoleInfo(guildUser),
             BuildVoiceCharacterInfo(character, profile),
@@ -284,8 +300,7 @@ public sealed class UserProfileEmbedService
 
     private static string BuildVoiceBasicInfo(SocketUser user)
     {
-        var discordName = user.Username;
-        return $"Discord: {MentionUser(user.Id)} (@{discordName})";
+        return $"💬 {MentionUser(user.Id)} `@{user.Username}`";
     }
 
     private static string BuildVoiceRoleInfo(SocketGuildUser? guildUser)
@@ -314,18 +329,18 @@ public sealed class UserProfileEmbedService
     {
         if (character is not null)
         {
-            var linkedName = string.IsNullOrWhiteSpace(character.Name) ? "unknown" : character.Name;
-            var linkedWorld = string.IsNullOrWhiteSpace(character.World) ? "unknown" : character.World;
-            var linkedDc = string.IsNullOrWhiteSpace(character.DataCenter) ? "unknown" : character.DataCenter;
-            return $"名前: {linkedName}\nデータセンター: {linkedDc}\nサーバー: {linkedWorld}";
+            var linkedName = string.IsNullOrWhiteSpace(character.Name) ? "Unknown" : character.Name;
+            var linkedWorld = string.IsNullOrWhiteSpace(character.World) ? "Unknown" : character.World;
+            var linkedDc = string.IsNullOrWhiteSpace(character.DataCenter) ? "Unknown" : character.DataCenter;
+            return $"**{linkedName}**\n`{linkedDc}` / `{linkedWorld}`";
         }
 
         if (profile is not null &&
             !string.IsNullOrWhiteSpace(profile.FfxivName) &&
             !string.IsNullOrWhiteSpace(profile.FfxivWorld))
         {
-            var profileDc = string.IsNullOrWhiteSpace(profile.FfxivDataCenter) ? "unknown" : profile.FfxivDataCenter;
-            return $"名前: {profile.FfxivName}\nデータセンター: {profileDc}\nサーバー: {profile.FfxivWorld}";
+            var profileDc = string.IsNullOrWhiteSpace(profile.FfxivDataCenter) ? "Unknown" : profile.FfxivDataCenter;
+            return $"**{profile.FfxivName}**\n`{profileDc}` / `{profile.FfxivWorld}`";
         }
 
         return "未連携";
@@ -333,9 +348,13 @@ public sealed class UserProfileEmbedService
 
     private static string BuildVoiceSnsInfo(DiscordUserProfile? profile)
     {
-        var x = SocialLinkService.FormatX(profile?.XHandle);
-        var bluesky = SocialLinkService.FormatBluesky(profile?.BlueskyHandle);
-        return $"X: {x}\nBluesky: {bluesky}";
+        var lines = new List<string>();
+        if (!string.IsNullOrWhiteSpace(profile?.XHandle))
+            lines.Add($"🐦 **X:** {SocialLinkService.FormatX(profile.XHandle)}");
+        if (!string.IsNullOrWhiteSpace(profile?.BlueskyHandle))
+            lines.Add($"🦋 **Bluesky:** {SocialLinkService.FormatBluesky(profile.BlueskyHandle)}");
+
+        return lines.Count > 0 ? string.Join('\n', lines) : "未設定";
     }
 
     private static string BuildVoiceBioInfo(DiscordUserProfile? profile, int maxLength)
@@ -407,7 +426,7 @@ public sealed class UserProfileEmbedService
     private sealed record ProfileSnapshot(
         string AuthorName,
         string AvatarUrl,
-        string ThumbnailUrl,
+        string? PortraitUrl,
         string BasicInfo,
         string RoleInfo,
         string CharacterInfo,

@@ -1,7 +1,11 @@
+using System.IO;
+using System.Net.Sockets;
 using System.Net;
 using System.Globalization;
 using System.Text.RegularExpressions;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using Microsoft.Playwright;
 using RaidDcBot.Models;
 
 namespace RaidDcBot.Services;
@@ -10,12 +14,16 @@ public sealed class LodestoneClient
 {
     private static readonly Regex LodestoneIdRegex = new(@"lodestone/character/(\d+)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex LodestoneCwlsIdRegex = new(@"lodestone/crossworld_linkshell/([0-9a-f]+)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
-    private readonly HttpClient _httpClient;
+    private readonly ILogger<LodestoneClient> _logger;
     private readonly HashSet<string> _allowedHosts;
 
-    public LodestoneClient(HttpClient httpClient, IOptions<LodestoneOptions> options)
+    private IPlaywright? _playwright;
+    private IBrowser? _browser;
+    private readonly SemaphoreSlim _browserLock = new(1, 1);
+
+    public LodestoneClient(ILogger<LodestoneClient> logger, IOptions<LodestoneOptions> options)
     {
-        _httpClient = httpClient;
+        _logger = logger;
         var configured = options.Value.AllowedHosts ?? Array.Empty<string>();
         var hosts = configured
             .Select(host => host.Trim().ToLowerInvariant())
@@ -34,9 +42,8 @@ public sealed class LodestoneClient
     {
         try
         {
-            using var request = new HttpRequestMessage(HttpMethod.Head, "https://jp.finalfantasyxiv.com/lodestone/");
-            var response = await _httpClient.SendAsync(request, cancellationToken);
-            return response.IsSuccessStatusCode;
+            var html = await FetchHtmlAsync("https://jp.finalfantasyxiv.com/lodestone/", cancellationToken);
+            return !string.IsNullOrWhiteSpace(html) && html.Contains("Lodestone", StringComparison.OrdinalIgnoreCase);
         }
         catch
         {
@@ -124,6 +131,166 @@ public sealed class LodestoneClient
     public Task<string> FetchProfileHtmlAsync(string url, CancellationToken cancellationToken = default)
         => FetchHtmlAsync(url, cancellationToken);
 
+    public async Task<string> FetchHtmlAsync(string url, CancellationToken cancellationToken = default)
+    {
+        await _browserLock.WaitAsync(cancellationToken);
+        try
+        {
+            if (_playwright == null)
+            {
+                _playwright = await Playwright.CreateAsync();
+                _logger.LogInformation("Playwright initialized.");
+            }
+
+            if (_browser == null || !_browser.IsConnected)
+            {
+                _browser = await _playwright.Chromium.LaunchAsync(new()
+                {
+                    Headless = true,
+                    Args = new[]
+                    {
+                        "--disable-blink-features=AutomationControlled",
+                        "--disable-web-security",
+                        "--disable-features=IsolateOrigins,site-per-process",
+                        "--no-sandbox"
+                    }
+                });
+                _logger.LogInformation("Playwright Chromium browser launched.");
+            }
+
+            var context = await _browser.NewContextAsync(new()
+            {
+                UserAgent = LodestoneOptions.DefaultUserAgent,
+                ViewportSize = new() { Width = 1920, Height = 1080 },
+                Locale = "ja-JP",
+                TimezoneId = "Asia/Tokyo"
+            });
+
+            // Lodestone のブラウザチェックをバイパス
+            await context.AddCookiesAsync(new[]
+            {
+                new Microsoft.Playwright.Cookie
+                {
+                    Name = "ldst_is_support_browser",
+                    Value = "1",
+                    Domain = ".finalfantasyxiv.com",
+                    Path = "/"
+                }
+            });
+
+            var page = await context.NewPageAsync();
+            try
+            {
+                var response = await page.GotoAsync(url, new() { WaitUntil = WaitUntilState.NetworkIdle });
+                if (response == null)
+                {
+                    throw new InvalidOperationException("ページの読み込みに失敗しました。");
+                }
+
+                // プロフィールページの場合、自己紹介文などの動的コンテンツが読み込まれるまで待機
+                if (url.Contains("/character/", StringComparison.OrdinalIgnoreCase))
+                {
+                    try
+                    {
+                        await page.WaitForSelectorAsync(
+                            ".character__selfintroduction, [class*='selfintroduction'], [class*='self_introduction'], .character__profile__detail, .character__profile__txt",
+                            new() { Timeout = 5000 });
+                    }
+                    catch
+                    {
+                        // 自己紹介文がないキャラクターやセレクタが変わった場合は無視
+                    }
+                }
+
+                var finalUri = response.Url;
+                if (!Uri.TryCreate(finalUri, UriKind.Absolute, out var uri) ||
+                    !string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase) ||
+                    !IsAllowedHost(uri.Host))
+                {
+                    throw new InvalidOperationException("Lodestone公式ドメイン以外への遷移を検出したため処理を中断しました。");
+                }
+
+                var html = await page.ContentAsync();
+                if (string.IsNullOrWhiteSpace(html))
+                {
+                    throw new InvalidOperationException("ページの内容が空です。");
+                }
+
+                // 診断: 取得したHTMLをファイルに保存
+                try
+                {
+                    var debugPath = $"/src/data/debug_lodestone_{DateTimeOffset.UtcNow:yyyyMMdd_HHmmss_fff}.html";
+                    await File.WriteAllTextAsync(debugPath, html, cancellationToken);
+                    _logger.LogInformation("Saved debug HTML to {Path}, length={Length}", debugPath, html.Length);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to save debug HTML");
+                }
+
+                return html;
+            }
+            finally
+            {
+                await context.CloseAsync();
+            }
+        }
+        finally
+        {
+            _browserLock.Release();
+        }
+    }
+
+    public bool TryParseProfile(string html, out LodestoneProfile profile)
+    {
+        profile = default!;
+
+        if (TryParseFromHtmlBlocks(html, out profile))
+        {
+            return true;
+        }
+
+        if (TryParseFromOgTitle(html, out profile))
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    public string? ExtractPortraitUrl(string html)
+    {
+        var portrait = FindPortraitImage(html);
+        if (!string.IsNullOrWhiteSpace(portrait))
+        {
+            return portrait;
+        }
+
+        var ogImage = FindMetaContent(html, "property", "og:image");
+        if (!string.IsNullOrWhiteSpace(ogImage))
+        {
+            return ogImage;
+        }
+
+        var twitterImage = FindMetaContent(html, "name", "twitter:image");
+        if (!string.IsNullOrWhiteSpace(twitterImage))
+        {
+            return twitterImage;
+        }
+
+        return null;
+    }
+
+    public static bool LooksLikeCharacterPortraitUrl(string? url)
+    {
+        if (string.IsNullOrWhiteSpace(url))
+        {
+            return false;
+        }
+
+        return url.Contains("/f/", StringComparison.OrdinalIgnoreCase);
+    }
+
     public async Task<LodestoneAchievementDetailSnapshot> FetchAchievementDetailAsync(
         string characterUrl,
         int achievementId,
@@ -205,7 +372,11 @@ public sealed class LodestoneClient
         var achievementUrl = BuildCharacterSubpageUrl(characterUrl, "achievement/");
         if (classJobUrl is null || mountUrl is null || minionUrl is null || achievementUrl is null)
         {
-            return CreateErrorExtrasSnapshot();
+            return new LodestoneCharacterExtrasSnapshot(
+                new LodestoneJobLevelsSnapshot(LodestonePageDataStatus.Error, Array.Empty<LodestoneJobLevel>()),
+                new LodestoneCountSnapshot(LodestonePageDataStatus.Error, null),
+                new LodestoneCountSnapshot(LodestonePageDataStatus.Error, null),
+                new LodestoneCountSnapshot(LodestonePageDataStatus.Error, null));
         }
 
         var classJobTask = TryFetchOptionalHtmlAsync(classJobUrl, cancellationToken);
@@ -232,7 +403,11 @@ public sealed class LodestoneClient
         var achievementUrl = BuildCharacterSubpageUrl(characterUrl, "achievement/");
         if (classJobUrl is null || mountUrl is null || minionUrl is null || achievementUrl is null)
         {
-            return CreateErrorExtrasDetailsSnapshot();
+            return new LodestoneCharacterExtrasDetailsSnapshot(
+                new LodestoneJobLevelsSnapshot(LodestonePageDataStatus.Error, Array.Empty<LodestoneJobLevel>()),
+                new LodestoneCollectibleListSnapshot(LodestonePageDataStatus.Error, null, Array.Empty<LodestoneCollectibleItem>()),
+                new LodestoneCollectibleListSnapshot(LodestonePageDataStatus.Error, null, Array.Empty<LodestoneCollectibleItem>()),
+                new LodestoneAchievementListSnapshot(LodestonePageDataStatus.Error, null, Array.Empty<LodestoneAchievementItem>()));
         }
 
         var classJobTask = TryFetchOptionalHtmlAsync(classJobUrl, cancellationToken);
@@ -254,100 +429,6 @@ public sealed class LodestoneClient
         return new LodestoneCharacterExtrasDetailsSnapshot(jobs, mounts, minions, achievements);
     }
 
-    public async Task<string> FetchHtmlAsync(string url, CancellationToken cancellationToken = default)
-    {
-        using var request = new HttpRequestMessage(HttpMethod.Get, url);
-        var response = await _httpClient.SendAsync(request, cancellationToken);
-        if (!response.IsSuccessStatusCode)
-        {
-            throw new InvalidOperationException($"Lodestoneの取得に失敗しました (HTTP {(int)response.StatusCode}).");
-        }
-
-        var finalUri = response.RequestMessage?.RequestUri;
-        if (finalUri is null ||
-            !string.Equals(finalUri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase) ||
-            !IsAllowedHost(finalUri.Host))
-        {
-            throw new InvalidOperationException("Lodestone公式ドメイン以外への遷移を検出したため処理を中断しました。");
-        }
-
-        var html = await response.Content.ReadAsStringAsync(cancellationToken);
-        if (IsUnsupportedBrowser(html))
-        {
-            throw new InvalidOperationException("Lodestoneがブラウザを拒否しました。User-Agentの設定を見直してください。");
-        }
-
-        return html;
-    }
-
-    public bool TryParseProfile(string html, out LodestoneProfile profile)
-    {
-        profile = default!;
-
-        if (TryParseFromHtmlBlocks(html, out profile))
-        {
-            return true;
-        }
-
-        if (TryParseFromOgTitle(html, out profile))
-        {
-            return true;
-        }
-
-        return false;
-    }
-
-    public string? ExtractPortraitUrl(string html)
-    {
-        var portrait = FindPortraitImage(html);
-        if (!string.IsNullOrWhiteSpace(portrait))
-        {
-            return portrait;
-        }
-
-        var ogImage = FindMetaContent(html, "property", "og:image");
-        if (!string.IsNullOrWhiteSpace(ogImage))
-        {
-            return ogImage;
-        }
-
-        var twitterImage = FindMetaContent(html, "name", "twitter:image");
-        if (!string.IsNullOrWhiteSpace(twitterImage))
-        {
-            return twitterImage;
-        }
-
-        return null;
-    }
-
-    public static bool LooksLikeCharacterPortraitUrl(string? url)
-    {
-        if (string.IsNullOrWhiteSpace(url))
-        {
-            return false;
-        }
-
-        return url.Contains("/f/", StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static LodestoneCharacterExtrasSnapshot CreateErrorExtrasSnapshot()
-    {
-        return new LodestoneCharacterExtrasSnapshot(
-            new LodestoneJobLevelsSnapshot(LodestonePageDataStatus.Error, Array.Empty<LodestoneJobLevel>()),
-            new LodestoneCountSnapshot(LodestonePageDataStatus.Error, null),
-            new LodestoneCountSnapshot(LodestonePageDataStatus.Error, null),
-            new LodestoneCountSnapshot(LodestonePageDataStatus.Error, null));
-    }
-
-    private static LodestoneCharacterExtrasDetailsSnapshot CreateErrorExtrasDetailsSnapshot()
-    {
-        return new LodestoneCharacterExtrasDetailsSnapshot(
-            new LodestoneJobLevelsSnapshot(LodestonePageDataStatus.Error, Array.Empty<LodestoneJobLevel>()),
-            new LodestoneCollectibleListSnapshot(LodestonePageDataStatus.Error, null, Array.Empty<LodestoneCollectibleItem>()),
-            new LodestoneCollectibleListSnapshot(LodestonePageDataStatus.Error, null, Array.Empty<LodestoneCollectibleItem>()),
-            new LodestoneAchievementListSnapshot(LodestonePageDataStatus.Error, null, Array.Empty<LodestoneAchievementItem>()));
-    }
-
     private async Task<string?> TryFetchOptionalHtmlAsync(string url, CancellationToken cancellationToken)
     {
         try
@@ -360,7 +441,7 @@ public sealed class LodestoneClient
         }
         catch (Exception ex)
         {
-            System.Console.WriteLine($"[LodestoneDebug] TryFetchOptionalHtmlAsync FAILED for {url}: {ex.Message}");
+            _logger.LogWarning(ex, "Optional fetch failed for {Url}", url);
             return null;
         }
     }
@@ -944,7 +1025,7 @@ public sealed class LodestoneClient
                 en.Groups["title"].Value.Trim());
         }
 
-        var quoted = Regex.Match(rawText, "[\"“”「『](?<title>.+?)[\"”」』]");
+var quoted = Regex.Match(rawText, @"[""“”「『](?<title>.+?)[""”」']");
         if (quoted.Success)
         {
             return (null, quoted.Groups["title"].Value.Trim());
@@ -1409,22 +1490,5 @@ public sealed class LodestoneClient
     private bool IsAllowedHost(string host)
     {
         return _allowedHosts.Contains(host.Trim().ToLowerInvariant());
-    }
-
-    private static bool IsUnsupportedBrowser(string html)
-    {
-        if (html.Contains("Your browser is not supported", StringComparison.OrdinalIgnoreCase)
-            || html.Contains("ご利用のブラウザ", StringComparison.OrdinalIgnoreCase))
-        {
-            return true;
-        }
-
-        if (html.Contains("unsupported_browser", StringComparison.OrdinalIgnoreCase))
-        {
-            return html.Contains("/lodestone/error/unsupported_browser", StringComparison.OrdinalIgnoreCase)
-                && !html.Contains("entry__achievement", StringComparison.OrdinalIgnoreCase);
-        }
-
-        return false;
     }
 }

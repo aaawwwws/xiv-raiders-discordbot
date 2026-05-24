@@ -1,3 +1,4 @@
+using System.Text.Json;
 using Discord;
 using Dapper;
 using Microsoft.Extensions.Logging;
@@ -995,6 +996,18 @@ WHERE discord_user_id = @UserId;";
         });
     }
 
+    public async Task UpdateProfileBgImageUrlAsync(ulong userId, string? imageUrl)
+    {
+        const string sql = @"
+UPDATE discord_users
+SET profile_bg_image_url = @ImageUrl,
+    updated_at = NOW()
+WHERE discord_user_id = @UserId;";
+
+        await using var conn = CreateConnection();
+        await conn.ExecuteAsync(sql, new { UserId = ToDbId(userId), ImageUrl = NullIfBlank(imageUrl) });
+    }
+
     public async Task<bool> HasMainCharacterAsync(ulong userId)
     {
         const string sql = @"
@@ -1386,6 +1399,7 @@ SELECT discord_user_id AS DiscordUserId,
        bluesky_handle AS BlueskyHandle,
        bio AS Bio,
        story_progression AS StoryProgression,
+       profile_bg_image_url AS ProfileBgImageUrl,
        registration_review_message_id AS RegistrationReviewMessageId,
        updated_at AS UpdatedAt
 FROM discord_users
@@ -1414,6 +1428,7 @@ SELECT discord_user_id AS DiscordUserId,
        bluesky_handle AS BlueskyHandle,
        bio AS Bio,
        story_progression AS StoryProgression,
+       profile_bg_image_url AS ProfileBgImageUrl,
        registration_review_message_id AS RegistrationReviewMessageId,
        updated_at AS UpdatedAt
 FROM discord_users
@@ -2733,6 +2748,62 @@ LIMIT @TopCount;";
         return rows.ToList();
     }
 
+    public async Task<long> GetUserVoiceDurationAsync(
+        ulong guildId,
+        ulong userId,
+        DateTimeOffset fromUtcInclusive,
+        DateTimeOffset toUtcExclusive)
+    {
+        const string sql = @"
+SELECT COALESCE(SUM(
+    GREATEST(
+        0,
+        EXTRACT(EPOCH FROM (LEAST(COALESCE(left_at, @ToUtcExclusive), @ToUtcExclusive) - GREATEST(joined_at, @FromUtcInclusive)))
+    )
+), 0)::BIGINT AS DurationSeconds
+FROM voice_sessions
+WHERE guild_id = @GuildId
+  AND user_id = @UserId
+  AND COALESCE(left_at, @ToUtcExclusive) > @FromUtcInclusive
+  AND joined_at < @ToUtcExclusive;";
+
+        await using var conn = CreateConnection();
+        var result = await conn.QuerySingleAsync<long>(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            UserId = ToDbId(userId),
+            FromUtcInclusive = fromUtcInclusive,
+            ToUtcExclusive = toUtcExclusive
+        });
+        return result;
+    }
+
+    public async Task<int> GetUserMessageCountAsync(
+        ulong guildId,
+        ulong userId,
+        DateTimeOffset fromUtcInclusive,
+        DateTimeOffset toUtcExclusive)
+    {
+        const string sql = @"
+SELECT COUNT(1)::INT AS MessageCount
+FROM message_logs
+WHERE guild_id = @GuildId
+  AND author_id = @UserId
+  AND deleted_at IS NULL
+  AND created_at >= @FromUtcInclusive
+  AND created_at < @ToUtcExclusive;";
+
+        await using var conn = CreateConnection();
+        var result = await conn.QuerySingleAsync<int>(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            UserId = ToDbId(userId),
+            FromUtcInclusive = fromUtcInclusive,
+            ToUtcExclusive = toUtcExclusive
+        });
+        return result;
+    }
+
     public async Task<IReadOnlyCollection<ulong>> ListActiveUserIdsSinceAsync(ulong guildId, DateTimeOffset sinceUtc)
     {
         const string sql = @"
@@ -3458,6 +3529,68 @@ WHERE guild_id = @GuildId
             AttachmentId = ToDbId(attachmentId)
         });
         return affected > 0;
+    }
+
+    public async Task<IReadOnlyList<(string ImageUrl, string? FileName, DateTimeOffset CreatedAt)>> ListUserSsImagesAsync(
+        ulong guildId, ulong userId, int limit = 25)
+    {
+        const string sql = @"
+SELECT attachments_json::text AS attachments_json, content, created_at
+FROM message_logs
+WHERE guild_id = @GuildId
+  AND author_id = @UserId
+  AND attachments_json IS NOT NULL
+ORDER BY created_at DESC
+LIMIT @Limit;";
+
+        await using var conn = CreateConnection();
+        var rows = await conn.QueryAsync<(string? AttachmentsJson, string Content, DateTimeOffset CreatedAt)>(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            UserId = ToDbId(userId),
+            Limit = limit
+        });
+
+        var result = new List<(string ImageUrl, string? FileName, DateTimeOffset CreatedAt)>();
+        foreach (var row in rows)
+        {
+            if (string.IsNullOrWhiteSpace(row.AttachmentsJson)) continue;
+            try
+            {
+                using var doc = JsonDocument.Parse(row.AttachmentsJson);
+                foreach (var element in doc.RootElement.EnumerateArray())
+                {
+                    var contentType = element.TryGetProperty("ContentType", out var ct) ? ct.GetString() : null;
+                    var fileName = element.TryGetProperty("Filename", out var fn) ? fn.GetString() : null;
+                    if (!IsImageLikeForBg(contentType, fileName)) continue;
+                    var url = element.TryGetProperty("Url", out var u) ? u.GetString() : null;
+                    if (string.IsNullOrWhiteSpace(url) && element.TryGetProperty("ProxyUrl", out var pu))
+                        url = pu.GetString();
+                    if (!string.IsNullOrWhiteSpace(url))
+                    {
+                        result.Add((url, fileName, row.CreatedAt));
+                    }
+                }
+            }
+            catch { /* ignore parse errors */ }
+        }
+        return result;
+    }
+
+    private static bool IsImageLikeForBg(string? contentType, string? fileName)
+    {
+        if (!string.IsNullOrWhiteSpace(contentType) &&
+            contentType.StartsWith("image/", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+        if (string.IsNullOrWhiteSpace(fileName)) return false;
+        var ext = System.IO.Path.GetExtension(fileName);
+        return ext.Equals(".png", StringComparison.OrdinalIgnoreCase) ||
+               ext.Equals(".jpg", StringComparison.OrdinalIgnoreCase) ||
+               ext.Equals(".jpeg", StringComparison.OrdinalIgnoreCase) ||
+               ext.Equals(".gif", StringComparison.OrdinalIgnoreCase) ||
+               ext.Equals(".webp", StringComparison.OrdinalIgnoreCase);
     }
 
     public async Task<IReadOnlyList<SsAlbumFavorite>> ListSsAlbumFavoritesAsync(

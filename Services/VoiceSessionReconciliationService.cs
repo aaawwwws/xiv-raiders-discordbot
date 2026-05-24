@@ -199,14 +199,28 @@ public sealed class VoiceSessionReconciliationService
         return closed;
     }
 
+    private static bool IsFullyMuted(SocketGuildUser user)
+    {
+        var state = user.VoiceState;
+        if (state is null) return false;
+        var s = state.Value;
+        return (s.IsSelfMuted || s.IsMuted) && (s.IsSelfDeafened || s.IsDeafened);
+    }
+
     private static Dictionary<ulong, VoicePresence> BuildCurrentVoicePresence(SocketGuild guild)
     {
         var result = new Dictionary<ulong, VoicePresence>();
         foreach (var channel in guild.VoiceChannels)
         {
-            foreach (var member in channel.ConnectedUsers.Where(member => !member.IsBot))
+            var humans = channel.ConnectedUsers.Where(member => !member.IsBot).ToList();
+            if (humans.Count <= 1) continue;
+
+            foreach (var member in humans)
             {
-                result[member.Id] = new VoicePresence(channel.Id);
+                if (!IsFullyMuted(member))
+                {
+                    result[member.Id] = new VoicePresence(channel.Id);
+                }
             }
         }
 

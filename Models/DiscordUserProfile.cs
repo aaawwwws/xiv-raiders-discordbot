@@ -12,6 +12,7 @@ public sealed class DiscordUserProfile
     public string? BlueskyHandle { get; init; }
     public string? Bio { get; init; }
     public string? StoryProgression { get; init; }
+    public string? ProfileBgImageUrl { get; init; }
     public long? RegistrationReviewMessageId { get; init; }
     public DateTimeOffset UpdatedAt { get; init; }
 }

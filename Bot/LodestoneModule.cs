@@ -4,6 +4,7 @@ using Discord.WebSocket;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using System.Text;
+using System.Text.RegularExpressions;
 using RaidDcBot.Data;
 using RaidDcBot.Models;
 using RaidDcBot.Services;
@@ -255,10 +256,25 @@ public sealed class LodestoneModule : InteractionModuleBase<SocketInteractionCon
 
         if (!_tokenService.MatchesStoredToken(html, token.Token))
         {
+            // 診断: 自己紹介文部分を抽出
+            var selfIntroMatch = Regex.Match(
+                html,
+                @"class=[""'][^""']*selfintroduction[^""']*[""'][^>]*>(.*?)</div>",
+                RegexOptions.IgnoreCase | RegexOptions.Singleline);
+            var selfIntroContent = selfIntroMatch.Success
+                ? System.Net.WebUtility.HtmlDecode(Regex.Replace(selfIntroMatch.Groups[1].Value, "<.*?>", string.Empty, RegexOptions.Singleline)).Trim()
+                : "(selfintroduction not found)";
+            _logger.LogWarning(
+                "Token mismatch. HTML length={HtmlLength}, SelfIntro={SelfIntro}, Token={Token}, Url={Url}",
+                html.Length, selfIntroContent[..Math.Min(200, selfIntroContent.Length)], token.Token, normalizedUrl);
+
             await LogInvalidOperationAsync(
                 "Lodestone連携コード不一致",
-                $"👤 ユーザー: {FormatUser(Context.User)}\n🆔 UserId: {Context.User.Id}\n🔗 URL: {normalizedUrl}");
-            await RespondEphemeralAsync("プロフィールに連携コードが見つかりませんでした。貼り付けを確認してください。", followup);
+                $"👤 ユーザー: {FormatUser(Context.User)}\n🆔 UserId: {Context.User.Id}\n🔗 URL: {normalizedUrl}\n📄 SelfIntro: {selfIntroContent[..Math.Min(200, selfIntroContent.Length)]}");
+            await RespondEphemeralAsync(
+                "プロフィールに連携コードが見つかりませんでした。貼り付けを確認してください。\n" +
+                $"[診断] 自己紹介文: `{selfIntroContent[..Math.Min(200, selfIntroContent.Length)]}`",
+                followup);
             return;
         }
 

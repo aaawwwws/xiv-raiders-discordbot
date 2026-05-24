@@ -87,6 +87,7 @@ CREATE TABLE ""public"".""discord_users"" (
     ""voice_notification_enabled"" boolean DEFAULT true NOT NULL,
     ""story_progression"" ""text"",
     ""registration_review_message_id"" bigint,
+    ""profile_bg_image_url"" text,
     ""created_at"" timestamp with time zone DEFAULT ""now""() NOT NULL,
     ""updated_at"" timestamp with time zone DEFAULT ""now""() NOT NULL
 );

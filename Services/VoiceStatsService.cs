@@ -391,7 +391,7 @@ public sealed class VoiceStatsService {
         return new Color(52, 152, 219);
     }
 
-    private static string FormatDuration(long durationSeconds) {
+    public static string FormatDuration(long durationSeconds) {
         if (durationSeconds < 0) {
             durationSeconds = 0;
         }

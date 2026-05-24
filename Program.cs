@@ -1,14 +1,18 @@
 using System.Net;
+using System.Text;
 using Discord;
 using Discord.Interactions;
 using Discord.WebSocket;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Options;
 using RaidDcBot.Bot;
 using RaidDcBot.Data;
 using RaidDcBot.Models;
 using RaidDcBot.Services;
+
+Console.OutputEncoding = Encoding.UTF8;
 
 EnvLoader.Load();
 
@@ -55,6 +59,9 @@ builder.Services.AddSingleton<Db>();
 builder.Services.AddSingleton<VoiceTransferTracker>();
 builder.Services.AddSingleton<VoiceChannelTextService>();
 builder.Services.AddSingleton<UserProfileEmbedService>();
+builder.Services.AddSingleton<JobIconCacheService>();
+builder.Services.AddSingleton<ProfileCacheService>();
+builder.Services.AddSingleton<ProfileImageService>();
 builder.Services.AddSingleton<AchievementResumeService>();
 builder.Services.AddSingleton<GuildAuditLogService>();
 

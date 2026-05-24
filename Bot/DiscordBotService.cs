@@ -4562,25 +4562,22 @@ public sealed class DiscordBotService : IHostedService
 
         var beforeChannel = before.VoiceChannel;
         var afterChannel = after.VoiceChannel;
-
-        if (beforeChannel?.Id == afterChannel?.Id)
-        {
-            return;
-        }
-
-        var guild = (user as SocketGuildUser)?.Guild ?? beforeChannel?.Guild ?? afterChannel?.Guild;
+        var guildUser = user as SocketGuildUser;
+        var guild = guildUser?.Guild ?? beforeChannel?.Guild ?? afterChannel?.Guild;
         if (guild is null)
         {
             return;
         }
 
+        bool channelChanged = beforeChannel?.Id != afterChannel?.Id;
+
         // Track VC join/leave for sleep kick detection
         if (beforeChannel is null && afterChannel is not null)
         {
             SleepKickJoinTracker.SetJoinTime(user.Id, DateTimeOffset.UtcNow);
-            if (user is SocketGuildUser guildUser)
+            if (user is SocketGuildUser gUser)
             {
-                await _voiceTextService.TrySendSpoilerWarningAsync(guildUser, afterChannel);
+                await _voiceTextService.TrySendSpoilerWarningAsync(gUser, afterChannel);
             }
         }
         else if (beforeChannel is not null && afterChannel is null)
@@ -4595,147 +4592,146 @@ public sealed class DiscordBotService : IHostedService
 
         var now = DateTimeOffset.UtcNow;
         var lobby = FindTempVoiceLobby(guild);
-        if (afterChannel is not null && lobby is not null && afterChannel.Id == lobby.Id)
+        if (channelChanged)
         {
-            var handled = await HandleTempVoiceLobbyJoinAsync(guild, lobby, user);
-            if (handled)
+            if (afterChannel is not null && lobby is not null && afterChannel.Id == lobby.Id)
             {
-                return;
+                var handled = await HandleTempVoiceLobbyJoinAsync(guild, lobby, user);
+                if (handled)
+                {
+                    return;
+                }
             }
-        }
 
-        if (afterChannel is not null && IsTempVoiceChannel(afterChannel, lobby))
-        {
-            CancelTempVoiceDeletion(afterChannel.Id);
-        }
-
-        if (beforeChannel is not null && IsTempVoiceChannel(beforeChannel, lobby) && beforeChannel.Id != afterChannel?.Id)
-        {
-            await HandleTempVoiceOwnerLeftAsync(beforeChannel, user);
-        }
-        var duration = await ResolveVoiceDurationAsync(guild, user, beforeChannel, now);
-        var summary = BuildVoiceSummary(guild, user, beforeChannel, afterChannel, duration);
-        var isFirstJoinInChannel = await IsFirstHumanJoinInChannelAsync(guild, user.Id, beforeChannel, afterChannel);
-        var endedChannel = ResolveEndedVoiceChannel(beforeChannel, afterChannel);
-        var shouldNotifyUserVoiceActivity = true;
-        if (isFirstJoinInChannel || endedChannel is not null)
-        {
-            shouldNotifyUserVoiceActivity = await ShouldNotifyUserVoiceActivityAsync(user.Id);
-        }
-
-        string title;
-        Color color;
-        DiscordUserProfile? joinProfile = null;
-        if (beforeChannel is null && afterChannel is not null)
-        {
-            title = "VC参加";
-            try
+            if (afterChannel is not null && IsTempVoiceChannel(afterChannel, lobby))
             {
-                joinProfile = await _db.GetDiscordUserProfileAsync(user.Id);
+                CancelTempVoiceDeletion(afterChannel.Id);
             }
-            catch (Exception ex)
+
+            if (beforeChannel is not null && IsTempVoiceChannel(beforeChannel, lobby) && beforeChannel.Id != afterChannel?.Id)
             {
-                _logger.LogDebug(ex, "Failed to fetch user profile for voice join color. UserId={UserId}", user.Id);
+                await HandleTempVoiceOwnerLeftAsync(beforeChannel, user);
             }
-            color = ResolveStoryProgressionColor(joinProfile?.StoryProgression);
-        }
-        else if (beforeChannel is not null && afterChannel is null)
-        {
-            title = "VC退出";
-            color = Color.DarkGrey;
-        }
-        else
-        {
-            title = "VC移動";
-            color = Color.Orange;
-        }
 
-        var embed = CreateLogEmbedBase(guild, title, color, user, preferGuildDisplayName: true)
-            .WithDescription(summary)
-            .Build();
-
-        await SendLogEmbedAsync(guild, embed);
-
-        if (shouldNotifyUserVoiceActivity && isFirstJoinInChannel && afterChannel is not null)
-        {
-            if (joinProfile is null && beforeChannel is not null)
+            var duration = await ResolveVoiceDurationAsync(guild, user, beforeChannel, now);
+            var summary = BuildVoiceSummary(guild, user, beforeChannel, afterChannel, duration);
+            var isFirstJoinInChannel = await IsFirstHumanJoinInChannelAsync(guild, user.Id, beforeChannel, afterChannel);
+            var endedChannel = ResolveEndedVoiceChannel(beforeChannel, afterChannel);
+            var shouldNotifyUserVoiceActivity = true;
+            if (isFirstJoinInChannel || endedChannel is not null)
             {
+                shouldNotifyUserVoiceActivity = await ShouldNotifyUserVoiceActivityAsync(user.Id);
+            }
+
+            string title;
+            Color color;
+            DiscordUserProfile? joinProfile = null;
+            if (beforeChannel is null && afterChannel is not null)
+            {
+                title = "VC参加";
                 try
                 {
                     joinProfile = await _db.GetDiscordUserProfileAsync(user.Id);
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogDebug(ex, "Failed to fetch user profile for first join color. UserId={UserId}", user.Id);
+                    _logger.LogDebug(ex, "Failed to fetch user profile for voice join color. UserId={UserId}", user.Id);
                 }
+                color = ResolveStoryProgressionColor(joinProfile?.StoryProgression);
             }
-            var firstJoinColor = ResolveStoryProgressionColor(joinProfile?.StoryProgression);
-            var firstJoinEmbed = CreateLogEmbedBase(guild, "通話開始", firstJoinColor, user, preferGuildDisplayName: true)
-                .WithDescription(BuildVoiceFirstJoinSummary(guild, user, afterChannel, now))
-                .Build();
-            await SendNotificationEmbedAsync(guild, firstJoinEmbed, mentionVoiceRole: true);
-        }
-
-        if (isFirstJoinInChannel && afterChannel is not null)
-        {
-            try
+            else if (beforeChannel is not null && afterChannel is null)
             {
-                await _voiceTextService.UpsertStatusPromptAsync(afterChannel, user);
+                title = "VC退出";
+                color = Color.DarkGrey;
             }
-            catch (Exception ex)
+            else
             {
-                _logger.LogWarning(ex, "Failed to post voice status prompt. ChannelId={ChannelId}", afterChannel.Id);
+                title = "VC移動";
+                color = Color.Orange;
             }
 
-        }
-
-        if (isFirstJoinInChannel && afterChannel is not null)
-        {
-            await TryMirrorVoiceJoinToWebTimelineAsync(guild, user, afterChannel, now);
-        }
-
-        if (shouldNotifyUserVoiceActivity && endedChannel is not null)
-        {
-            var endedEmbed = CreateLogEmbedBase(guild, "通話終了", Color.DarkGrey, user, preferGuildDisplayName: true)
-                .WithDescription(BuildVoiceCallEndedSummary(guild, user, endedChannel, now, duration))
+            var embed = CreateLogEmbedBase(guild, title, color, user, preferGuildDisplayName: true)
+                .WithDescription(summary)
                 .Build();
-            await SendNotificationEmbedAsync(guild, endedEmbed, mentionVoiceRole: false);
+
+            await SendLogEmbedAsync(guild, embed);
+
+            if (shouldNotifyUserVoiceActivity && isFirstJoinInChannel && afterChannel is not null)
+            {
+                if (joinProfile is null && beforeChannel is not null)
+                {
+                    try
+                    {
+                        joinProfile = await _db.GetDiscordUserProfileAsync(user.Id);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogDebug(ex, "Failed to fetch user profile for first join color. UserId={UserId}", user.Id);
+                    }
+                }
+                var firstJoinColor = ResolveStoryProgressionColor(joinProfile?.StoryProgression);
+                var firstJoinEmbed = CreateLogEmbedBase(guild, "通話開始", firstJoinColor, user, preferGuildDisplayName: true)
+                    .WithDescription(BuildVoiceFirstJoinSummary(guild, user, afterChannel, now))
+                    .Build();
+                await SendNotificationEmbedAsync(guild, firstJoinEmbed, mentionVoiceRole: true);
+            }
+
+            if (isFirstJoinInChannel && afterChannel is not null)
+            {
+                try
+                {
+                    await _voiceTextService.UpsertStatusPromptAsync(afterChannel, user);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to post voice status prompt. ChannelId={ChannelId}", afterChannel.Id);
+                }
+
+            }
+
+            if (isFirstJoinInChannel && afterChannel is not null)
+            {
+                await TryMirrorVoiceJoinToWebTimelineAsync(guild, user, afterChannel, now);
+            }
+
+            if (shouldNotifyUserVoiceActivity && endedChannel is not null)
+            {
+                var endedEmbed = CreateLogEmbedBase(guild, "通話終了", Color.DarkGrey, user, preferGuildDisplayName: true)
+                    .WithDescription(BuildVoiceCallEndedSummary(guild, user, endedChannel, now, duration))
+                    .Build();
+                await SendNotificationEmbedAsync(guild, endedEmbed, mentionVoiceRole: false);
+            }
+
+            if (endedChannel is not null)
+            {
+                await TryMirrorVoiceEndedToWebTimelineAsync(guild, user, endedChannel, now);
+            }
+
+            if (afterChannel is not null && _options.VoiceProfileEmbedEnabled)
+            {
+                await SendVoiceJoinEmbedAsync(afterChannel, user);
+            }
+
+            if (beforeChannel is not null && IsTempVoiceChannel(beforeChannel, lobby) && beforeChannel.ConnectedUsers.Count == 0)
+            {
+                await _voiceTextService.ClearOwnerTransferAsync(beforeChannel);
+                await _voiceTextService.ClearStatusPromptAsync(beforeChannel);
+                await ScheduleTempVoiceDeletionAsync(beforeChannel);
+            }
+            else if (beforeChannel is not null && beforeChannel.Id != afterChannel?.Id && beforeChannel.ConnectedUsers.Count == 0)
+            {
+                await _voiceTextService.ClearStatusPromptAsync(beforeChannel);
+            }
         }
 
-        if (endedChannel is not null)
-        {
-            await TryMirrorVoiceEndedToWebTimelineAsync(guild, user, endedChannel, now);
-        }
+        // Refresh voice sessions for affected channels
+        var affectedChannels = new HashSet<SocketVoiceChannel>();
+        if (beforeChannel is not null) affectedChannels.Add(beforeChannel);
+        if (afterChannel is not null) affectedChannels.Add(afterChannel);
 
-        if (afterChannel is not null && _options.VoiceProfileEmbedEnabled)
+        foreach (var ch in affectedChannels)
         {
-            await SendVoiceJoinEmbedAsync(afterChannel, user);
-        }
-
-        if (beforeChannel is null && afterChannel is not null)
-        {
-            await CloseOpenVoiceSessionAsync(guild, user, now);
-            await _db.StartVoiceSessionAsync(guild.Id, afterChannel.Id, afterChannel.Name, user.Id, user.ToString() ?? string.Empty, now);
-        }
-        else if (beforeChannel is not null && afterChannel is null)
-        {
-            await CloseVoiceSessionAsync(guild, user, beforeChannel, now);
-        }
-        else if (beforeChannel is not null && afterChannel is not null)
-        {
-            await CloseVoiceSessionAsync(guild, user, beforeChannel, now);
-            await _db.StartVoiceSessionAsync(guild.Id, afterChannel.Id, afterChannel.Name, user.Id, user.ToString() ?? string.Empty, now);
-        }
-
-        if (beforeChannel is not null && IsTempVoiceChannel(beforeChannel, lobby) && beforeChannel.ConnectedUsers.Count == 0)
-        {
-            await _voiceTextService.ClearOwnerTransferAsync(beforeChannel);
-            await _voiceTextService.ClearStatusPromptAsync(beforeChannel);
-            await ScheduleTempVoiceDeletionAsync(beforeChannel);
-        }
-        else if (beforeChannel is not null && beforeChannel.Id != afterChannel?.Id && beforeChannel.ConnectedUsers.Count == 0)
-        {
-            await _voiceTextService.ClearStatusPromptAsync(beforeChannel);
+            await RefreshVoiceSessionsForChannelAsync(guild, ch, now);
         }
     }
 
@@ -6644,6 +6640,47 @@ public sealed class DiscordBotService : IHostedService
         }
 
         await _db.EndVoiceSessionAsync(guild.Id, ToUlong(open.ChannelId), user.Id, leftAt);
+    }
+
+    private static bool IsFullyMuted(SocketGuildUser user)
+    {
+        var state = user.VoiceState;
+        if (state is null) return false;
+        var s = state.Value;
+        return (s.IsSelfMuted || s.IsMuted) && (s.IsSelfDeafened || s.IsDeafened);
+    }
+
+    private async Task RefreshVoiceSessionsForChannelAsync(SocketGuild guild, SocketVoiceChannel channel, DateTimeOffset now)
+    {
+        var humans = channel.ConnectedUsers.Where(u => !u.IsBot).ToList();
+        var humanIds = humans.Select(u => (long)u.Id).ToHashSet();
+        bool isSolo = humans.Count <= 1;
+
+        var openSessions = await _db.ListOpenVoiceSessionsAsync(guild.Id, channel.Id);
+        var openByUserId = openSessions.ToDictionary(s => s.UserId);
+
+        foreach (var session in openSessions)
+        {
+            if (!humanIds.Contains(session.UserId))
+            {
+                await _db.EndVoiceSessionAsync(guild.Id, channel.Id, ToUlong(session.UserId), now);
+            }
+        }
+
+        foreach (var member in humans)
+        {
+            bool shouldCount = !isSolo && !IsFullyMuted(member);
+            bool hasOpen = openByUserId.TryGetValue((long)member.Id, out _);
+
+            if (shouldCount && !hasOpen)
+            {
+                await _db.StartVoiceSessionAsync(guild.Id, channel.Id, channel.Name, member.Id, member.ToString() ?? string.Empty, now);
+            }
+            else if (!shouldCount && hasOpen)
+            {
+                await _db.EndVoiceSessionAsync(guild.Id, channel.Id, member.Id, now);
+            }
+        }
     }
 
     private static string FormatDuration(TimeSpan duration)

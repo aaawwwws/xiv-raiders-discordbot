@@ -33,15 +33,34 @@ public sealed class TokenService
 
         if (storedToken.StartsWith("RDC-", StringComparison.OrdinalIgnoreCase))
         {
-            return html.Contains(storedToken, StringComparison.OrdinalIgnoreCase);
+            var found = html.Contains(storedToken, StringComparison.OrdinalIgnoreCase);
+            if (!found)
+            {
+                Console.WriteLine($"[TokenDebug] Token '{storedToken}' not found in HTML. HTML length={html.Length}, contains_self_intro={html.Contains("自己紹介", StringComparison.Ordinal)}");
+            }
+            return found;
         }
 
         if (!TryParseHex(storedToken, out var expectedHash))
         {
+            Console.WriteLine($"[TokenDebug] Stored token is not a valid hash. Length={storedToken.Length}, startsWith={storedToken[..Math.Min(10, storedToken.Length)]}");
             return false;
         }
 
-        foreach (Match match in TokenRegex.Matches(html))
+        var matches = TokenRegex.Matches(html);
+        if (matches.Count == 0)
+        {
+            // HTMLタグを除去してテキスト抽出後にも探す（<wbr>などで分割されている可能性）
+            var stripped = Regex.Replace(html, "<.*?>", string.Empty, RegexOptions.Singleline);
+            matches = TokenRegex.Matches(stripped);
+            if (matches.Count == 0)
+            {
+                Console.WriteLine($"[TokenDebug] No token pattern found in HTML. HTML length={html.Length}, contains_self_intro={html.Contains("自己紹介", StringComparison.Ordinal)}, stripped_length={stripped.Length}");
+                return false;
+            }
+        }
+
+        foreach (Match match in matches)
         {
             if (!match.Success)
             {
@@ -56,6 +75,7 @@ public sealed class TokenService
             }
         }
 
+        Console.WriteLine($"[TokenDebug] Hash mismatch. Found {matches.Count} token pattern(s) but none matched stored hash. HTML length={html.Length}, contains_self_intro={html.Contains("自己紹介", StringComparison.Ordinal)}");
         return false;
     }
 

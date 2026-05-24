@@ -87,13 +87,14 @@ public sealed class TodayRankingModule : InteractionModuleBase<SocketInteraction
         var lastMessageId = existing is null ? 0UL : ToUlong(existing.MessageId);
         await _db.UpsertGuildWeeklyActivityPanelAsync(Context.Guild.Id, channel.Id, lastMessageId);
 
-        // 先週のランキング上位者にロール付与
+        // 先週のランキング上位者にロール付与（自動実行と同じ期間計算）
         try
         {
             var roleRangeDays = Math.Clamp(_options.VoiceWeeklyRankingRangeDays, 1, 30);
-            var nowUtc = DateTimeOffset.UtcNow;
-            var fromUtc = nowUtc.AddDays(-roleRangeDays);
-            await _voiceStats.AssignWeeklyRankingRolesAsync(Context.Guild, fromUtc, nowUtc);
+            var nowJst = DateTimeOffset.UtcNow.ToOffset(TimeSpan.FromHours(9));
+            var periodEndJst = new DateTimeOffset(nowJst.Year, nowJst.Month, nowJst.Day, 0, 0, 0, TimeSpan.FromHours(9));
+            var periodStartJst = periodEndJst.AddDays(-roleRangeDays);
+            await _voiceStats.AssignWeeklyRankingRolesAsync(Context.Guild, periodStartJst.ToUniversalTime(), periodEndJst.ToUniversalTime());
         }
         catch
         {
