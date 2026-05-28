@@ -35,9 +35,10 @@ public sealed class UserProfileEmbedService
         Color color,
         bool includeBio = true,
         bool includeLodestoneExtras = false,
+        bool skipLodestoneFetch = false,
         Action<EmbedBuilder>? configure = null)
     {
-        var snapshot = await BuildProfileSnapshotAsync(user, guild);
+        var snapshot = await BuildProfileSnapshotAsync(user, guild, skipLodestoneFetch);
 
         var embed = new EmbedBuilder()
             .WithTitle(title)
@@ -130,6 +131,9 @@ public sealed class UserProfileEmbedService
     }
 
     private async Task<ProfileSnapshot> BuildProfileSnapshotAsync(SocketUser user, SocketGuild? guild)
+        => await BuildProfileSnapshotAsync(user, guild, false);
+
+    private async Task<ProfileSnapshot> BuildProfileSnapshotAsync(SocketUser user, SocketGuild? guild, bool skipLodestoneFetch)
     {
         var guildUser = guild?.GetUser(user.Id);
         var displayName = guildUser?.DisplayName ?? user.GlobalName ?? user.Username;
@@ -141,7 +145,7 @@ public sealed class UserProfileEmbedService
         var avatar = user.GetAvatarUrl() ?? user.GetDefaultAvatarUrl();
         var authorName = user.GlobalName ?? user.Username;
         var portrait = character?.PortraitUrl;
-        if (character is not null)
+        if (character is not null && !skipLodestoneFetch)
         {
             portrait = await EnsureCharacterPortraitAsync(character) ?? portrait;
         }
@@ -332,7 +336,7 @@ public sealed class UserProfileEmbedService
             var linkedName = string.IsNullOrWhiteSpace(character.Name) ? "Unknown" : character.Name;
             var linkedWorld = string.IsNullOrWhiteSpace(character.World) ? "Unknown" : character.World;
             var linkedDc = string.IsNullOrWhiteSpace(character.DataCenter) ? "Unknown" : character.DataCenter;
-            return $"**{linkedName}**\n`{linkedDc}` / `{linkedWorld}`";
+            return $"名前: **{linkedName}**\n`{linkedDc}` / `{linkedWorld}`";
         }
 
         if (profile is not null &&
@@ -340,7 +344,7 @@ public sealed class UserProfileEmbedService
             !string.IsNullOrWhiteSpace(profile.FfxivWorld))
         {
             var profileDc = string.IsNullOrWhiteSpace(profile.FfxivDataCenter) ? "Unknown" : profile.FfxivDataCenter;
-            return $"**{profile.FfxivName}**\n`{profileDc}` / `{profile.FfxivWorld}`";
+            return $"名前: **{profile.FfxivName}**\n`{profileDc}` / `{profile.FfxivWorld}`";
         }
 
         return "未連携";

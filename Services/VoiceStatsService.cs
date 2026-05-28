@@ -613,7 +613,7 @@ public sealed class VoiceStatsService {
             {
                 new { Rank = 1, Name = "🥇1位", Colors = new RoleColors(new Color(0xFF, 0xD7, 0x00), new Color(0xFF, 0x95, 0x00), null) },
                 new { Rank = 2, Name = "🥈2位", Colors = new RoleColors(new Color(0xE0, 0xE0, 0xE0), new Color(0x80, 0x80, 0x80), null) },
-                new { Rank = 3, Name = "🥉3位", Colors = new RoleColors(new Color(0xCD, 0x7F, 0x32), new Color(0x8B, 0x45, 0x13), null) }
+                new { Rank = 3, Name = "🥉3位", Colors = new RoleColors(new Color(0xFF, 0xB3, 0x66), new Color(0xE6, 0x7E, 0x22), null) }
             };
 
             foreach (var config in roleConfigs)

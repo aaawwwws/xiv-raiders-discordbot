@@ -63,7 +63,7 @@ public sealed class DiscordOptions
     public bool AutoCreateInactiveRole { get; init; } = true;
     public int InactiveRoleDays { get; init; } = 7;
     public int ActivityRoleSyncIntervalMinutes { get; init; } = 30;
-    public bool InactiveAutoKickEnabled { get; init; } = true;
+    public bool InactiveAutoKickEnabled { get; init; } = false;
     public int InactiveAutoKickDays { get; init; } = 30;
     public int InactiveAutoKickUserDataRetentionDays { get; init; } = 7;
     public string[] ManagementRoleNames { get; init; } = ["管理者", "オフィサー", "宣伝係"];

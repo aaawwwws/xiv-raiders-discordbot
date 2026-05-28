@@ -2303,6 +2303,88 @@ LIMIT @TopCount;";
         return rows.ToList();
     }
 
+    public async Task<int?> GetUserVoiceRankAsync(
+        ulong guildId,
+        ulong userId,
+        DateTimeOffset fromUtcInclusive,
+        DateTimeOffset toUtcExclusive)
+    {
+        const string sql = @"
+WITH ranked AS (
+    SELECT user_id,
+           SUM(
+               GREATEST(
+                   0,
+                   EXTRACT(EPOCH FROM (LEAST(COALESCE(left_at, @ToUtcExclusive), @ToUtcExclusive) - GREATEST(joined_at, @FromUtcInclusive)))
+               )
+           )::BIGINT AS DurationSeconds,
+           RANK() OVER (
+               ORDER BY SUM(
+                   GREATEST(
+                       0,
+                       EXTRACT(EPOCH FROM (LEAST(COALESCE(left_at, @ToUtcExclusive), @ToUtcExclusive) - GREATEST(joined_at, @FromUtcInclusive)))
+                   )
+               )::BIGINT DESC, user_id ASC
+           ) AS rank
+    FROM voice_sessions
+    WHERE guild_id = @GuildId
+      AND COALESCE(left_at, @ToUtcExclusive) > @FromUtcInclusive
+      AND joined_at < @ToUtcExclusive
+    GROUP BY user_id
+    HAVING SUM(
+               GREATEST(
+                   0,
+                   EXTRACT(EPOCH FROM (LEAST(COALESCE(left_at, @ToUtcExclusive), @ToUtcExclusive) - GREATEST(joined_at, @FromUtcInclusive)))
+               )
+           ) > 0
+)
+SELECT rank FROM ranked WHERE user_id = @UserId;";
+
+        await using var conn = CreateConnection();
+        var result = await conn.QuerySingleOrDefaultAsync<int?>(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            UserId = ToDbId(userId),
+            FromUtcInclusive = fromUtcInclusive,
+            ToUtcExclusive = toUtcExclusive
+        });
+        return result;
+    }
+
+    public async Task<int?> GetUserMessageRankAsync(
+        ulong guildId,
+        ulong userId,
+        DateTimeOffset fromUtcInclusive,
+        DateTimeOffset toUtcExclusive)
+    {
+        const string sql = @"
+WITH ranked AS (
+    SELECT author_id AS user_id,
+           COUNT(1)::INT AS MessageCount,
+           RANK() OVER (
+               ORDER BY COUNT(1)::INT DESC, author_id ASC
+           ) AS rank
+    FROM message_logs
+    WHERE guild_id = @GuildId
+      AND deleted_at IS NULL
+      AND created_at >= @FromUtcInclusive
+      AND created_at < @ToUtcExclusive
+    GROUP BY author_id
+    HAVING COUNT(1) > 0
+)
+SELECT rank FROM ranked WHERE user_id = @UserId;";
+
+        await using var conn = CreateConnection();
+        var result = await conn.QuerySingleOrDefaultAsync<int?>(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            UserId = ToDbId(userId),
+            FromUtcInclusive = fromUtcInclusive,
+            ToUtcExclusive = toUtcExclusive
+        });
+        return result;
+    }
+
     public async Task<IReadOnlyList<VoiceChannelDurationSummary>> ListVoiceChannelDurationSummaryAsync(
         ulong guildId,
         DateTimeOffset fromUtcInclusive,
@@ -3818,6 +3900,79 @@ WHERE guild_id = @GuildId
             ToUtcExclusive = toUtcExclusive
         });
         return (Math.Max(0, row.SessionCount), Math.Max(0L, row.TotalDurationSeconds));
+    }
+
+    public async Task<DateTimeOffset?> GetUserLastVoiceJoinAsync(ulong guildId, ulong userId, DateTimeOffset beforeUtc)
+    {
+        if (guildId == 0 || userId == 0)
+        {
+            return null;
+        }
+
+        const string sql = @"
+SELECT MAX(joined_at) AS JoinedAt
+FROM voice_sessions
+WHERE guild_id = @GuildId
+  AND user_id = @UserId
+  AND joined_at < @BeforeUtc;";
+
+        await using var conn = CreateConnection();
+        var result = await conn.ExecuteScalarAsync<DateTime?>(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            UserId = ToDbId(userId),
+            BeforeUtc = beforeUtc
+        });
+        return result.HasValue ? new DateTimeOffset(result.Value) : null;
+    }
+
+    public async Task<int> GetUserConsecutiveVoiceDaysAsync(ulong guildId, ulong userId)
+    {
+        if (guildId == 0 || userId == 0)
+        {
+            return 0;
+        }
+
+        const string sql = @"
+SELECT DISTINCT (joined_at AT TIME ZONE 'Asia/Tokyo')::date AS d
+FROM voice_sessions
+WHERE guild_id = @GuildId
+  AND user_id = @UserId
+ORDER BY d DESC;";
+
+        await using var conn = CreateConnection();
+        var dates = await conn.QueryAsync<DateTime>(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            UserId = ToDbId(userId)
+        });
+
+        var dateList = dates.ToList();
+        if (dateList.Count == 0) return 0;
+
+        var jstZone = TimeZoneInfo.FindSystemTimeZoneById("Asia/Tokyo");
+        var today = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, jstZone).Date;
+
+        var latest = dateList[0].Date;
+        if (latest != today && latest != today.AddDays(-1))
+        {
+            return 0;
+        }
+
+        int streak = 1;
+        for (int i = 1; i < dateList.Count; i++)
+        {
+            if (dateList[i].Date == dateList[i - 1].Date.AddDays(-1))
+            {
+                streak++;
+            }
+            else
+            {
+                break;
+            }
+        }
+
+        return streak;
     }
 
     public async Task<long> SummarizeVoiceDurationByGuildAsync(
@@ -9353,6 +9508,79 @@ LIMIT @Limit OFFSET @Offset;";
                 reader.GetDateTime(8)));
         }
         return (items, totalCount);
+    }
+
+    public async Task EnsureScheduledMessageDeletionsTableAsync()
+    {
+        const string sql = @"
+CREATE TABLE IF NOT EXISTS scheduled_message_deletions (
+    id SERIAL PRIMARY KEY,
+    guild_id BIGINT NOT NULL,
+    channel_id BIGINT NOT NULL,
+    message_id BIGINT NOT NULL,
+    author_user_id BIGINT NOT NULL,
+    delete_at TIMESTAMPTZ NOT NULL,
+    reason TEXT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (guild_id, channel_id, message_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_scheduled_message_deletions_delete_at
+ON scheduled_message_deletions (delete_at ASC);";
+
+        await using var conn = CreateConnection();
+        await conn.ExecuteAsync(sql);
+    }
+
+    public async Task InsertScheduledMessageDeletionAsync(ulong guildId, ulong channelId, ulong messageId, ulong authorUserId, DateTimeOffset deleteAt, string? reason)
+    {
+        const string sql = @"
+INSERT INTO scheduled_message_deletions (guild_id, channel_id, message_id, author_user_id, delete_at, reason)
+VALUES (@GuildId, @ChannelId, @MessageId, @AuthorUserId, @DeleteAt, @Reason)
+ON CONFLICT (guild_id, channel_id, message_id) DO UPDATE
+SET delete_at = EXCLUDED.delete_at,
+    author_user_id = EXCLUDED.author_user_id,
+    reason = EXCLUDED.reason;";
+
+        await using var conn = CreateConnection();
+        await conn.ExecuteAsync(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            ChannelId = ToDbId(channelId),
+            MessageId = ToDbId(messageId),
+            AuthorUserId = ToDbId(authorUserId),
+            DeleteAt = deleteAt,
+            Reason = reason
+        });
+    }
+
+    public async Task<IReadOnlyList<ScheduledMessageDeletion>> GetPendingScheduledMessageDeletionsAsync(DateTimeOffset before)
+    {
+        const string sql = @"
+SELECT id AS Id,
+       guild_id AS GuildId,
+       channel_id AS ChannelId,
+       message_id AS MessageId,
+       author_user_id AS AuthorUserId,
+       delete_at AS DeleteAt,
+       reason AS Reason,
+       created_at AS CreatedAt
+FROM scheduled_message_deletions
+WHERE delete_at <= @Before
+ORDER BY delete_at ASC;";
+
+        await using var conn = CreateConnection();
+        var rows = await conn.QueryAsync<ScheduledMessageDeletion>(sql, new { Before = before });
+        return rows.AsList();
+    }
+
+    public async Task DeleteScheduledMessageDeletionAsync(long id)
+    {
+        const string sql = @"
+DELETE FROM scheduled_message_deletions WHERE id = @Id;";
+
+        await using var conn = CreateConnection();
+        await conn.ExecuteAsync(sql, new { Id = id });
     }
 }
 

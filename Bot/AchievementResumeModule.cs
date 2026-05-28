@@ -21,7 +21,7 @@ public sealed class AchievementResumeModule : InteractionModuleBase<SocketIntera
         _audit = audit;
     }
 
-    [ComponentInteraction(SavageFilterCustomIdPrefix + ":*", ignoreGroupNames: true)]
+    [ComponentInteraction(SavageFilterCustomIdPrefix + ":*")]
     public async Task ApplySavageFilterAsync(string targetUserIdRaw, string[] values)
     {
         if (Context.Guild is null)
@@ -61,7 +61,7 @@ public sealed class AchievementResumeModule : InteractionModuleBase<SocketIntera
         });
     }
 
-    [ComponentInteraction(ResumeGenerateCustomIdPrefix + ":*:*", ignoreGroupNames: true)]
+    [ComponentInteraction(ResumeGenerateCustomIdPrefix + ":*:*")]
     public async Task GenerateResumeAsync(string targetUserIdRaw, string selectedRaw)
     {
         if (Context.Guild is null)
@@ -101,7 +101,8 @@ public sealed class AchievementResumeModule : InteractionModuleBase<SocketIntera
         var result = await _resume.BuildAsync(
             Context.Guild,
             target,
-            forceRefresh: true,
+            forceRefresh: false,
+            probeAchievements: false,
             savageGroupFilter: selectedGroups.ToArray());
         if (!result.Success || result.Embed is null)
         {
@@ -111,6 +112,76 @@ public sealed class AchievementResumeModule : InteractionModuleBase<SocketIntera
         }
 
         await _audit.SendAsync(Context.Guild, "レイド履歴書生成", $"零式フィルタ `{string.Join(", ", selectedGroups)}` での履歴書を生成しました。", Color.Purple, Context.User);
+        var components = BuildSavageFilterComponents(targetUserId, selectedGroups);
+        if (result.ImagePng is { Length: > 0 } && !string.IsNullOrWhiteSpace(result.ImageFileName))
+        {
+            await using var imageStream = new MemoryStream(result.ImagePng, writable: false);
+            await FollowupWithFileAsync(
+                imageStream,
+                result.ImageFileName,
+                embed: result.Embed,
+                components: components,
+                ephemeral: true);
+            return;
+        }
+
+        await FollowupAsync(embed: result.Embed, components: components, ephemeral: true);
+    }
+
+    [ComponentInteraction(ResumeGenerateCustomIdPrefix + "_refresh:*:*")]
+    public async Task RefreshResumeAsync(string targetUserIdRaw, string selectedRaw)
+    {
+        if (Context.Guild is null)
+        {
+            await RespondAsync("この操作はサーバー内でのみ使えます。", ephemeral: true);
+            return;
+        }
+
+        if (!ulong.TryParse(targetUserIdRaw, out var targetUserId) || targetUserId == 0)
+        {
+            await RespondAsync("対象ユーザー情報が不正です。", ephemeral: true);
+            return;
+        }
+
+        if (Context.User.Id != targetUserId)
+        {
+            await RespondAsync("この履歴書メニューは作成した本人のみ操作できます。", ephemeral: true);
+            return;
+        }
+
+        var selectedGroups = ParseSelectedGroups(selectedRaw);
+        if (selectedGroups.Count == 0)
+        {
+            selectedGroups = new HashSet<string>(SavageExpansionGroups, StringComparer.Ordinal);
+        }
+
+        await DeferAsync(ephemeral: true);
+
+        IUser? target = Context.Guild.GetUser(targetUserId);
+        target ??= await Context.Client.Rest.GetUserAsync(targetUserId);
+        if (target is null)
+        {
+            await FollowupAsync("対象ユーザーが見つかりませんでした。", ephemeral: true);
+            return;
+        }
+
+        // 最新データで再取得（時間がかかる）
+        await FollowupAsync("🔄 Lodestoneから最新データを取得しています...（30秒程度かかる場合があります）", ephemeral: true);
+
+        var result = await _resume.BuildAsync(
+            Context.Guild,
+            target,
+            forceRefresh: true,
+            probeAchievements: true,
+            savageGroupFilter: selectedGroups.ToArray());
+        if (!result.Success || result.Embed is null)
+        {
+            await _audit.SendAsync(Context.Guild, "レイド履歴書再取得失敗", $"零式フィルタ `{string.Join(", ", selectedGroups)}` での履歴書再取得に失敗しました。", Color.Red, Context.User);
+            await FollowupAsync(result.ErrorMessage ?? "履歴書の再取得に失敗しました。", ephemeral: true);
+            return;
+        }
+
+        await _audit.SendAsync(Context.Guild, "レイド履歴書再取得", $"零式フィルタ `{string.Join(", ", selectedGroups)}` での履歴書を再取得しました。", Color.Purple, Context.User);
         var components = BuildSavageFilterComponents(targetUserId, selectedGroups);
         if (result.ImagePng is { Length: > 0 } && !string.IsNullOrWhiteSpace(result.ImageFileName))
         {
@@ -148,6 +219,7 @@ public sealed class AchievementResumeModule : InteractionModuleBase<SocketIntera
         return new ComponentBuilder()
             .WithSelectMenu(menu, row: 0)
             .WithButton("この内容で生成", $"{ResumeGenerateCustomIdPrefix}:{targetUserId}:{encoded}", ButtonStyle.Primary, row: 1)
+            .WithButton("🔄 最新データで再取得", $"{ResumeGenerateCustomIdPrefix}_refresh:{targetUserId}:{encoded}", ButtonStyle.Secondary, row: 1)
             .Build();
     }
 

@@ -158,9 +158,6 @@ public sealed class SleepKickService
         if (targetUser.VoiceChannel is null)
             return false;
 
-        if (!targetUser.IsSelfMuted && !targetUser.IsMuted)
-            return false;
-
         if (!skipCooldown
             && InitiatorCooldownTimestamps.TryGetValue(initiatorUserId, out var lastInitiated)
             && DateTimeOffset.UtcNow - lastInitiated < TimeSpan.FromMinutes(10))

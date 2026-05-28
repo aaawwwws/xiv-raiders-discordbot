@@ -184,6 +184,18 @@ public sealed class AchievementResumeService
         IReadOnlyCollection<string>? savageGroupFilter = null,
         CancellationToken cancellationToken = default)
     {
+        return await BuildAsync(guild, targetUser, forceRefresh, probeAchievements: forceRefresh, recentCount, savageGroupFilter, cancellationToken);
+    }
+
+    public async Task<AchievementResumeBuildResult> BuildAsync(
+        SocketGuild guild,
+        IUser targetUser,
+        bool forceRefresh,
+        bool probeAchievements,
+        int recentCount = 8,
+        IReadOnlyCollection<string>? savageGroupFilter = null,
+        CancellationToken cancellationToken = default)
+    {
         _logger.LogInformation("Building raid resume. UserId={UserId}, GuildId={GuildId}, ForceRefresh={ForceRefresh}", targetUser.Id, guild.Id, forceRefresh);
 
         if (!await _lodestone.IsAvailableAsync(cancellationToken))
@@ -221,6 +233,7 @@ public sealed class AchievementResumeService
         var knownUltimateStatusById = await BuildKnownUltimateStatusMapAsync(
             character.LodestoneUrl,
             allAchievements,
+            probeAchievements,
             cancellationToken);
         var supplementedUltimateAchievements = BuildSupplementedKnownUltimateAchievements(
             character.LodestoneUrl,
@@ -259,7 +272,7 @@ public sealed class AchievementResumeService
         var knownUltimateStatusLine = BuildKnownUltimateStatusLine(knownUltimateStatusById);
         var knownUltimateHasPrivate = knownUltimateStatusById.Values.Any(value => value.Available is null);
         var ultimateAchievementLines = BuildUltimateAchievementLines(knownUltimateStatusById);
-        var knownSavageStatusById = await BuildKnownSavageStatusMapAsync(character.LodestoneUrl, raidAchievements, cancellationToken);
+        var knownSavageStatusById = await BuildKnownSavageStatusMapAsync(character.LodestoneUrl, raidAchievements, probeAchievements, cancellationToken);
         var savageAchievementLines = BuildSavageAchievementLines(knownSavageStatusById);
         savageAchievementLines = FilterSavageAchievementLines(savageAchievementLines, savageGroupFilter);
         var timelineLines = BuildTimelineLines(fallbackToAllAchievements ? allAchievements : raidAchievements);
@@ -630,6 +643,7 @@ public sealed class AchievementResumeService
     private async Task<IReadOnlyDictionary<int, KnownUltimateProbeResult>> BuildKnownUltimateStatusMapAsync(
         string characterUrl,
         IReadOnlyCollection<LodestoneAchievementItem> achievements,
+        bool probeAchievements,
         CancellationToken cancellationToken)
     {
         var statusById = new Dictionary<int, KnownUltimateProbeResult>(KnownUltimateAchievementIdOrder.Length);
@@ -659,7 +673,7 @@ public sealed class AchievementResumeService
         var pendingIds = KnownUltimateAchievementIdOrder
             .Where(id => statusById[id].Available is not true || !statusById[id].EarnedAt.HasValue)
             .ToArray();
-        if (pendingIds.Length == 0)
+        if (!probeAchievements || pendingIds.Length == 0)
         {
             return statusById;
         }
@@ -846,6 +860,7 @@ public sealed class AchievementResumeService
     private async Task<IReadOnlyDictionary<int, KnownSavageProbeResult>> BuildKnownSavageStatusMapAsync(
         string characterUrl,
         IReadOnlyCollection<LodestoneAchievementItem> achievements,
+        bool probeAchievements,
         CancellationToken cancellationToken)
     {
         var statusById = new Dictionary<int, KnownSavageProbeResult>(KnownSavageAchievementIds.Count);
@@ -875,7 +890,7 @@ public sealed class AchievementResumeService
         var pendingIds = KnownSavageAchievementIdOrder
             .Where(id => statusById[id].Available is not true || !statusById[id].EarnedAt.HasValue)
             .ToArray();
-        if (pendingIds.Length == 0)
+        if (!probeAchievements || pendingIds.Length == 0)
         {
             return statusById;
         }

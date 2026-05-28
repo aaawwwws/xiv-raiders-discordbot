@@ -70,6 +70,8 @@ public sealed class DiscordBotService : IHostedService
     private Task? _voiceSessionReconcileTask;
     private CancellationTokenSource? _botAdminOperationCts;
     private Task? _botAdminOperationTask;
+    private CancellationTokenSource? _scheduledMessageDeleteCts;
+    private Task? _scheduledMessageDeleteTask;
     private int _missingTimelineBridgeSecretLogged;
     private DateTimeOffset? _lastRuntimeTuningUpdatedAtUtc;
     private static readonly TimeSpan RuntimeTuningRefreshInterval = TimeSpan.FromSeconds(30);
@@ -161,6 +163,7 @@ public sealed class DiscordBotService : IHostedService
         await _db.EnsureUserReactionLogsTableAsync();
         await _db.EnsureVoiceSessionColumnsAsync();
         await _db.EnsureInactiveKickRetentionTableAsync();
+        await _db.EnsureScheduledMessageDeletionsTableAsync();
         await RestoreRuntimeTuningAsync();
         EnsureAttachmentArchiveDirectory();
 
@@ -194,6 +197,8 @@ public sealed class DiscordBotService : IHostedService
         _voiceSessionReconcileTask = Task.Run(() => VoiceSessionReconcileLoopAsync(_voiceSessionReconcileCts.Token), _voiceSessionReconcileCts.Token);
         _botAdminOperationCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         _botAdminOperationTask = Task.Run(() => BotAdminOperationLoopAsync(_botAdminOperationCts.Token), _botAdminOperationCts.Token);
+        _scheduledMessageDeleteCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        _scheduledMessageDeleteTask = Task.Run(() => ScheduledMessageDeleteLoopAsync(_scheduledMessageDeleteCts.Token), _scheduledMessageDeleteCts.Token);
 
         await _client.LoginAsync(TokenType.Bot, _options.Token);
         await _client.StartAsync();
@@ -412,6 +417,22 @@ public sealed class DiscordBotService : IHostedService
             try
             {
                 await _botAdminOperationTask;
+            }
+            catch (OperationCanceledException)
+            {
+            }
+        }
+
+        if (_scheduledMessageDeleteCts is not null)
+        {
+            _scheduledMessageDeleteCts.Cancel();
+        }
+
+        if (_scheduledMessageDeleteTask is not null)
+        {
+            try
+            {
+                await _scheduledMessageDeleteTask;
             }
             catch (OperationCanceledException)
             {
@@ -827,7 +848,7 @@ public sealed class DiscordBotService : IHostedService
                 {
                     var settings = await _db.GetGuildSettingsAsync(guild.Id);
                     var sleepKickEnabled = settings?.SleepKickEnabled ?? _options.SleepKickEnabled;
-                    var sleepKickAutoDetect = settings?.SleepKickAutoDetectEnabled ?? true;
+                    var sleepKickAutoDetect = settings?.SleepKickAutoDetectEnabled ?? false;
                     if (!sleepKickEnabled || !sleepKickAutoDetect)
                         continue;
 
@@ -4993,26 +5014,23 @@ public sealed class DiscordBotService : IHostedService
         }
 
         var retentionHours = Math.Clamp(policy.RetentionHours <= 0 ? 6 : policy.RetentionHours, 1, 168);
-        var dueAt = message.Timestamp.ToUniversalTime().AddHours(retentionHours);
-        var delay = dueAt - DateTimeOffset.UtcNow;
-        if (delay < TimeSpan.FromSeconds(1))
-        {
-            delay = TimeSpan.FromSeconds(1);
-        }
+        var deleteAt = message.Timestamp.ToUniversalTime().AddHours(retentionHours);
 
-        _ = Task.Run(async () =>
+        try
         {
-            try
-            {
-                await Task.Delay(delay);
-                await TryExecuteVoiceTextAutoDeleteAsync(guildChannel.Guild.Id, guildChannel.Id, message.Id, message.Author.Id);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "VC text auto-delete task failed. GuildId={GuildId}, ChannelId={ChannelId}, MessageId={MessageId}",
-                    guildChannel.Guild.Id, guildChannel.Id, message.Id);
-            }
-        });
+            await _db.InsertScheduledMessageDeletionAsync(
+                guildChannel.Guild.Id,
+                guildChannel.Id,
+                message.Id,
+                message.Author.Id,
+                deleteAt,
+                "vc_text");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to schedule VC text auto-delete in DB. GuildId={GuildId}, ChannelId={ChannelId}, MessageId={MessageId}",
+                guildChannel.Guild.Id, guildChannel.Id, message.Id);
+        }
     }
 
     private async Task TryScheduleFflogsAutoDeleteAsync(SocketGuildChannel guildChannel, SocketUserMessage message)
@@ -5023,21 +5041,23 @@ public sealed class DiscordBotService : IHostedService
             return;
         }
 
-        var delay = TimeSpan.FromMinutes(3);
+        var deleteAt = DateTimeOffset.UtcNow.AddMinutes(3);
 
-        _ = Task.Run(async () =>
+        try
         {
-            try
-            {
-                await Task.Delay(delay);
-                await TryExecuteVoiceTextAutoDeleteAsync(guildChannel.Guild.Id, guildChannel.Id, message.Id, message.Author.Id);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "FFLogs auto-delete task failed. GuildId={GuildId}, ChannelId={ChannelId}, MessageId={MessageId}",
-                    guildChannel.Guild.Id, guildChannel.Id, message.Id);
-            }
-        });
+            await _db.InsertScheduledMessageDeletionAsync(
+                guildChannel.Guild.Id,
+                guildChannel.Id,
+                message.Id,
+                message.Author.Id,
+                deleteAt,
+                "fflogs");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to schedule FFLogs auto-delete in DB. GuildId={GuildId}, ChannelId={ChannelId}, MessageId={MessageId}",
+                guildChannel.Guild.Id, guildChannel.Id, message.Id);
+        }
     }
 
     private async Task TryExecuteVoiceTextAutoDeleteAsync(ulong guildId, ulong channelId, ulong messageId, ulong authorUserId)
@@ -5099,6 +5119,68 @@ public sealed class DiscordBotService : IHostedService
         }
 
         return;
+    }
+
+    private async Task ScheduledMessageDeleteLoopAsync(CancellationToken token)
+    {
+        while (!token.IsCancellationRequested)
+        {
+            try
+            {
+                await RunScheduledMessageDeletionsAsync();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed in scheduled message deletion loop.");
+            }
+
+            try
+            {
+                await Task.Delay(TimeSpan.FromMinutes(1), token);
+            }
+            catch (TaskCanceledException)
+            {
+                return;
+            }
+        }
+    }
+
+    private async Task RunScheduledMessageDeletionsAsync()
+    {
+        var pending = await _db.GetPendingScheduledMessageDeletionsAsync(DateTimeOffset.UtcNow);
+        if (pending.Count == 0)
+        {
+            return;
+        }
+
+        foreach (var item in pending)
+        {
+            var guildId = (ulong)item.GuildId;
+            var channelId = (ulong)item.ChannelId;
+            var messageId = (ulong)item.MessageId;
+            var authorUserId = (ulong)item.AuthorUserId;
+
+            try
+            {
+                await TryExecuteVoiceTextAutoDeleteAsync(guildId, channelId, messageId, authorUserId);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to execute scheduled message deletion. GuildId={GuildId}, ChannelId={ChannelId}, MessageId={MessageId}",
+                    guildId, channelId, messageId);
+            }
+            finally
+            {
+                try
+                {
+                    await _db.DeleteScheduledMessageDeletionAsync(item.Id);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to remove scheduled message deletion record. Id={Id}", item.Id);
+                }
+            }
+        }
     }
 
     private static bool IsVoiceTextMessageChannel(SocketGuildChannel guildChannel)
@@ -6715,6 +6797,10 @@ public sealed class DiscordBotService : IHostedService
 
         var vcPodiumCounts = new ActivityRankingPodiumCount();
         var messagePodiumCounts = new ActivityRankingPodiumCount();
+        long totalVoiceSeconds = 0;
+        int totalMessageCount = 0;
+        int? voiceRank = null;
+        int? messageRank = null;
         try
         {
             vcPodiumCounts = await _db.GetActivityRankingMetricPodiumCountsByUserAsync(
@@ -6725,6 +6811,27 @@ public sealed class DiscordBotService : IHostedService
                 channel.Guild.Id,
                 user.Id,
                 VoiceStatsService.RankingMetricMessageCount);
+            var oneMonthAgo = DateTimeOffset.UtcNow.AddMonths(-1);
+            totalVoiceSeconds = await _db.GetUserVoiceDurationAsync(
+                channel.Guild.Id,
+                user.Id,
+                oneMonthAgo,
+                DateTimeOffset.UtcNow);
+            totalMessageCount = await _db.GetUserMessageCountAsync(
+                channel.Guild.Id,
+                user.Id,
+                oneMonthAgo,
+                DateTimeOffset.UtcNow);
+            voiceRank = await _db.GetUserVoiceRankAsync(
+                channel.Guild.Id,
+                user.Id,
+                oneMonthAgo,
+                DateTimeOffset.UtcNow);
+            messageRank = await _db.GetUserMessageRankAsync(
+                channel.Guild.Id,
+                user.Id,
+                oneMonthAgo,
+                DateTimeOffset.UtcNow);
         }
         catch (Exception ex)
         {
@@ -6745,21 +6852,59 @@ public sealed class DiscordBotService : IHostedService
             }
         }
 
+        DateTimeOffset? lastVoiceJoin = null;
+        int consecutiveVoiceDays = 0;
+        try
+        {
+            lastVoiceJoin = await _db.GetUserLastVoiceJoinAsync(channel.Guild.Id, user.Id, DateTimeOffset.UtcNow);
+            consecutiveVoiceDays = await _db.GetUserConsecutiveVoiceDaysAsync(channel.Guild.Id, user.Id);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to load voice join history. GuildId={GuildId}, UserId={UserId}", channel.Guild.Id, user.Id);
+        }
+
         var embed = await _profileEmbeds.BuildProfileEmbedAsync(
             user,
             channel.Guild,
             "VC参加",
             Color.Blue,
+            skipLodestoneFetch: true,
             configure: builder =>
             {
+                // VC入室時はLodestoneポートレート画像を表示しない（アバターは表示する）
+                builder.ImageUrl = null;
+
+                // VC滞在 TOP3回数 (独立フィールド)
                 builder.AddField(
                     "🎙️ VC滞在 TOP3回数",
                     FormatPodiumCounts(vcPodiumCounts),
                     true);
+
+                // 発言数 TOP3回数 (独立フィールド)
                 builder.AddField(
                     "💬 発言数 TOP3回数",
                     FormatPodiumCounts(messagePodiumCounts),
                     true);
+
+                // 前回VC参加
+                if (lastVoiceJoin.HasValue)
+                {
+                    builder.AddField(
+                        "🕐 前回VC参加",
+                        FormatTimeAgo(lastVoiceJoin.Value),
+                        true);
+                }
+
+                // 連続VC参加日数
+                if (consecutiveVoiceDays > 0)
+                {
+                    builder.AddField(
+                        "🔥 連続VC参加",
+                        $"{consecutiveVoiceDays}日連続",
+                        true);
+                }
+
                 if (!string.IsNullOrWhiteSpace(timePatternHint))
                 {
                     builder.AddField(
@@ -6856,6 +7001,27 @@ public sealed class DiscordBotService : IHostedService
 
     private static string FormatPodiumCounts(ActivityRankingPodiumCount counts)
         => $"🥇 1位: `{Math.Max(0, counts.FirstCount)}回`\n🥈 2位: `{Math.Max(0, counts.SecondCount)}回`\n🥉 3位: `{Math.Max(0, counts.ThirdCount)}回`";
+
+    private static string FormatDuration(long totalSeconds)
+    {
+        var hours = totalSeconds / 3600;
+        var minutes = (totalSeconds % 3600) / 60;
+        if (hours > 0)
+            return $"{hours}時間{minutes}分";
+        if (minutes > 0)
+            return $"{minutes}分";
+        return $"{totalSeconds}秒";
+    }
+
+    private static string FormatTimeAgo(DateTimeOffset lastJoin)
+    {
+        var diff = DateTimeOffset.UtcNow - lastJoin;
+        if (diff.TotalMinutes < 1) return "さっき";
+        if (diff.TotalHours < 1) return $"{(int)diff.TotalMinutes}分前";
+        if (diff.TotalHours < 24) return $"{(int)diff.TotalHours}時間前";
+        if (diff.TotalDays < 2) return "昨日";
+        return $"{(int)diff.TotalDays}日前";
+    }
 
     private async Task<IMessageChannel?> ResolveVoiceTextChannelAsync(SocketVoiceChannel channel)
     {

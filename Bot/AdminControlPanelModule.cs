@@ -228,7 +228,7 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
     }
 
     [RequireBotAdmin]
-    [SlashCommand("inactive_preview", "次回の自動キック判定で対象になる候補を表示します")]
+    [SlashCommand("inactive_preview", "次回の非アクティブ30日キック判定で対象になる候補を表示します")]
     public async Task PreviewInactiveKickByCommandAsync([Summary("top", "各カテゴリの表示件数(1-50)")] int top = 20)
     {
         if (Context.Guild is null)
@@ -443,7 +443,7 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
         var approvalRequired = settings?.RegistrationApprovalRequired ?? true;
         var inactiveAutoKickEnabled = settings?.InactiveAutoKickEnabled ?? _options.InactiveAutoKickEnabled;
         var sleepKickEnabled = settings?.SleepKickEnabled ?? _options.SleepKickEnabled;
-        var sleepKickAutoDetect = settings?.SleepKickAutoDetectEnabled ?? true;
+        var sleepKickAutoDetect = settings?.SleepKickAutoDetectEnabled ?? false;
         var sleepKickAdminConfirm = settings?.SleepKickAdminConfirmationRequired ?? _options.SleepKickRequiresAdminConfirmation;
         await RespondAsync(
             "設定/保守メニュー",
@@ -3889,7 +3889,7 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
         var approvalRequired = refreshedSettings?.RegistrationApprovalRequired ?? true;
         var inactiveAutoKickEnabled = refreshedSettings?.InactiveAutoKickEnabled ?? _options.InactiveAutoKickEnabled;
         var sleepKickEnabled = refreshedSettings?.SleepKickEnabled ?? _options.SleepKickEnabled;
-        var sleepKickAutoDetect = refreshedSettings?.SleepKickAutoDetectEnabled ?? true;
+        var sleepKickAutoDetect = refreshedSettings?.SleepKickAutoDetectEnabled ?? false;
         var sleepKickAdminConfirm = refreshedSettings?.SleepKickAdminConfirmationRequired ?? _options.SleepKickRequiresAdminConfirmation;
         if (Context.Interaction is SocketMessageComponent component &&
             component.Message is IUserMessage message &&
@@ -3946,7 +3946,7 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
         var approvalRequired = refreshedSettings?.RegistrationApprovalRequired ?? true;
         var inactiveAutoKickEnabled = refreshedSettings?.InactiveAutoKickEnabled ?? _options.InactiveAutoKickEnabled;
         var sleepKickEnabled = refreshedSettings?.SleepKickEnabled ?? _options.SleepKickEnabled;
-        var sleepKickAutoDetect = refreshedSettings?.SleepKickAutoDetectEnabled ?? true;
+        var sleepKickAutoDetect = refreshedSettings?.SleepKickAutoDetectEnabled ?? false;
         var sleepKickAdminConfirm = refreshedSettings?.SleepKickAdminConfirmationRequired ?? _options.SleepKickRequiresAdminConfirmation;
         if (Context.Interaction is SocketMessageComponent component &&
             component.Message is IUserMessage message &&
@@ -4003,7 +4003,7 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
         var approvalRequired = refreshedSettings?.RegistrationApprovalRequired ?? true;
         var inactiveAutoKickEnabled = refreshedSettings?.InactiveAutoKickEnabled ?? _options.InactiveAutoKickEnabled;
         var sleepKickEnabled = refreshedSettings?.SleepKickEnabled ?? _options.SleepKickEnabled;
-        var sleepKickAutoDetect = refreshedSettings?.SleepKickAutoDetectEnabled ?? true;
+        var sleepKickAutoDetect = refreshedSettings?.SleepKickAutoDetectEnabled ?? false;
         var sleepKickAdminConfirm = refreshedSettings?.SleepKickAdminConfirmationRequired ?? _options.SleepKickRequiresAdminConfirmation;
         if (Context.Interaction is SocketMessageComponent component &&
             component.Message is IUserMessage message &&
@@ -4015,13 +4015,13 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
 
         await FollowupAsync(
             sleepKickEnabled
-                ? "寝落ち投票機能を「ON」に変更しました。"
-                : "寝落ち投票機能を「OFF」に変更しました。",
+                ? "🛌 寝落ちキック機能を「ON」に変更しました。"
+                : "🛌 寝落ちキック機能を「OFF」に変更しました。",
             ephemeral: true);
 
         await _audit.SendAsync(
             Context.Guild,
-            "設定変更: 寝落ち投票機能",
+            "設定変更: 寝落ちキック機能",
             $"旧値: {(previousValue ? "ON" : "OFF")}\n新値: {(sleepKickEnabled ? "ON" : "OFF")}",
             Color.Teal,
             Context.User);
@@ -4060,7 +4060,7 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
         var approvalRequired = refreshedSettings?.RegistrationApprovalRequired ?? true;
         var inactiveAutoKickEnabled = refreshedSettings?.InactiveAutoKickEnabled ?? _options.InactiveAutoKickEnabled;
         var sleepKickEnabled = refreshedSettings?.SleepKickEnabled ?? _options.SleepKickEnabled;
-        var sleepKickAutoDetect = refreshedSettings?.SleepKickAutoDetectEnabled ?? true;
+        var sleepKickAutoDetect = refreshedSettings?.SleepKickAutoDetectEnabled ?? false;
         var sleepKickAdminConfirm = refreshedSettings?.SleepKickAdminConfirmationRequired ?? _options.SleepKickRequiresAdminConfirmation;
         if (Context.Interaction is SocketMessageComponent component &&
             component.Message is IUserMessage message &&
@@ -4072,8 +4072,8 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
 
         await FollowupAsync(
             sleepKickAutoDetect
-                ? "寝落ち自動検出を「ON」に変更しました。"
-                : "寝落ち自動検出を「OFF」に変更しました。",
+                ? "🛌 寝落ち自動検出を「ON」に変更しました。"
+                : "🛌 寝落ち自動検出を「OFF」に変更しました。",
             ephemeral: true);
 
         await _audit.SendAsync(
@@ -4117,7 +4117,7 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
         var approvalRequired = refreshedSettings?.RegistrationApprovalRequired ?? true;
         var inactiveAutoKickEnabled = refreshedSettings?.InactiveAutoKickEnabled ?? _options.InactiveAutoKickEnabled;
         var sleepKickEnabled = refreshedSettings?.SleepKickEnabled ?? _options.SleepKickEnabled;
-        var sleepKickAutoDetect = refreshedSettings?.SleepKickAutoDetectEnabled ?? true;
+        var sleepKickAutoDetect = refreshedSettings?.SleepKickAutoDetectEnabled ?? false;
         var sleepKickAdminConfirm = refreshedSettings?.SleepKickAdminConfirmationRequired ?? _options.SleepKickRequiresAdminConfirmation;
         if (Context.Interaction is SocketMessageComponent component &&
             component.Message is IUserMessage message &&
@@ -4129,13 +4129,13 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
 
         await FollowupAsync(
             sleepKickAdminConfirm
-                ? "寝落ち管理者確認を「ON」に変更しました。"
-                : "寝落ち管理者確認を「OFF」に変更しました。",
+                ? "🛌 寝落ち管理者承認を「ON」に変更しました。"
+                : "🛌 寝落ち管理者承認を「OFF」に変更しました。",
             ephemeral: true);
 
         await _audit.SendAsync(
             Context.Guild,
-            "設定変更: 寝落ち管理者確認",
+            "設定変更: 寝落ち管理者承認",
             $"旧値: {(previousValue ? "ON" : "OFF")}\n新値: {(sleepKickAdminConfirm ? "ON" : "OFF")}",
             Color.Teal,
             Context.User);
@@ -4857,7 +4857,7 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
             .WithColor(color)
             .WithCurrentTimestamp()
             .AddField("総合", overall, true)
-            .AddField("自動キック", autoKickEnabled ? "ON" : "OFF", true)
+            .AddField("非アクティブ30日自動キック", autoKickEnabled ? "ON" : "OFF", true)
             .AddField("対象Guild", $"{guild.Name} ({guild.Id})", true)
             .AddField("Cleanup間隔", $"{cleanupIntervalMinutes}分", true)
             .AddField("募集Cleanup", recruitCleanupPolicy, true)
@@ -5185,10 +5185,10 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
         var color = inactiveAutoKickEnabled ? Color.Orange : Color.DarkGrey;
         var stateText = inactiveAutoKickEnabled ? "ON" : "OFF";
         var embed = new EmbedBuilder()
-            .WithTitle("自動キック候補プレビュー")
+            .WithTitle("非アクティブ30日キック候補プレビュー")
             .WithColor(color)
             .WithCurrentTimestamp()
-            .AddField("設定", $"自動キック: **{stateText}** / 日数: **{kickDays}日**", false)
+            .AddField("設定", $"非アクティブ30日自動キック: **{stateText}** / 日数: **{kickDays}日**", false)
             .AddField("次回判定(JST)", $"{evaluationBaseJst:yyyy/MM/dd HH:mm}", true)
             .AddField("活動判定", "メッセージ / VC参加 / リアクション", true)
             .AddField("判定基準", $"{kickCutoffUtc.ToOffset(JapanTimeOffset):yyyy/MM/dd HH:mm} 以降の活動なし", true)
@@ -6790,7 +6790,7 @@ public sealed class AdminControlPanelModule : InteractionModuleBase<SocketIntera
         var approvalRequired = settings?.RegistrationApprovalRequired ?? true;
         var inactiveAutoKickEnabled = settings?.InactiveAutoKickEnabled ?? _options.InactiveAutoKickEnabled;
         var sleepKickEnabled = settings?.SleepKickEnabled ?? _options.SleepKickEnabled;
-        var sleepKickAutoDetect = settings?.SleepKickAutoDetectEnabled ?? true;
+        var sleepKickAutoDetect = settings?.SleepKickAutoDetectEnabled ?? false;
         var sleepKickAdminConfirm = settings?.SleepKickAdminConfirmationRequired ?? _options.SleepKickRequiresAdminConfirmation;
         if (existing is not null)
         {

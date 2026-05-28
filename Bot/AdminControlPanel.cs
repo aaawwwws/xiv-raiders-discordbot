@@ -73,21 +73,21 @@ public static class AdminControlPanel
         return new ComponentBuilder()
             .WithButton("メンバー管理", MemberManageCustomId, ButtonStyle.Primary, row: 0)
             .WithButton("登録保留リスト", RegistrationPendingListCustomId, ButtonStyle.Secondary, row: 0)
-            .WithButton("自動キック候補", PreviewInactiveKickCustomId, ButtonStyle.Primary, row: 0)
+            .WithButton("非アクティブ30日キック候補", PreviewInactiveKickCustomId, ButtonStyle.Primary, row: 0)
             .Build();
     }
 
     public static MessageComponent BuildSettingsCategoryComponents(bool registrationApprovalRequired, bool inactiveAutoKickEnabled, bool sleepKickEnabled, bool sleepKickAutoDetect, bool sleepKickAdminConfirm)
     {
-        var approvalToggleLabel = registrationApprovalRequired ? "登録確認をOFF" : "登録確認をON";
+        var approvalToggleLabel = registrationApprovalRequired ? "🔴 新規登録確認 OFF" : "🟢 新規登録確認 ON";
         var approvalToggleStyle = registrationApprovalRequired ? ButtonStyle.Danger : ButtonStyle.Success;
-        var autoKickToggleLabel = inactiveAutoKickEnabled ? "自動キックをOFF" : "自動キックをON";
+        var autoKickToggleLabel = inactiveAutoKickEnabled ? "🔴 非アクティブ30日キック OFF" : "🟢 非アクティブ30日キック ON";
         var autoKickToggleStyle = inactiveAutoKickEnabled ? ButtonStyle.Danger : ButtonStyle.Success;
-        var sleepKickEnabledLabel = sleepKickEnabled ? "寝落ち投票をOFF" : "寝落ち投票をON";
+        var sleepKickEnabledLabel = sleepKickEnabled ? "🔴 🛌 寝落ちキック OFF" : "🟢 🛌 寝落ちキック ON";
         var sleepKickEnabledStyle = sleepKickEnabled ? ButtonStyle.Danger : ButtonStyle.Success;
-        var sleepKickAutoDetectLabel = sleepKickAutoDetect ? "自動検出をOFF" : "自動検出をON";
+        var sleepKickAutoDetectLabel = sleepKickAutoDetect ? "🔴 寝落ち自動検出 OFF" : "🟢 寝落ち自動検出 ON";
         var sleepKickAutoDetectStyle = sleepKickAutoDetect ? ButtonStyle.Danger : ButtonStyle.Success;
-        var sleepKickToggleLabel = sleepKickAdminConfirm ? "管理者確認をOFF" : "管理者確認をON";
+        var sleepKickToggleLabel = sleepKickAdminConfirm ? "🔴 寝落ち管理者承認 OFF" : "🟢 寝落ち管理者承認 ON";
         var sleepKickToggleStyle = sleepKickAdminConfirm ? ButtonStyle.Danger : ButtonStyle.Success;
 
         return new ComponentBuilder()
@@ -131,44 +131,44 @@ public static class AdminControlPanel
 
     public static Embed BuildStatusEmbed(bool approvalRequired, bool inactiveAutoKickEnabled, bool sleepKickEnabled, bool sleepKickAutoDetect, bool sleepKickAdminConfirm, bool includeReactionLabelInAutoKickNote = false)
     {
-        var approvalState = approvalRequired ? "ON（管理者確認あり）" : "OFF（即時付与）";
+        var approvalState = approvalRequired ? "🟢 ON（管理者確認あり）" : "🔴 OFF（即時付与）";
         var approvalDetail = approvalRequired
-            ? "登録申請は確認チャンネルで管理者が許可/拒否します。"
-            : "登録申請時にメンバーロールを即時で付与します。";
-        var autoKickState = inactiveAutoKickEnabled ? "ON" : "OFF";
+            ? "新規メンバーの登録申請は、確認チャンネルで管理者が許可/拒否します。"
+            : "新規メンバーの登録申請時に、メンバーロールを即時で付与します。";
+        var autoKickState = inactiveAutoKickEnabled ? "🟢 ON" : "🔴 OFF";
         var autoKickDetail = inactiveAutoKickEnabled
             ? includeReactionLabelInAutoKickNote
                 ? "毎日 00:00 (JST) に30日非アクティブを判定して自動キックします。（判定対象: メッセージ / VC / リアクション）"
                 : "毎日 00:00 (JST) に30日非アクティブを判定して自動キックします。"
-            : "30日非アクティブ自動キックは無効です。";
-        var sleepKickEnabledState = sleepKickEnabled ? "ON" : "OFF";
+            : "30日以上非アクティブのメンバーを自動キックする機能は無効です。";
+        var sleepKickEnabledState = sleepKickEnabled ? "🟢 ON" : "🔴 OFF";
         var sleepKickEnabledDetail = sleepKickEnabled
-            ? "長時間ミュートの自動検出・投票機能が有効です。"
-            : "長時間ミュートの自動検出・投票機能は無効です。";
-        var sleepKickAutoDetectState = sleepKickAutoDetect ? "ON" : "OFF";
+            ? "🛌 長時間ミュートの自動検出・投票機能が有効です。"
+            : "🛌 長時間ミュートの自動検出・投票機能は無効です。";
+        var sleepKickAutoDetectState = sleepKickAutoDetect ? "🟢 ON" : "🔴 OFF";
         var sleepKickAutoDetectDetail = sleepKickAutoDetect
-            ? "一定時間ミュートのメンバーを自動検出し投票を開始します。"
+            ? "Botが一定時間ミュートのメンバーを自動検出し、投票を開始します。"
             : "自動検出は無効です。手動でのみ投票を開始できます。";
-        var sleepKickState = sleepKickAdminConfirm ? "ON（管理者確認あり）" : "OFF（投票通過で即時切断）";
+        var sleepKickState = sleepKickAdminConfirm ? "🟢 ON（管理者確認あり）" : "🔴 OFF（投票通過で即時切断）";
         var sleepKickDetail = sleepKickAdminConfirm
-            ? "寝落ち投票可決後、管理者・オフィサーが切断を承認/拒否できます。"
-            : "寝落ち投票可決後、60秒で自動切断します。";
+            ? "寝落ち投票が可決後、管理者・オフィサーが切断を承認/拒否できます。"
+            : "寝落ち投票が可決後、60秒で自動切断します。";
 
         return new EmbedBuilder()
             .WithTitle("ADMINコントロールパネル")
             .WithDescription("状態確認はこのEmbed、操作はカテゴリボタン -> サブメニューで実行します。")
             .WithColor(inactiveAutoKickEnabled ? Color.Orange : Color.Green)
             .WithCurrentTimestamp()
-            .AddField("登録確認フロー", approvalState, true)
-            .AddField("30日非アクティブ自動キック", autoKickState, true)
-            .AddField("寝落ち投票機能", sleepKickEnabledState, true)
-            .AddField("寝落ち自動検出", sleepKickAutoDetectState, true)
-            .AddField("寝落ち管理者確認", sleepKickState, true)
-            .AddField("登録確認の動作", approvalDetail, false)
-            .AddField("自動キックの動作", autoKickDetail, false)
-            .AddField("寝落ち投票の動作", sleepKickEnabledDetail, false)
-            .AddField("寝落ち自動検出の動作", sleepKickAutoDetectDetail, false)
-            .AddField("寝落ち管理者確認の動作", sleepKickDetail, false)
+            .AddField("新規登録確認", approvalState, true)
+            .AddField("非アクティブ30日自動キック", autoKickState, true)
+            .AddField("🛌 寝落ちキック機能", sleepKickEnabledState, true)
+            .AddField("🛌 寝落ち自動検出", sleepKickAutoDetectState, true)
+            .AddField("🛌 寝落ち管理者承認", sleepKickState, true)
+            .AddField("新規登録確認の動作", approvalDetail, false)
+            .AddField("非アクティブ自動キックの動作", autoKickDetail, false)
+            .AddField("🛌 寝落ちキックの動作", sleepKickEnabledDetail, false)
+            .AddField("🛌 寝落ち自動検出の動作", sleepKickAutoDetectDetail, false)
+            .AddField("🛌 寝落ち管理者承認の動作", sleepKickDetail, false)
             .AddField("メニュー分類", "監視/統計 | メンバー運用 | 設定/保守 | 管理機能 | 補助/エクスポート", false)
             .AddField("ボタン色の意味", "緑: 有効化/開始  |  赤: 無効化/停止  |  灰: 設定/診断/補助", false)
             .Build();
