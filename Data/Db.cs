@@ -3948,7 +3948,7 @@ WITH user_dates AS (
 ),
 numbered AS (
     SELECT user_id, d,
-           (d - (ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY d DESC))::int) AS grp
+           (d - (ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY d))::int) AS grp
     FROM user_dates
 ),
 streaks AS (
