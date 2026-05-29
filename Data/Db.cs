@@ -3928,51 +3928,63 @@ WHERE guild_id = @GuildId
 
     public async Task<int> GetUserConsecutiveVoiceDaysAsync(ulong guildId, ulong userId)
     {
+        var (days, _) = await GetUserConsecutiveVoiceDaysWithRankAsync(guildId, userId);
+        return days;
+    }
+
+    public async Task<(int days, int rank)> GetUserConsecutiveVoiceDaysWithRankAsync(ulong guildId, ulong userId)
+    {
         if (guildId == 0 || userId == 0)
         {
-            return 0;
+            return (0, 0);
         }
 
         const string sql = @"
-SELECT DISTINCT (joined_at AT TIME ZONE 'Asia/Tokyo')::date AS d
-FROM voice_sessions
-WHERE guild_id = @GuildId
-  AND user_id = @UserId
-ORDER BY d DESC;";
-
-        await using var conn = CreateConnection();
-        var dates = await conn.QueryAsync<DateTime>(sql, new
-        {
-            GuildId = ToDbId(guildId),
-            UserId = ToDbId(userId)
-        });
-
-        var dateList = dates.ToList();
-        if (dateList.Count == 0) return 0;
+WITH user_dates AS (
+    SELECT DISTINCT user_id,
+           (joined_at AT TIME ZONE 'Asia/Tokyo')::date AS d
+    FROM voice_sessions
+    WHERE guild_id = @GuildId
+),
+numbered AS (
+    SELECT user_id, d,
+           (d - (ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY d DESC))::int) AS grp
+    FROM user_dates
+),
+streaks AS (
+    SELECT user_id,
+           COUNT(*) AS streak_length
+    FROM numbered
+    GROUP BY user_id, grp
+    HAVING MAX(d) >= @Today - interval '1 day'
+),
+ranked AS (
+    SELECT user_id,
+           streak_length,
+           DENSE_RANK() OVER (ORDER BY streak_length DESC) AS rnk
+    FROM streaks
+)
+SELECT streak_length, rnk
+FROM ranked
+WHERE user_id = @UserId;";
 
         var jstZone = TimeZoneInfo.FindSystemTimeZoneById("Asia/Tokyo");
         var today = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, jstZone).Date;
 
-        var latest = dateList[0].Date;
-        if (latest != today && latest != today.AddDays(-1))
+        await using var conn = CreateConnection();
+        var row = await conn.QuerySingleOrDefaultAsync(sql, new
         {
-            return 0;
+            GuildId = ToDbId(guildId),
+            UserId = ToDbId(userId),
+            Today = today
+        });
+
+        if (row is null)
+        {
+            return (0, 0);
         }
 
-        int streak = 1;
-        for (int i = 1; i < dateList.Count; i++)
-        {
-            if (dateList[i].Date == dateList[i - 1].Date.AddDays(-1))
-            {
-                streak++;
-            }
-            else
-            {
-                break;
-            }
-        }
-
-        return streak;
+        return ((int)row.streak_length, (int)row.rnk);
     }
 
     public async Task<long> SummarizeVoiceDurationByGuildAsync(

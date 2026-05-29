@@ -6854,10 +6854,11 @@ public sealed class DiscordBotService : IHostedService
 
         DateTimeOffset? lastVoiceJoin = null;
         int consecutiveVoiceDays = 0;
+        int consecutiveVoiceRank = 0;
         try
         {
             lastVoiceJoin = await _db.GetUserLastVoiceJoinAsync(channel.Guild.Id, user.Id, DateTimeOffset.UtcNow);
-            consecutiveVoiceDays = await _db.GetUserConsecutiveVoiceDaysAsync(channel.Guild.Id, user.Id);
+            (consecutiveVoiceDays, consecutiveVoiceRank) = await _db.GetUserConsecutiveVoiceDaysWithRankAsync(channel.Guild.Id, user.Id);
         }
         catch (Exception ex)
         {
@@ -6899,9 +6900,19 @@ public sealed class DiscordBotService : IHostedService
                 // 連続VC参加日数
                 if (consecutiveVoiceDays > 0)
                 {
+                    var medal = consecutiveVoiceRank switch
+                    {
+                        1 => "🥇 ",
+                        2 => "🥈 ",
+                        3 => "🥉 ",
+                        _ => ""
+                    };
+                    var rankText = consecutiveVoiceRank > 0
+                        ? $"{medal}**{consecutiveVoiceDays}日連続 ({consecutiveVoiceRank}位)**"
+                        : $"**{consecutiveVoiceDays}日連続**";
                     builder.AddField(
                         "🔥 連続VC参加",
-                        $"{consecutiveVoiceDays}日連続",
+                        rankText,
                         true);
                 }
 
