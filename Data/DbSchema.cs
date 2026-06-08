@@ -395,6 +395,9 @@ CREATE TABLE ""public"".""guild_settings"" (
     ""lodestone_user_agent"" text,
     ""log_channel_id"" bigint NOT NULL,
     ""control_channel_id"" bigint NOT NULL,
+    ""default_fc_url"" text,
+    ""fc_embed_channel_id"" bigint,
+    ""fc_embed_message_id"" bigint,
     ""updated_at"" timestamp with time zone DEFAULT ""now""() NOT NULL
 );
 

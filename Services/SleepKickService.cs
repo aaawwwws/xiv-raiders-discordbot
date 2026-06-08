@@ -243,6 +243,14 @@ public sealed class SleepKickService
             return;
         }
 
+        var voterGuild = _client.GetGuild(guildId);
+        var voterGuildUser = voterGuild?.GetUser(component.User.Id);
+        if (voterGuildUser is null || voterGuildUser.VoiceChannel?.Id != vote.ChannelId)
+        {
+            await component.RespondAsync("投票は対象VCに参加しているメンバーのみ可能です。", ephemeral: true);
+            return;
+        }
+
         if (vote.VoterIds.Contains(component.User.Id))
         {
             await component.RespondAsync("既に投票済みです。", ephemeral: true);

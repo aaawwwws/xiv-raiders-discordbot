@@ -17,6 +17,9 @@ public sealed class GuildSettings
     public int? InactiveAutoKickUserDataRetentionDays { get; init; }
     public long LogChannelId { get; init; }
     public long ControlChannelId { get; init; }
+    public string? DefaultFcUrl { get; init; }
+    public long? FcEmbedChannelId { get; init; }
+    public long? FcEmbedMessageId { get; init; }
     public int? RuntimeCleanupIntervalMinutes { get; init; }
     public int? RuntimeRecruitClosedRetentionHours { get; init; }
     public int? RuntimeRecruitCanceledRetentionHours { get; init; }

@@ -14,6 +14,7 @@ public sealed class LodestoneClient
 {
     private static readonly Regex LodestoneIdRegex = new(@"lodestone/character/(\d+)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex LodestoneCwlsIdRegex = new(@"lodestone/crossworld_linkshell/([0-9a-f]+)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex LodestoneFcIdRegex = new(@"lodestone/freecompany/(\d+)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private readonly ILogger<LodestoneClient> _logger;
     private readonly HashSet<string> _allowedHosts;
 
@@ -125,6 +126,40 @@ public sealed class LodestoneClient
         }
 
         normalizedUrl = $"https://{uri.Host}/lodestone/crossworld_linkshell/{match.Groups[1].Value}/";
+        return true;
+    }
+
+    public bool TryNormalizeFcUrl(string url, out string normalizedUrl, out string error)
+    {
+        normalizedUrl = string.Empty;
+        error = string.Empty;
+
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri))
+        {
+            error = "URLの形式が正しくありません。";
+            return false;
+        }
+
+        if (!string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
+        {
+            error = "https:// のLodestone URLのみ対応しています。";
+            return false;
+        }
+
+        if (!IsAllowedHost(uri.Host))
+        {
+            error = "Lodestone公式ドメインのURLのみ対応しています。";
+            return false;
+        }
+
+        var match = LodestoneFcIdRegex.Match(uri.AbsoluteUri);
+        if (!match.Success)
+        {
+            error = "LodestoneのフリーカンパニーページURLを入力してください。";
+            return false;
+        }
+
+        normalizedUrl = $"https://{uri.Host}/lodestone/freecompany/{match.Groups[1].Value}/";
         return true;
     }
 
@@ -1127,6 +1162,345 @@ var quoted = Regex.Match(rawText, @"[""“”「『](?<title>.+?)[""”」']");
             members);
 
         return true;
+    }
+
+    public bool TryParseFc(string html, string sourceUrl, out LodestoneFcProfile profile)
+    {
+        profile = default!;
+
+        var name = TryExtractFcName(html);
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            return false;
+        }
+
+        var tag = TryExtractFcTag(html);
+
+        var worldText = TryExtractFcWorldText(html);
+
+        string world = string.Empty;
+        string? dataCenter = null;
+        if (!string.IsNullOrWhiteSpace(worldText) && TryParseWorldText(worldText, out var w, out var dc))
+        {
+            world = w;
+            dataCenter = dc;
+        }
+        else if (!string.IsNullOrWhiteSpace(worldText))
+        {
+            world = worldText;
+        }
+
+        if (string.IsNullOrWhiteSpace(world))
+        {
+            return false;
+        }
+
+        var memberCount = TryExtractInteger(
+            html,
+            "<div\\s+class=[\"'][^\"']*freecompany__member__num[^\"']*[\"'][^>]*>\\s*([\\d,]+)\\s*</div>");
+
+        if (!memberCount.HasValue)
+        {
+            memberCount = TryExtractInteger(
+                html,
+                "<h3[^>]*class=[\"'][^\"']*heading--lead[^\"']*[\"'][^>]*>メンバー</h3>\\s*<p[^>]*class=[\"'][^\"']*freecompany__text[^\"']*[\"'][^>]*>(\\d+)名</p>");
+        }
+
+        var formedAt = TryExtractFcFormedAt(html);
+        var iconUrl = FindFcIconUrl(html);
+        var introduction = TryExtractFcIntroduction(html);
+        var activeTime = TryExtractFcFieldText(html, "freecompany__text__time");
+        var recruiting = TryExtractFcFieldText(html, "freecompany__text__recruitment");
+        var activeMembers = TryExtractFcFieldText(html, "freecompany__text__num");
+        var focus = TryExtractFcFocus(html);
+        var estate = TryExtractFcEstate(html);
+        var rank = TryExtractFcRank(html);
+        var grandCompanyReputation = TryExtractFcGrandCompanyReputation(html);
+
+        profile = new LodestoneFcProfile(
+            name,
+            string.IsNullOrWhiteSpace(tag) ? null : tag,
+            world,
+            dataCenter,
+            memberCount,
+            formedAt,
+            iconUrl,
+            string.IsNullOrWhiteSpace(introduction) ? null : introduction,
+            string.IsNullOrWhiteSpace(activeTime) ? null : activeTime,
+            string.IsNullOrWhiteSpace(recruiting) ? null : recruiting,
+            string.IsNullOrWhiteSpace(activeMembers) ? null : activeMembers,
+            string.IsNullOrWhiteSpace(focus) ? null : focus,
+            string.IsNullOrWhiteSpace(estate) ? null : estate,
+            sourceUrl,
+            rank,
+            grandCompanyReputation);
+
+        return true;
+    }
+
+    public async Task<IReadOnlyList<FcMember>> FetchFcMembersAsync(string fcUrl, CancellationToken cancellationToken = default)
+    {
+        if (!Uri.TryCreate(fcUrl, UriKind.Absolute, out var uri))
+        {
+            return Array.Empty<FcMember>();
+        }
+
+        var memberUrl = fcUrl.TrimEnd('/') + "/member/";
+        var html = await TryFetchOptionalHtmlAsync(memberUrl, cancellationToken);
+        if (string.IsNullOrWhiteSpace(html))
+        {
+            return Array.Empty<FcMember>();
+        }
+
+        return ParseFcMembers(html, fcUrl);
+    }
+
+    private static List<FcMember> ParseFcMembers(string html, string sourceUrl)
+    {
+        var members = new List<FcMember>();
+
+        var matches = Regex.Matches(
+            html,
+            "<div[^>]*class=[\"'][^\"']*entry__freecompany__center[^\"']*[\"'][^>]*>.*?" +
+            "<p[^>]*class=[\"'][^\"']*entry__name[^\"']*[\"'][^>]*>(?<name>.*?)</p>.*?" +
+            "<p[^>]*class=[\"'][^\"']*entry__world[^\"']*[\"'][^>]*>.*?<i[^>]*>[^<]*</i>(?<world>[^<]+)</p>.*?" +
+            "(?:<ul[^>]*class=[\"'][^\"']*entry__freecompany__info[^\"']*[\"'][^>]*>.*?<li>.*?<span>(?<rank>.*?)</span>)?.*?" +
+            "</li>.*?" +
+            "</div>",
+            RegexOptions.IgnoreCase | RegexOptions.Singleline);
+
+        foreach (Match match in matches)
+        {
+            var name = NormalizeInnerText(match.Groups["name"].Value);
+            var worldText = NormalizeInnerText(match.Groups["world"].Value);
+            var rank = match.Groups["rank"].Success ? NormalizeInnerText(match.Groups["rank"].Value) : null;
+
+            if (string.IsNullOrWhiteSpace(name) || string.IsNullOrWhiteSpace(worldText))
+            {
+                continue;
+            }
+
+            string world;
+            string? dataCenter;
+            if (TryParseWorldText(worldText, out var w, out var dc))
+            {
+                world = w;
+                dataCenter = dc;
+            }
+            else
+            {
+                world = worldText;
+                dataCenter = null;
+            }
+
+            members.Add(new FcMember(name, world, dataCenter, string.IsNullOrWhiteSpace(rank) ? null : rank));
+        }
+
+        return members;
+    }
+
+    private static int? TryExtractFcRank(string html)
+    {
+        var rankMatch = Regex.Match(
+            html,
+            "<h3[^>]*class=[\"'][^\"']*heading--lead[^\"']*[\"'][^>]*>ランク</h3>\\s*<p[^>]*class=[\"'][^\"']*freecompany__text[^\"']*[\"'][^>]*>(\\d+)</p>",
+            RegexOptions.IgnoreCase | RegexOptions.Singleline);
+        if (rankMatch.Success && int.TryParse(rankMatch.Groups[1].Value, out var rank))
+        {
+            return rank;
+        }
+        return null;
+    }
+
+    private static List<string>? TryExtractFcGrandCompanyReputation(string html)
+    {
+        var reputations = new List<string>();
+        var matches = Regex.Matches(
+            html,
+            "<div[^>]*class=[\"'][^\"']*freecompany__reputation[^\"']*[\"'][^>]*>.*?" +
+            "<p[^>]*class=[\"'][^\"']*freecompany__reputation__gcname[^\"']*[\"'][^>]*>(?<gc>.*?)</p>.*?" +
+            "<p[^>]*class=[\"'][^\"']*freecompany__reputation__rank[^\"']*[\"'][^>]*>(?<rank>.*?)</p>.*?" +
+            "</div>",
+            RegexOptions.IgnoreCase | RegexOptions.Singleline);
+
+        foreach (Match match in matches)
+        {
+            var gc = NormalizeInnerText(match.Groups["gc"].Value);
+            var rank = NormalizeInnerText(match.Groups["rank"].Value);
+            if (!string.IsNullOrWhiteSpace(gc) && !string.IsNullOrWhiteSpace(rank))
+            {
+                reputations.Add($"{gc}: {rank}");
+            }
+        }
+
+        return reputations.Count > 0 ? reputations : null;
+    }
+
+    private static string? TryExtractFcName(string html)
+    {
+        var nameMatch = Regex.Match(
+            html,
+            "<p[^>]*class=[\"'][^\"']*freecompany__text__name[^\"']*[\"'][^>]*>(?<name>[^<]+)</p>",
+            RegexOptions.IgnoreCase | RegexOptions.Singleline);
+        if (nameMatch.Success)
+        {
+            return NormalizeInnerText(nameMatch.Groups["name"].Value);
+        }
+
+        var ogTitle = FindMetaContent(html, "property", "og:title");
+        if (!string.IsNullOrWhiteSpace(ogTitle))
+        {
+            var titleMatch = Regex.Match(ogTitle, @"^(.+?)\s*\|", RegexOptions.IgnoreCase);
+            if (titleMatch.Success)
+            {
+                return titleMatch.Groups[1].Value.Trim();
+            }
+        }
+
+        return FindElementText(html, new[]
+        {
+            new ElementPattern("freecompany__text__name", "p"),
+            new ElementPattern("freecompany__text__name", "h2"),
+            new ElementPattern("heading__freecompany__name", "h2")
+        });
+    }
+
+    private static string? TryExtractFcWorldText(string html)
+    {
+        var worldMatch = Regex.Match(
+            html,
+            "<p[^>]*class=[\"'][^\"']*entry__freecompany__gc[^\"']*[\"'][^>]*>\\s*<i[^>]*class=[\"'][^\"']*xiv-lds-home-world[^\"']*[\"'][^>]*>[^<]*</i>(?<world>[^<]+)</p>",
+            RegexOptions.IgnoreCase | RegexOptions.Singleline);
+        if (worldMatch.Success)
+        {
+            return NormalizeInnerText(worldMatch.Groups["world"].Value);
+        }
+
+        return null;
+    }
+
+    private static string? TryExtractFcTag(string html)
+    {
+        var tagMatch = Regex.Match(
+            html,
+            "<p[^>]*class=[\"'][^\"']*freecompany__text[^\"']*\\s+freecompany__text__tag[^\"']*[\"'][^>]*>\\s*«(?<tag>[^»]+)»\\s*</p>",
+            RegexOptions.IgnoreCase | RegexOptions.Singleline);
+        if (tagMatch.Success)
+        {
+            return NormalizeInnerText(tagMatch.Groups["tag"].Value);
+        }
+
+        return null;
+    }
+
+    private static DateTimeOffset? TryExtractFcFormedAt(string html)
+    {
+        var formedMatch = Regex.Match(
+            html,
+            "<h3[^>]*class=[\"'][^\"']*heading--lead[^\"']*[\"'][^>]*>結成日</h3>\\s*<p[^>]*class=[\"'][^\"']*freecompany__text[^\"']*[\"'][^>]*>.*?ldst_strftime\\((\\d+)",
+            RegexOptions.IgnoreCase | RegexOptions.Singleline);
+        if (formedMatch.Success && long.TryParse(formedMatch.Groups[1].Value, out var epoch))
+        {
+            try
+            {
+                return DateTimeOffset.FromUnixTimeSeconds(epoch);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        var dateMatch = Regex.Match(
+            html,
+            "<h3[^>]*class=[\"'][^\"']*heading--lead[^\"']*[\"'][^>]*>結成日</h3>\\s*<p[^>]*class=[\"'][^\"']*freecompany__text[^\"']*[\"'][^>]*>\\s*<span[^>]*>(?<date>\\d{4}/\\d{2}/\\d{2})</span>",
+            RegexOptions.IgnoreCase | RegexOptions.Singleline);
+        if (dateMatch.Success && DateTimeOffset.TryParse(dateMatch.Groups["date"].Value, out var date))
+        {
+            return date;
+        }
+
+        return null;
+    }
+
+    private static string? FindFcIconUrl(string html)
+    {
+        var match = Regex.Match(
+            html,
+            "<div[^>]*class=[\"'][^\"']*heading__freecompany__icon[^\"']*[\"'][^>]*>\\s*<img[^>]*src=[\"']([^\"']+)[\"']",
+            RegexOptions.IgnoreCase | RegexOptions.Singleline);
+        if (match.Success)
+        {
+            return WebUtility.HtmlDecode(match.Groups[1].Value).Trim();
+        }
+
+        var ogImage = FindMetaContent(html, "property", "og:image");
+        return string.IsNullOrWhiteSpace(ogImage) ? null : ogImage;
+    }
+
+    private static string? TryExtractFcIntroduction(string html)
+    {
+        var introMatch = Regex.Match(
+            html,
+            "<div[^>]*class=[\"'][^\"']*freecompany__introduction[^\"']*[\"'][^>]*>(?<content>.*?)</div>",
+            RegexOptions.IgnoreCase | RegexOptions.Singleline);
+        if (introMatch.Success)
+        {
+            var inner = NormalizeInnerText(introMatch.Groups["content"].Value);
+            if (!string.IsNullOrWhiteSpace(inner))
+            {
+                return inner.Length > 500 ? inner[..500] + "..." : inner;
+            }
+        }
+
+        return null;
+    }
+
+    private static string? TryExtractFcFieldText(string html, string className)
+    {
+        var match = Regex.Match(
+            html,
+            $"<div[^>]*class=[\"'][^\"']*{Regex.Escape(className)}[^\"']*[\"'][^>]*>(?<content>.*?)</div>",
+            RegexOptions.IgnoreCase | RegexOptions.Singleline);
+        if (match.Success)
+        {
+            return NormalizeInnerText(match.Groups["content"].Value);
+        }
+
+        return null;
+    }
+
+    private static string? TryExtractFcFocus(string html)
+    {
+        var focusMatch = Regex.Match(
+            html,
+            "<div[^>]*class=[\"'][^\"']*freecompany__focus[^\"']*[\"'][^>]*>(?<content>.*?)</div>",
+            RegexOptions.IgnoreCase | RegexOptions.Singleline);
+        if (focusMatch.Success)
+        {
+            var inner = focusMatch.Groups["content"].Value;
+            var text = NormalizeInnerText(inner);
+            if (!string.IsNullOrWhiteSpace(text))
+            {
+                return text.Length > 200 ? text[..200] + "..." : text;
+            }
+        }
+
+        return null;
+    }
+
+    private static string? TryExtractFcEstate(string html)
+    {
+        var estateMatch = Regex.Match(
+            html,
+            "<div[^>]*class=[\"'][^\"']*freecompany__estate[^\"']*[\"'][^>]*>(?<content>.*?)</div>",
+            RegexOptions.IgnoreCase | RegexOptions.Singleline);
+        if (estateMatch.Success)
+        {
+            return NormalizeInnerText(estateMatch.Groups["content"].Value);
+        }
+
+        return null;
     }
 
     private static bool TryParseFromOgTitle(string html, out LodestoneProfile profile)

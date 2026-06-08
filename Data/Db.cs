@@ -372,6 +372,9 @@ ADD COLUMN IF NOT EXISTS inactive_auto_kick_enabled BOOLEAN NOT NULL DEFAULT TRU
 ADD COLUMN IF NOT EXISTS inactive_auto_kick_user_data_retention_days INTEGER NOT NULL DEFAULT 7,
 ADD COLUMN IF NOT EXISTS log_channel_id BIGINT NOT NULL DEFAULT 0,
 ADD COLUMN IF NOT EXISTS control_channel_id BIGINT NOT NULL DEFAULT 0,
+ADD COLUMN IF NOT EXISTS default_fc_url TEXT NULL,
+ADD COLUMN IF NOT EXISTS fc_embed_channel_id BIGINT NULL,
+ADD COLUMN IF NOT EXISTS fc_embed_message_id BIGINT NULL,
 ADD COLUMN IF NOT EXISTS runtime_cleanup_interval_minutes INTEGER NULL,
 ADD COLUMN IF NOT EXISTS runtime_recruit_closed_retention_hours INTEGER NULL,
 ADD COLUMN IF NOT EXISTS runtime_recruit_canceled_retention_hours INTEGER NULL,
@@ -950,6 +953,123 @@ ON public.lottery_claim_channels (channel_id);";
 
         await using var conn = CreateConnection();
         await conn.ExecuteAsync(sql);
+    }
+
+    public async Task EnsureEvent0TablesAsync()
+    {
+        const string sql = @"
+CREATE TABLE IF NOT EXISTS public.event0_posts (
+    id SERIAL PRIMARY KEY,
+    guild_id BIGINT NOT NULL,
+    channel_id BIGINT NOT NULL,
+    message_id BIGINT NULL UNIQUE,
+    title TEXT NOT NULL,
+    description TEXT NULL,
+    created_by_user_id BIGINT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_event0_posts_guild
+ON public.event0_posts (guild_id, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS public.event0_participants (
+    id SERIAL PRIMARY KEY,
+    event_id INTEGER NOT NULL REFERENCES public.event0_posts(id) ON DELETE CASCADE,
+    user_id BIGINT NOT NULL,
+    user_name TEXT NOT NULL,
+    joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT ux_event0_participants UNIQUE (event_id, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_event0_participants_event
+ON public.event0_participants (event_id, joined_at ASC);";
+
+        await using var conn = CreateConnection();
+        await conn.ExecuteAsync(sql);
+    }
+
+    public async Task<int> CreateEvent0PostAsync(ulong guildId, ulong channelId, ulong? messageId, string title, string? description, ulong createdByUserId)
+    {
+        const string sql = @"
+INSERT INTO public.event0_posts (guild_id, channel_id, message_id, title, description, created_by_user_id)
+VALUES (@GuildId, @ChannelId, @MessageId, @Title, @Description, @CreatedByUserId)
+RETURNING id;";
+
+        await using var conn = CreateConnection();
+        return await conn.QuerySingleAsync<int>(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            ChannelId = ToDbId(channelId),
+            MessageId = messageId.HasValue ? (object)ToDbId(messageId.Value) : DBNull.Value,
+            Title = title,
+            Description = NullIfBlank(description),
+            CreatedByUserId = ToDbId(createdByUserId)
+        });
+    }
+
+    public async Task UpdateEvent0PostMessageIdAsync(int eventId, ulong messageId)
+    {
+        const string sql = @"
+UPDATE public.event0_posts
+SET message_id = @MessageId, updated_at = NOW()
+WHERE id = @EventId;";
+
+        await using var conn = CreateConnection();
+        await conn.ExecuteAsync(sql, new { EventId = eventId, MessageId = ToDbId(messageId) });
+    }
+
+    public async Task<Event0Post?> GetEvent0PostAsync(int eventId)
+    {
+        const string sql = @"
+SELECT id AS Id,
+       guild_id AS GuildId,
+       channel_id AS ChannelId,
+       message_id AS MessageId,
+       title AS Title,
+       description AS Description,
+       created_by_user_id AS CreatedByUserId,
+       created_at AS CreatedAt,
+       updated_at AS UpdatedAt
+FROM public.event0_posts
+WHERE id = @EventId;";
+
+        await using var conn = CreateConnection();
+        return await conn.QueryFirstOrDefaultAsync<Event0Post>(sql, new { EventId = eventId });
+    }
+
+    public async Task<bool> AddEvent0ParticipantAsync(int eventId, ulong userId, string userName)
+    {
+        const string sql = @"
+INSERT INTO public.event0_participants (event_id, user_id, user_name)
+VALUES (@EventId, @UserId, @UserName)
+ON CONFLICT (event_id, user_id) DO NOTHING;";
+
+        await using var conn = CreateConnection();
+        var affected = await conn.ExecuteAsync(sql, new
+        {
+            EventId = eventId,
+            UserId = ToDbId(userId),
+            UserName = string.IsNullOrWhiteSpace(userName) ? userId.ToString() : userName.Trim()
+        });
+        return affected > 0;
+    }
+
+    public async Task<IReadOnlyList<Event0Participant>> ListEvent0ParticipantsAsync(int eventId)
+    {
+        const string sql = @"
+SELECT id AS Id,
+       event_id AS EventId,
+       user_id AS UserId,
+       user_name AS UserName,
+       joined_at AS JoinedAt
+FROM public.event0_participants
+WHERE event_id = @EventId
+ORDER BY joined_at ASC, id ASC;";
+
+        await using var conn = CreateConnection();
+        var rows = await conn.QueryAsync<Event0Participant>(sql, new { EventId = eventId });
+        return rows.ToList();
     }
 
     public async Task EnsureDiscordUserAsync(ulong userId)
@@ -2188,6 +2308,56 @@ WHERE left_at IS NOT NULL
 
         await using var conn = CreateConnection();
         return await conn.ExecuteAsync(sql, new { Days = retentionDays });
+    }
+
+    public async Task<int> GetUserVoiceJoinCountAsync(ulong guildId, ulong userId)
+    {
+        if (guildId == 0 || userId == 0)
+        {
+            return 0;
+        }
+
+        const string sql = @"
+SELECT COUNT(1)::INT AS JoinCount
+FROM voice_sessions
+WHERE guild_id = @GuildId
+  AND user_id = @UserId
+  AND (left_at IS NULL OR duration_seconds >= 30);";
+
+        await using var conn = CreateConnection();
+        return await conn.QuerySingleAsync<int>(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            UserId = ToDbId(userId)
+        });
+    }
+
+    public async Task<int> GetUserVoiceJoinCountTodayAsync(ulong guildId, ulong userId, DateTimeOffset nowUtc)
+    {
+        if (guildId == 0 || userId == 0)
+        {
+            return 0;
+        }
+
+        const string sql = @"
+SELECT COUNT(1)::INT AS JoinCount
+FROM voice_sessions
+WHERE guild_id = @GuildId
+  AND user_id = @UserId
+  AND joined_at >= @TodayStart
+  AND (left_at IS NULL OR duration_seconds >= 30);";
+
+        var jstNow = nowUtc.ToOffset(TimeSpan.FromHours(9));
+        var todayStartJst = new DateTimeOffset(jstNow.Year, jstNow.Month, jstNow.Day, 0, 0, 0, TimeSpan.FromHours(9));
+        var todayStartUtc = todayStartJst.ToUniversalTime();
+
+        await using var conn = CreateConnection();
+        return await conn.QuerySingleAsync<int>(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            UserId = ToDbId(userId),
+            TodayStart = todayStartUtc
+        });
     }
 
     public async Task<int> CleanupReactionLogsAsync(int retentionDays)
@@ -3985,6 +4155,48 @@ WHERE user_id = @UserId;";
         }
 
         return ((int)row.streak_length, (int)row.rnk);
+    }
+
+    public async Task<(long maxSeconds, int rank)> GetUserMaxVoiceSessionDurationWithRankAsync(ulong guildId, ulong userId)
+    {
+        if (guildId == 0 || userId == 0)
+        {
+            return (0L, 0);
+        }
+
+        const string sql = @"
+WITH user_max AS (
+    SELECT user_id,
+           MAX(duration_seconds) AS max_seconds
+    FROM voice_sessions
+    WHERE guild_id = @GuildId
+      AND duration_seconds IS NOT NULL
+    GROUP BY user_id
+    HAVING MAX(duration_seconds) > 0
+),
+ranked AS (
+    SELECT user_id,
+           max_seconds,
+           DENSE_RANK() OVER (ORDER BY max_seconds DESC) AS rnk
+    FROM user_max
+)
+SELECT max_seconds, rnk
+FROM ranked
+WHERE user_id = @UserId;";
+
+        await using var conn = CreateConnection();
+        var row = await conn.QuerySingleOrDefaultAsync(sql, new
+        {
+            GuildId = ToDbId(guildId),
+            UserId = ToDbId(userId)
+        });
+
+        if (row is null)
+        {
+            return (0L, 0);
+        }
+
+        return ((long)row.max_seconds, (int)row.rnk);
     }
 
     public async Task<long> SummarizeVoiceDurationByGuildAsync(
@@ -6241,6 +6453,9 @@ SELECT guild_id AS GuildId,
         sleep_kick_auto_detect_enabled AS SleepKickAutoDetectEnabled,
         log_channel_id AS LogChannelId,
        control_channel_id AS ControlChannelId,
+       default_fc_url AS DefaultFcUrl,
+       fc_embed_channel_id AS FcEmbedChannelId,
+       fc_embed_message_id AS FcEmbedMessageId,
        runtime_cleanup_interval_minutes AS RuntimeCleanupIntervalMinutes,
        runtime_recruit_closed_retention_hours AS RuntimeRecruitClosedRetentionHours,
        runtime_recruit_canceled_retention_hours AS RuntimeRecruitCanceledRetentionHours,
@@ -6326,6 +6541,50 @@ WHERE guild_id = @GuildId;";
         await using var conn = CreateConnection();
         var affected = await conn.ExecuteAsync(sql, new { GuildId = ToDbId(guildId), Enabled = enabled });
         return affected > 0;
+    }
+
+    public async Task<bool> UpdateGuildDefaultFcUrlAsync(ulong guildId, string defaultFcUrl)
+    {
+        const string sql = @"
+UPDATE guild_settings
+SET default_fc_url = @DefaultFcUrl,
+    updated_at = NOW()
+WHERE guild_id = @GuildId;";
+
+        await using var conn = CreateConnection();
+        var affected = await conn.ExecuteAsync(sql, new { GuildId = ToDbId(guildId), DefaultFcUrl = defaultFcUrl });
+        return affected > 0;
+    }
+
+    public async Task<bool> UpdateGuildFcEmbedAsync(ulong guildId, ulong channelId, ulong messageId)
+    {
+        const string sql = @"
+UPDATE guild_settings
+SET fc_embed_channel_id = @ChannelId,
+    fc_embed_message_id = @MessageId,
+    updated_at = NOW()
+WHERE guild_id = @GuildId;";
+
+        await using var conn = CreateConnection();
+        var affected = await conn.ExecuteAsync(sql, new { GuildId = ToDbId(guildId), ChannelId = ToDbId(channelId), MessageId = ToDbId(messageId) });
+        return affected > 0;
+    }
+
+    public async Task<IReadOnlyList<(long GuildId, long ChannelId, long MessageId, string DefaultFcUrl)>> ListFcEmbedsAsync()
+    {
+        const string sql = @"
+SELECT guild_id AS GuildId,
+       fc_embed_channel_id AS ChannelId,
+       fc_embed_message_id AS MessageId,
+       default_fc_url AS DefaultFcUrl
+FROM guild_settings
+WHERE fc_embed_channel_id IS NOT NULL
+  AND fc_embed_message_id IS NOT NULL
+  AND default_fc_url IS NOT NULL;";
+
+        await using var conn = CreateConnection();
+        var rows = await conn.QueryAsync(sql);
+        return rows.Select(r => ((long)r.GuildId, (long)r.ChannelId, (long)r.MessageId, (string)r.DefaultFcUrl)).ToList();
     }
 
     public async Task<bool> UpdateGuildSleepKickAdminConfirmationRequiredAsync(ulong guildId, bool enabled)
@@ -9645,6 +9904,28 @@ public sealed record SleepKickVoteLog(
     string? VoterDetails,
     string? Result,
     DateTimeOffset CreatedAt);
+
+public sealed record Event0Post
+{
+    public int Id { get; init; }
+    public long GuildId { get; init; }
+    public long ChannelId { get; init; }
+    public long? MessageId { get; init; }
+    public string Title { get; init; } = "";
+    public string? Description { get; init; }
+    public long CreatedByUserId { get; init; }
+    public DateTimeOffset CreatedAt { get; init; }
+    public DateTimeOffset UpdatedAt { get; init; }
+}
+
+public sealed record Event0Participant
+{
+    public int Id { get; init; }
+    public int EventId { get; init; }
+    public long UserId { get; init; }
+    public string UserName { get; init; } = "";
+    public DateTimeOffset JoinedAt { get; init; }
+}
 
 public sealed record ServerStatsSnapshot
 {
