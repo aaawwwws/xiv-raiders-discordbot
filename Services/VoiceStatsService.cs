@@ -39,6 +39,12 @@ public sealed class VoiceStatsService {
             toUtc = fromUtc.AddMinutes(1);
         }
 
+        try {
+            await guild.DownloadUsersAsync();
+        } catch (Exception ex) {
+            _logger.LogWarning(ex, "Failed to download guild users for ranking. GuildId={GuildId}", guild.Id);
+        }
+
         var topLimit = Math.Clamp(topCount, 1, 10);
         var voiceRows = await ExecuteRankingDbQueryWithRetryAsync(
             guild.Id,
